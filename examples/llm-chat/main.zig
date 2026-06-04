@@ -665,7 +665,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var stream = false;
     var screenshot_path: ?[:0]const u8 = null;
     var open_settings = false;
-    var arg_it = std.process.Args.iterate(init.args);
+    // iterateAllocator (not iterate): the simple iterator @compileErrors on
+    // Windows, where argv must be decoded from the WTF-16 command line.
+    var arg_it = try std.process.Args.iterateAllocator(init.args, gpa);
+    defer arg_it.deinit();
     _ = arg_it.next(); // skip argv[0]
     while (arg_it.next()) |a| {
         if (std.mem.eql(u8, a, "--smoke")) {

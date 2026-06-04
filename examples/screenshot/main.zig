@@ -154,7 +154,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const gpa = std.heap.page_allocator;
 
     var out: [:0]const u8 = "zigui-screenshot.bmp";
-    var it = std.process.Args.iterate(init.args);
+    // iterateAllocator (not iterate): the simple iterator @compileErrors on
+    // Windows, where argv must be decoded from the WTF-16 command line.
+    var it = try std.process.Args.iterateAllocator(init.args, gpa);
+    defer it.deinit();
     _ = it.next(); // argv[0]
     while (it.next()) |a| out = a; // last positional arg = output path
 

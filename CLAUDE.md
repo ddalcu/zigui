@@ -23,14 +23,17 @@ seams each one uses.
 ## Build / test / run — and the gotchas
 
 ```sh
-zig build test --summary all                # 146 tests, headless. THIS is the inner loop.
-zig build hello settings showcase llm-chat  # build the examples (does NOT run them)
+zig build test --summary all                # 152 tests, headless. THIS is the inner loop.
+zig build hello settings showcase llm-chat edit  # build the examples (does NOT run them)
 zig build run-showcase                       # opens a window — blocks on the event loop
 docker build -t zigui-test .                 # run the full suite on Linux
 
 # Headless proof the llm-chat networking works against a real LLM (no window):
 ./zig-out/bin/llm-chat --smoke "say hi" --model <name>            # one-shot
 ./zig-out/bin/llm-chat --smoke "count to 5" --model <name> --stream  # SSE path
+
+# Headless UI iteration for the text editor (renders one frame to a BMP):
+./zig-out/bin/edit --screenshot /tmp/edit.bmp [file] [--demo-find|--demo-dialog]
 ```
 
 - **Use `zig build test`, NOT `zig test src/zigui.zig`.** The bundled Inter font
@@ -298,6 +301,45 @@ Added to support `examples/llm-chat` (a streaming LLM client); all headless-test
   tray and the loop skips rendering while `SDL_WINDOW_HIDDEN`. Caveat: SDL may invoke
   tray callbacks off the main thread on some platforms (main-thread on macOS) — keep
   them to flipping app-owned state / show-hide-quit.
+
+### Multi-line editing — `TextEditor` + `TextFieldState` selection/motion
+Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
+
+- **`TextFieldState` grew up.** The same struct that backs `TextField` now also
+  backs the multi-line editor: it gained a `sel_anchor` (selection), a
+  `multiline` flag, `pref_col` (preferred column for vertical motion), a
+  `last_caret` (so the editor follows the caret only when it *moved*), and a
+  `revision` counter (so an app sees "modified since saved" without diffing).
+  `insert`/`backspace` delete the selection first; movement methods take an
+  `extend: bool` (Shift) and `home/end/moveUp/moveDown` use the pure
+  `lineStartIndex`/`lineEndIndex`/`columnOf`/`indexForColumn`/`nthLineRange`
+  helpers (UTF-8-aware, line = run between `'\n'`s, column = codepoints).
+- **`TextEditor(state, scroll, line_numbers)`** is a new `Kind`/component that
+  *reuses* `TextFieldState`, so it shares the focus + keyboard plumbing with
+  `TextField` (no second focus system). It lowers to a flexible `.leaf` (fills
+  its space). `paintTextEditor` sets `state.multiline`, draws a rounded bg + focus
+  border, a line-number gutter, selection highlight, the visible lines (clipped,
+  scrolled by the app-owned `ScrollState`), and the caret; it **auto-scrolls to
+  the caret only when `caret != last_caret`** (so the wheel scrolls freely
+  otherwise) and registers a `ScrollRegion` for the wheel.
+- **Click-to-position** is a new `HitAction.text_click` (payload `TextClick`)
+  that carries the font + text-area origin/scroll so `performAction` (which only
+  has the tap point, no `Context`) can resolve the byte index via `caretIndexAt`/
+  `caretInLine`. **Mouse drag-selection** reuses it: mouse-down anchors the
+  selection + arms `g_drag` (a thread-local `*TextFieldState`); the app's
+  `MOUSE_MOTION` (button held) calls `dispatchDrag`, which finds that field's
+  re-emitted region in the current frame (so mid-drag scroll stays correct) and
+  extends the caret; `MOUSE_BUTTON_UP` → `endDrag`.
+- **Tabs** render to tab stops (multiples of `editor_tab_size` spaces), not the
+  font's `.notdef` box: `editorPrefixWidth` (caret/selection x), `drawEditorLine`
+  (run-by-run between tabs), and `caretInLine` (hit test) share one advance walk.
+- **`app.zig` key routing** (build-only verified) now sends Up/Down/Home/End/
+  Delete + Shift-extend to the focused field, makes Enter insert `'\n'` for a
+  `multiline` field (else `submitFocused`), and Tab indent. A new
+  `setKeyHandler(fn(key, mods) bool)` hook (mirrors `setBusyCheck`) gets first
+  refusal on every key-down so an app can grab ⌘-shortcuts/clipboard; `examples/
+  edit` uses it for ⌘S/O/N/F/A and ⌘C/X/V (SDL clipboard) and ⌘±/0 zoom.
+  `setFocus` is now exported so an app can focus the editor at launch.
 
 ## Coding conventions
 - Readability over cleverness (it's an open-source teaching codebase). Match the

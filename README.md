@@ -40,9 +40,14 @@ fn body(st: *AppState) zigui.View {
 ## Components
 
 Layout: `VStack` `HStack` `ZStack` `Spacer` `Divider` `ScrollView` `List`
-`ForEach` · Text/Media: `Text` `Label` `Image` `TextField` · Controls: `Button`
-`Toggle` `Slider` `Stepper` `ProgressView` · Shapes: `Rectangle`
-`RoundedRectangle` `Circle` `Capsule` `Ellipse` `LinearGradient`.
+`ForEach` · Text/Media: `Text` `Label` `Image` `TextField` `TextEditor` ·
+Controls: `Button` `Toggle` `Slider` `Stepper` `ProgressView` · Shapes:
+`Rectangle` `RoundedRectangle` `Circle` `Capsule` `Ellipse` `LinearGradient`.
+
+`TextEditor` is a multi-line, scrollable plain-text editor: line numbers, a
+click-positionable caret, selection (mouse drag or Shift+arrows / Select-All),
+tab stops, and wheel + caret-follow scrolling. See the [`edit`](examples/edit)
+example.
 
 Modifiers chain fluently: `.padding()` `.frame()` `.background()`
 `.foreground()` `.font()` `.cornerRadius()` `.border()` `.opacity()` `.onTap()`
@@ -109,7 +114,8 @@ zig build run-hello                  # minimal counter
 zig build run-settings               # macOS-like Settings demo
 zig build run-showcase               # nav · tabs · sheet · material · a11y
 zig build run-llm-chat               # streaming chat over an OpenAI-compatible API
-zig build hello settings showcase llm-chat   # build the examples without running them
+zig build run-edit                   # a multi-line text editor (TextEdit/gedit-like)
+zig build hello settings showcase llm-chat edit   # build the examples without running them
 ```
 
 > Run with `-Doptimize=ReleaseFast` for smooth UI — the CPU software rasterizer

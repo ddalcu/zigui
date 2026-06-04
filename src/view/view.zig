@@ -25,6 +25,7 @@ const theme_mod = @import("../theme/theme.zig");
 const atlas = @import("../text/atlas.zig");
 const shape = @import("../text/shape.zig");
 const font_mod = @import("../text/font.zig");
+const ttf = @import("../text/ttf.zig");
 const state = @import("../state/state.zig");
 
 pub const Binding = state.Binding;
@@ -195,12 +196,34 @@ pub const ImageData = struct { image: canvas_mod.Image };
 pub const LabelData = struct { title: []const u8, symbol_color: Color };
 pub const ScrollData = struct { axis: engine.Direction, offset: f32, content: *const View };
 
-/// Editable text buffer + caret for a `TextField`. Owned by the app (like a
-/// `State`), so editing survives across frames. Key events call its methods.
+/// Editable text buffer + caret for a `TextField` or `TextEditor`. Owned by the
+/// app (like a `State`), so editing survives across frames. Key events call its
+/// methods. Beyond a caret it tracks an optional selection (`sel_anchor`) and,
+/// for multi-line editors, the machinery for vertical motion and caret-follow
+/// scrolling.
 pub const TextFieldState = struct {
     buffer: std.ArrayList(u8) = .empty,
     caret: usize = 0, // byte index
+    /// Selection anchor (byte index). When non-null and different from `caret`,
+    /// the selection is the ordered range [min, max]. A plain (un-shifted) move
+    /// or any edit collapses it (back to `null`).
+    sel_anchor: ?usize = null,
     focused: bool = false,
+    /// True for a `TextEditor` (multi-line). The event loop then inserts a
+    /// newline on Enter (instead of submitting) and routes Up/Down/Home/End/Tab.
+    /// Set by `paintTextEditor` each frame.
+    multiline: bool = false,
+    /// Preferred column (codepoints from the line start) for vertical motion, so
+    /// a run of Up/Down keeps the original column across shorter lines. Reset by
+    /// any horizontal move or edit.
+    pref_col: ?usize = null,
+    /// The caret seen at the previous paint. `TextEditor` auto-scrolls to follow
+    /// the caret only when it actually moved, so the wheel can scroll freely
+    /// otherwise.
+    last_caret: usize = 0,
+    /// Bumped on every mutation so an app can cheaply detect "modified since
+    /// saved" without diffing the buffer (see `examples/edit`).
+    revision: u64 = 0,
     /// The `.onSubmit` callback for this field, refreshed during paint while the
     /// field is focused so `submitFocused()` (called from the event loop on
     /// Enter) can fire it without the view tree. See `paintTextField`.
@@ -220,27 +243,160 @@ pub const TextFieldState = struct {
         self.buffer.clearRetainingCapacity();
         try self.buffer.appendSlice(self.allocator, s);
         self.caret = self.buffer.items.len;
+        self.sel_anchor = null;
+        self.pref_col = null;
+        self.last_caret = self.caret;
+        self.revision +%= 1;
     }
+
+    // --- selection ---------------------------------------------------------
+
+    /// The current selection as an ordered byte range, or null when the caret is
+    /// a plain insertion point (no anchor, or an empty selection).
+    pub fn selectionRange(self: *const TextFieldState) ?struct { start: usize, end: usize } {
+        const a = self.sel_anchor orelse return null;
+        if (a == self.caret) return null;
+        return .{ .start = @min(a, self.caret), .end = @max(a, self.caret) };
+    }
+    pub fn hasSelection(self: *const TextFieldState) bool {
+        return self.selectionRange() != null;
+    }
+    pub fn selectAll(self: *TextFieldState) void {
+        if (self.buffer.items.len == 0) {
+            self.sel_anchor = null;
+            return;
+        }
+        self.sel_anchor = 0;
+        self.caret = self.buffer.items.len;
+        self.pref_col = null;
+    }
+    /// Delete the selected range, if any. Returns true if something was removed.
+    pub fn deleteSelection(self: *TextFieldState) bool {
+        const r = self.selectionRange() orelse {
+            self.sel_anchor = null;
+            return false;
+        };
+        const n = r.end - r.start;
+        std.mem.copyForwards(u8, self.buffer.items[r.start..], self.buffer.items[r.end..]);
+        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - n);
+        self.caret = r.start;
+        self.sel_anchor = null;
+        self.pref_col = null;
+        self.revision +%= 1;
+        return true;
+    }
+
+    // --- editing -----------------------------------------------------------
+
     pub fn insert(self: *TextFieldState, s: []const u8) !void {
+        _ = self.deleteSelection();
         try self.buffer.insertSlice(self.allocator, self.caret, s);
         self.caret += s.len;
+        self.sel_anchor = null;
+        self.pref_col = null;
+        self.revision +%= 1;
     }
     pub fn backspace(self: *TextFieldState) void {
+        if (self.deleteSelection()) return;
         if (self.caret == 0) return;
         const start = prevCpStart(self.buffer.items, self.caret);
         const n = self.caret - start;
         std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[self.caret..]);
         self.buffer.shrinkRetainingCapacity(self.buffer.items.len - n);
         self.caret = start;
+        self.pref_col = null;
+        self.revision +%= 1;
     }
-    pub fn moveLeft(self: *TextFieldState) void {
-        if (self.caret == 0) return;
-        self.caret = prevCpStart(self.buffer.items, self.caret);
+    /// Forward-delete (the Delete key): remove the codepoint after the caret.
+    pub fn deleteForward(self: *TextFieldState) void {
+        if (self.deleteSelection()) return;
+        const items = self.buffer.items;
+        if (self.caret >= items.len) return;
+        const len = std.unicode.utf8ByteSequenceLength(items[self.caret]) catch 1;
+        const stop = @min(self.caret + len, items.len);
+        std.mem.copyForwards(u8, self.buffer.items[self.caret..], self.buffer.items[stop..]);
+        self.buffer.shrinkRetainingCapacity(items.len - (stop - self.caret));
+        self.pref_col = null;
+        self.revision +%= 1;
     }
-    pub fn moveRight(self: *TextFieldState) void {
-        if (self.caret >= self.buffer.items.len) return;
-        const len = std.unicode.utf8ByteSequenceLength(self.buffer.items[self.caret]) catch 1;
-        self.caret = @min(self.caret + len, self.buffer.items.len);
+
+    // --- caret movement (extend = Shift held, growing the selection) -------
+
+    fn beginExtend(self: *TextFieldState, extend: bool) void {
+        if (extend) {
+            if (self.sel_anchor == null) self.sel_anchor = self.caret;
+        } else self.sel_anchor = null;
+    }
+    pub fn moveLeft(self: *TextFieldState, extend: bool) void {
+        self.pref_col = null;
+        if (!extend) {
+            if (self.selectionRange()) |r| {
+                self.caret = r.start;
+                self.sel_anchor = null;
+                return;
+            }
+        }
+        self.beginExtend(extend);
+        if (self.caret > 0) self.caret = prevCpStart(self.buffer.items, self.caret);
+    }
+    pub fn moveRight(self: *TextFieldState, extend: bool) void {
+        self.pref_col = null;
+        if (!extend) {
+            if (self.selectionRange()) |r| {
+                self.caret = r.end;
+                self.sel_anchor = null;
+                return;
+            }
+        }
+        self.beginExtend(extend);
+        const items = self.buffer.items;
+        if (self.caret < items.len) {
+            const len = std.unicode.utf8ByteSequenceLength(items[self.caret]) catch 1;
+            self.caret = @min(self.caret + len, items.len);
+        }
+    }
+    pub fn home(self: *TextFieldState, extend: bool) void {
+        self.beginExtend(extend);
+        self.caret = lineStartIndex(self.buffer.items, self.caret);
+        self.pref_col = null;
+    }
+    pub fn end(self: *TextFieldState, extend: bool) void {
+        self.beginExtend(extend);
+        self.caret = lineEndIndex(self.buffer.items, self.caret);
+        self.pref_col = null;
+    }
+    pub fn moveUp(self: *TextFieldState, extend: bool) void {
+        self.beginExtend(extend);
+        const b = self.buffer.items;
+        const ls = lineStartIndex(b, self.caret);
+        if (self.pref_col == null) self.pref_col = columnOf(b, self.caret);
+        if (ls == 0) {
+            self.caret = 0; // already on the first line
+            return;
+        }
+        const prev_end = ls - 1; // the '\n' that ends the previous line
+        const prev_start = lineStartIndex(b, prev_end);
+        self.caret = indexForColumn(b, prev_start, prev_end, self.pref_col.?);
+    }
+    pub fn moveDown(self: *TextFieldState, extend: bool) void {
+        self.beginExtend(extend);
+        const b = self.buffer.items;
+        const le = lineEndIndex(b, self.caret);
+        if (self.pref_col == null) self.pref_col = columnOf(b, self.caret);
+        if (le >= b.len) {
+            self.caret = b.len; // already on the last line
+            return;
+        }
+        const next_start = le + 1;
+        const next_end = lineEndIndex(b, next_start);
+        self.caret = indexForColumn(b, next_start, next_end, self.pref_col.?);
+    }
+    /// The caret's 1-based line and column (counting codepoints), for a status bar.
+    pub fn lineCol(self: *const TextFieldState) struct { line: usize, col: usize } {
+        return .{
+            .line = lineIndexOf(self.buffer.items, self.caret) + 1,
+            .col = columnOf(self.buffer.items, self.caret) + 1,
+        };
     }
 };
 
@@ -250,6 +406,143 @@ fn prevCpStart(bytes: []const u8, i: usize) usize {
     j -= 1;
     while (j > 0 and (bytes[j] & 0xC0) == 0x80) j -= 1; // skip UTF-8 continuation bytes
     return j;
+}
+
+// --- pure line/column geometry over a UTF-8 byte buffer --------------------
+// Lines are separated by '\n'; a column counts codepoints from the line start.
+// Shared by `TextFieldState` movement and `paintTextEditor`.
+
+fn lineStartIndex(bytes: []const u8, i: usize) usize {
+    var j = @min(i, bytes.len);
+    while (j > 0 and bytes[j - 1] != '\n') j -= 1;
+    return j;
+}
+fn lineEndIndex(bytes: []const u8, i: usize) usize {
+    var j = @min(i, bytes.len);
+    while (j < bytes.len and bytes[j] != '\n') j += 1;
+    return j;
+}
+fn columnOf(bytes: []const u8, i: usize) usize {
+    const lim = @min(i, bytes.len);
+    var col: usize = 0;
+    var j = lineStartIndex(bytes, lim);
+    while (j < lim) : (j += 1) {
+        if ((bytes[j] & 0xC0) != 0x80) col += 1; // count non-continuation bytes
+    }
+    return col;
+}
+fn lineIndexOf(bytes: []const u8, i: usize) usize {
+    const lim = @min(i, bytes.len);
+    var n: usize = 0;
+    for (bytes[0..lim]) |b| {
+        if (b == '\n') n += 1;
+    }
+    return n;
+}
+fn countLines(bytes: []const u8) usize {
+    var n: usize = 1;
+    for (bytes) |b| {
+        if (b == '\n') n += 1;
+    }
+    return n;
+}
+/// The byte index `col` codepoints into the line spanning [line_start, line_end].
+fn indexForColumn(bytes: []const u8, line_start: usize, line_end: usize, col: usize) usize {
+    var j = line_start;
+    var c: usize = 0;
+    while (j < line_end and c < col) {
+        j += std.unicode.utf8ByteSequenceLength(bytes[j]) catch 1;
+        c += 1;
+    }
+    return @min(j, line_end);
+}
+/// The byte range [start, end) of the `n`-th line (0-based), clamped to the last.
+fn nthLineRange(bytes: []const u8, n: usize) struct { start: usize, end: usize } {
+    var start: usize = 0;
+    var seen: usize = 0;
+    var j: usize = 0;
+    while (j < bytes.len) : (j += 1) {
+        if (bytes[j] == '\n') {
+            if (seen == n) return .{ .start = start, .end = j };
+            seen += 1;
+            start = j + 1;
+        }
+    }
+    return .{ .start = start, .end = bytes.len };
+}
+/// Editor tab width, in spaces (tabs snap to the next multiple of this).
+const editor_tab_size: f32 = 4;
+
+/// The advance of a single space and a tab stop at `px`, used to lay out the
+/// editor's monospace-ish tab handling.
+fn editorTabMetrics(face: *const ttf.Font, px: f32) struct { space: f32, tab: f32 } {
+    const space = shape.measureLineWidth(face, " ", px);
+    return .{ .space = space, .tab = space * editor_tab_size };
+}
+
+/// Pixel width of `slice`, honoring tab stops (so `\t` advances to the next
+/// multiple of the tab width rather than drawing a `.notdef` box). Shared by the
+/// caret, selection, and click math so they all agree.
+fn editorPrefixWidth(face: *const ttf.Font, px: f32, slice: []const u8) f32 {
+    const sc = face.scaleForPixelSize(px);
+    const tab_w = editorTabMetrics(face, px).tab;
+    var x: f32 = 0;
+    var i: usize = 0;
+    while (i < slice.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(slice[i]) catch 1;
+        const e = @min(i + cp_len, slice.len);
+        if (slice[i] == '\t') {
+            x = (@floor(x / tab_w) + 1) * tab_w;
+        } else {
+            const cp = std.unicode.utf8Decode(slice[i..e]) catch slice[i];
+            x += @as(f32, @floatFromInt(face.advanceWidth(face.glyphIndex(cp)))) * sc;
+        }
+        i = e;
+    }
+    return x;
+}
+
+/// Draw a single editor line, rendering tabs as gaps to the next tab stop
+/// (drawing text between tabs run-by-run) so caret/selection x's line up with it.
+fn drawEditorLine(ctx: *const Context, canvas: *Canvas, line: []const u8, px: f32, color: Color, origin: Point) void {
+    const tab_w = editorTabMetrics(ctx.cache.face, px).tab;
+    var x: f32 = 0;
+    var seg_start: usize = 0;
+    for (line, 0..) |ch, i| {
+        if (ch != '\t') continue;
+        const seg = line[seg_start..i];
+        if (seg.len > 0) {
+            drawTextC(ctx, canvas, seg, px, color, .{ .x = origin.x + x, .y = origin.y }) catch {};
+            x += shape.measureLineWidth(ctx.cache.face, seg, px);
+        }
+        x = (@floor(x / tab_w) + 1) * tab_w;
+        seg_start = i + 1;
+    }
+    const tail = line[seg_start..];
+    if (tail.len > 0) drawTextC(ctx, canvas, tail, px, color, .{ .x = origin.x + x, .y = origin.y }) catch {};
+}
+
+/// The byte offset within `line` whose glyph boundary is nearest to pixel
+/// `target_x` (measured from the line's left edge). Tab-aware; used for click-
+/// to-position.
+fn caretInLine(face: *const ttf.Font, px: f32, line: []const u8, target_x: f32) usize {
+    if (target_x <= 0) return 0;
+    const sc = face.scaleForPixelSize(px);
+    const tab_w = editorTabMetrics(face, px).tab;
+    var x: f32 = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        const e = @min(i + cp_len, line.len);
+        const adv = if (line[i] == '\t')
+            (@floor(x / tab_w) + 1) * tab_w - x
+        else
+            @as(f32, @floatFromInt(face.advanceWidth(face.glyphIndex(std.unicode.utf8Decode(line[i..e]) catch line[i])))) * sc;
+        if (target_x < x + adv / 2) return i; // nearer this cell's left edge
+        x += adv;
+        i = e;
+    }
+    return line.len;
 }
 
 /// A navigation route stack for `NavigationStack`-style flows. Owned by the app
@@ -317,6 +610,9 @@ pub const ScrollState = struct {
 pub const ScrollRegion = struct { rect: Rect, state: *ScrollState };
 
 pub const TextFieldData = struct { state: *TextFieldState, placeholder: []const u8 = "" };
+/// A multi-line, scrollable text editor over a `TextFieldState` (buffer/caret/
+/// selection) with vertical scroll in an app-owned `ScrollState`.
+pub const TextEditorData = struct { state: *TextFieldState, scroll: *ScrollState, line_numbers: bool = true };
 pub const ScrollStateData = struct { state: *ScrollState, content: *const View };
 pub const PickerData = struct { selection: Binding(i64), options: []const []const u8 };
 
@@ -346,6 +642,9 @@ pub const Kind = union(enum) {
     /// offset.
     scroll_state: ScrollStateData,
     textfield: TextFieldData,
+    /// A multi-line editor (see `TextEditorData`). Reuses `TextFieldState`, so it
+    /// shares the focus/keyboard plumbing with `textfield`.
+    text_editor: TextEditorData,
     picker: PickerData,
     /// A transparent container whose children are spliced into the enclosing
     /// stack (used by `ForEach`).
@@ -589,6 +888,15 @@ pub fn Label(title: []const u8, symbol_color: Color) View {
 }
 pub fn TextField(placeholder: []const u8, fieldState: *TextFieldState) View {
     return .{ .kind = .{ .textfield = .{ .state = fieldState, .placeholder = placeholder } } };
+}
+/// A multi-line, scrollable plain-text editor (like SwiftUI's `TextEditor`). It
+/// fills the space it is given. `editor_state` holds the buffer/caret/selection
+/// (app-owned, like a `TextField`); `scroll_state` holds the vertical scroll so
+/// the wheel can drive it and the caret can be followed. Pass `line_numbers` to
+/// show a gutter. The event loop routes editing keys to whichever field is
+/// focused, so no extra wiring is needed beyond owning the two states.
+pub fn TextEditor(editor_state: *TextFieldState, scroll_state: *ScrollState, line_numbers: bool) View {
+    return .{ .kind = .{ .text_editor = .{ .state = editor_state, .scroll = scroll_state, .line_numbers = line_numbers } } };
 }
 /// A segmented picker bound to a selected index.
 pub fn Picker(selection: Binding(i64), options: []const []const u8) View {
@@ -853,9 +1161,37 @@ pub const HitAction = union(enum) {
     step: struct { binding: Binding(i64), delta: i64, min: i64, max: i64 },
     /// Focus a text field (the app is responsible for unfocusing others).
     focus: *TextFieldState,
+    /// Focus a `TextEditor` and place the caret at the clicked point. Carries the
+    /// font metrics and the text-area origin/scroll so the byte index can be
+    /// resolved in `performAction` (which has only the tap point, no `Context`).
+    /// The same payload also drives mouse drag-selection (see `dispatchDrag`).
+    text_click: TextClick,
     /// Select a specific value (e.g. a picker segment).
     select: struct { binding: Binding(i64), value: i64 },
 };
+
+/// Geometry captured for a `TextEditor`'s clickable text area, enough to map a
+/// pixel point to a caret byte index (`caretIndexAt`) without a `Context`.
+pub const TextClick = struct {
+    state: *TextFieldState,
+    face: *const ttf.Font,
+    px: f32,
+    origin: Point,
+    scroll_y: f32,
+    line_height: f32,
+};
+
+/// Map a pixel point to a caret byte index within a `TextEditor`, clamping to
+/// the document (a point above/below/left maps to the nearest edge).
+fn caretIndexAt(tc: TextClick, p: Point) usize {
+    const txt = tc.state.text();
+    const total = countLines(txt);
+    const rel_y = p.y - tc.origin.y + tc.scroll_y;
+    var li: usize = if (rel_y <= 0) 0 else @intFromFloat(rel_y / tc.line_height);
+    if (li >= total) li = total - 1;
+    const r = nthLineRange(txt, li);
+    return r.start + caretInLine(tc.face, tc.px, txt[r.start..r.end], p.x - tc.origin.x);
+}
 
 pub const HitRegion = struct { rect: Rect, action: HitAction, disabled: bool };
 
@@ -1143,6 +1479,12 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             .min = .{ .width = 80, .height = ctx.theme.metrics.control_height },
             .ideal = .{ .width = 180, .height = ctx.theme.metrics.control_height },
             .max = .{ .width = inf, .height = ctx.theme.metrics.control_height },
+        } },
+        // The editor fills the space it is offered (the gutter/scroll live inside).
+        .text_editor => return .{ .leaf = .{
+            .min = .{ .width = 120, .height = 60 },
+            .ideal = .{ .width = 360, .height = 220 },
+            .max = .{ .width = inf, .height = inf },
         } },
         .picker => |pk| {
             const px = ctx.theme.typography.body.size;
@@ -1443,6 +1785,11 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
             const val = ctx.arena.dupe(u8, tf.state.text()) catch "";
             try emitA11y(ctx, v, rect, .text_field, tf.placeholder, val);
         },
+        .text_editor => |ed| {
+            try paintTextEditor(ctx, v, ed, rect, canvas);
+            const val = ctx.arena.dupe(u8, ed.state.text()) catch "";
+            try emitA11y(ctx, v, rect, .text_field, "", val);
+        },
         .picker => |pk| try paintPicker(ctx, pk, rect, canvas),
         .stack => |s| {
             for (s.children, 0..) |child, i| {
@@ -1658,6 +2005,129 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .focus = tf.state }, .disabled = ctx.disabled });
 }
 
+/// Width of the line-number gutter: enough for `nlines`' digits plus padding.
+fn gutterWidth(face: *const ttf.Font, px: f32, nlines: usize, pad: f32) f32 {
+    var digits: usize = 1;
+    var n = nlines;
+    while (n >= 10) : (n = n / 10) digits += 1;
+    const zeros = "0000000000000000000"; // up to 19 digits
+    const s = zeros[0..@min(digits, zeros.len)];
+    return shape.measureLineWidth(face, s, px) + 2 * pad;
+}
+
+/// Paint a multi-line editor: rounded background + focus border, a line-number
+/// gutter, selection highlight, the visible lines (vertically scrolled by the
+/// `ScrollState`), and the caret. Auto-scrolls to keep the caret visible only
+/// when it moved (so the wheel can scroll freely otherwise), registers a
+/// `ScrollRegion` for the wheel, and a `text_click` hit region for click-to-
+/// position-caret.
+fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect, canvas: *Canvas) Allocator.Error!void {
+    const st = ed.state;
+    st.multiline = true;
+    const op = ctx.opacity;
+    const m = ctx.theme.metrics;
+    const px = resolvedFontSize(ctx, v);
+    const face = ctx.cache.face;
+    const lh = shape.lineHeight(face, px);
+    const focused = st.focused;
+
+    const radius = if (v.mods.corner_radius > 0) v.mods.corner_radius else m.control_corner_radius;
+    try canvas.fillRoundedRect(rect, radius, ctx.theme.colors.control_background.multiplyAlpha(op));
+    const border_c = if (focused) ctx.theme.colors.accent else ctx.theme.colors.separator;
+    try canvas.strokeRoundedRect(rect, radius, if (focused) 1.5 else m.hairline, border_c.multiplyAlpha(op));
+
+    const text = st.text();
+    const nlines = countLines(text);
+
+    const pad: f32 = 8;
+    const gutter_w: f32 = if (ed.line_numbers) gutterWidth(face, px, nlines, pad) else pad;
+    const text_x = rect.x + gutter_w + pad;
+    const top = rect.y + pad;
+    const view_h = @max(0, rect.height - 2 * pad);
+
+    // Scroll geometry, then auto-follow the caret only when it actually moved.
+    ed.scroll.content_h = @as(f32, @floatFromInt(nlines)) * lh;
+    ed.scroll.viewport_h = view_h;
+    const caret_line = lineIndexOf(text, st.caret);
+    if (st.caret != st.last_caret) {
+        const cy = @as(f32, @floatFromInt(caret_line)) * lh;
+        if (cy < ed.scroll.offset) {
+            ed.scroll.offset = cy;
+        } else if (cy + lh > ed.scroll.offset + view_h) {
+            ed.scroll.offset = cy + lh - view_h;
+        }
+        st.last_caret = st.caret;
+    }
+    ed.scroll.offset = std.math.clamp(ed.scroll.offset, 0, ed.scroll.maxOffset());
+    const off = ed.scroll.offset;
+
+    const fg = ctx.foreground.multiplyAlpha(op);
+    const num_c = ctx.theme.colors.tertiary_label.multiplyAlpha(op);
+    const sel_c = ctx.theme.colors.selection.multiplyAlpha(op);
+    const sel = st.selectionRange();
+    const space_w = shape.measureLineWidth(face, " ", px);
+
+    // Clip to the interior (inside the border/corners) while drawing content.
+    try canvas.pushClip(rect.insetBy(2, 2), 0);
+
+    if (ed.line_numbers) {
+        const gx = rect.x + gutter_w;
+        try canvas.line(.{ .x = gx, .y = rect.y }, .{ .x = gx, .y = rect.y + rect.height }, m.hairline, ctx.theme.colors.separator.multiplyAlpha(op));
+    }
+
+    var line_no: usize = 0;
+    var pos: usize = 0;
+    while (line_no < nlines) : (line_no += 1) {
+        const lstart = pos;
+        const lend = lineEndIndex(text, lstart);
+        pos = lend + 1; // advance past the '\n' (or one past the end for the last line)
+        const y = top - off + @as(f32, @floatFromInt(line_no)) * lh;
+        if (y + lh < top or y > top + view_h) continue; // fully offscreen
+
+        // Selection highlight: the part of [sel.start, sel.end] inside this line.
+        if (sel) |s| {
+            if (s.start <= lend and s.end >= lstart) {
+                const a = @max(s.start, lstart);
+                const b = @min(s.end, lend);
+                const hx0 = text_x + editorPrefixWidth(face, px, text[lstart..a]);
+                var hx1 = text_x + editorPrefixWidth(face, px, text[lstart..b]);
+                if (s.end > lend) hx1 += space_w; // a selected line-break reads as a trailing sliver
+                try canvas.fillRect(.{ .x = hx0, .y = y, .width = @max(1, hx1 - hx0), .height = lh }, sel_c);
+            }
+        }
+
+        if (ed.line_numbers) {
+            var buf: [20]u8 = undefined;
+            const numstr = std.fmt.bufPrint(&buf, "{d}", .{line_no + 1}) catch "";
+            const nw = shape.measureLineWidth(face, numstr, px);
+            drawTextC(ctx, canvas, numstr, px, num_c, .{ .x = rect.x + gutter_w - pad - nw, .y = y }) catch {};
+        }
+
+        if (lend > lstart) drawEditorLine(ctx, canvas, text[lstart..lend], px, fg, .{ .x = text_x, .y = y });
+
+        if (focused and line_no == caret_line) {
+            const cx = text_x + editorPrefixWidth(face, px, text[lstart..st.caret]);
+            try canvas.line(.{ .x = cx, .y = y + 1 }, .{ .x = cx, .y = y + lh - 1 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
+        }
+    }
+
+    canvas.popClip() catch {};
+
+    try ctx.hit_regions.append(ctx.arena, .{
+        .rect = rect,
+        .action = .{ .text_click = .{
+            .state = st,
+            .face = face,
+            .px = px,
+            .origin = .{ .x = text_x, .y = top },
+            .scroll_y = off,
+            .line_height = lh,
+        } },
+        .disabled = ctx.disabled,
+    });
+    if (ctx.scroll_regions) |regs| try regs.append(ctx.arena, .{ .rect = rect, .state = ed.scroll });
+}
+
 fn paintPicker(ctx: *const Context, pk: PickerData, rect: Rect, canvas: *Canvas) !void {
     const op = ctx.opacity;
     const m = ctx.theme.metrics;
@@ -1728,6 +2198,39 @@ fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas
 // Hit testing
 // ---------------------------------------------------------------------------
 
+/// The `TextEditor` currently being drag-selected (set on mouse-down over its
+/// text, cleared on mouse-up). Identity only — the live geometry is re-read from
+/// the current frame's hit regions on each motion event (so scrolling mid-drag
+/// stays correct). Managed by the app/event loop.
+threadlocal var g_drag: ?*TextFieldState = null;
+
+/// End an in-progress mouse drag-selection (the app calls this on mouse-up).
+pub fn endDrag() void {
+    g_drag = null;
+}
+
+/// Continue a drag-selection started by a mouse-down on a `TextEditor`: extend
+/// the dragging field's caret to `p` (leaving its anchor put, so the selection
+/// grows). The field's `text_click` region is re-emitted every frame, so this
+/// re-reads the current origin/scroll. No-op when no drag is active.
+pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
+    const target = g_drag orelse return;
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled) continue;
+        switch (r.action) {
+            .text_click => |tc| if (tc.state == target) {
+                tc.state.caret = caretIndexAt(tc, p);
+                tc.state.pref_col = null;
+                return;
+            },
+            else => {},
+        }
+    }
+}
+
 /// Dispatch a tap at `p` to the top-most enabled hit region containing it.
 /// Returns true if a callback fired.
 pub fn dispatchTap(regions: []const HitRegion, p: Point) bool {
@@ -1773,6 +2276,17 @@ fn performAction(a: HitAction, p: Point) void {
             s.binding.set(next);
         },
         .focus => |fs| setFocus(fs),
+        .text_click => |tc| {
+            setFocus(tc.state);
+            const idx = caretIndexAt(tc, p);
+            tc.state.caret = idx;
+            tc.state.last_caret = idx;
+            // Anchor the selection here: a pure click leaves anchor == caret (no
+            // selection); a drag (see dispatchDrag) then extends from this point.
+            tc.state.sel_anchor = idx;
+            tc.state.pref_col = null;
+            g_drag = tc.state;
+        },
         .select => |s| s.binding.set(s.value),
     }
 }
@@ -2285,8 +2799,8 @@ test "TextFieldState: editing operations" {
     try testing.expectEqual(@as(usize, 5), tf.caret);
     tf.backspace();
     try testing.expectEqualStrings("hell", tf.text());
-    tf.moveLeft();
-    tf.moveLeft();
+    tf.moveLeft(false);
+    tf.moveLeft(false);
     try tf.insert("X");
     try testing.expectEqualStrings("heXll", tf.text());
     try tf.setText("done");
@@ -2301,6 +2815,146 @@ test "TextFieldState: backspace handles a multi-byte codepoint" {
     try testing.expectEqual(@as(usize, 2), tf.caret);
     tf.backspace();
     try testing.expectEqual(@as(usize, 0), tf.text().len);
+}
+
+test "TextFieldState: selection editing (insert/backspace replace, selectAll)" {
+    var tf = TextFieldState.init(testing.allocator);
+    defer tf.deinit();
+    try tf.setText("hello world");
+    // Select "world" by anchoring at 6 and moving to the end.
+    tf.caret = 6;
+    tf.sel_anchor = 6;
+    tf.end(true);
+    const r = tf.selectionRange().?;
+    try testing.expectEqual(@as(usize, 6), r.start);
+    try testing.expectEqual(@as(usize, 11), r.end);
+    // Typing replaces the selection.
+    try tf.insert("there");
+    try testing.expectEqualStrings("hello there", tf.text());
+    try testing.expect(!tf.hasSelection());
+    // Select-all then backspace clears everything.
+    tf.selectAll();
+    tf.backspace();
+    try testing.expectEqual(@as(usize, 0), tf.text().len);
+}
+
+test "TextFieldState: a plain move collapses the selection to an edge" {
+    var tf = TextFieldState.init(testing.allocator);
+    defer tf.deinit();
+    try tf.setText("abcdef");
+    tf.caret = 1;
+    tf.sel_anchor = 4; // selection [1,4)
+    tf.moveLeft(false); // collapse to the left edge
+    try testing.expectEqual(@as(usize, 1), tf.caret);
+    try testing.expect(!tf.hasSelection());
+    tf.caret = 1;
+    tf.sel_anchor = 4;
+    tf.moveRight(false); // collapse to the right edge
+    try testing.expectEqual(@as(usize, 4), tf.caret);
+    try testing.expect(!tf.hasSelection());
+}
+
+test "TextFieldState: multi-line up/down keeps the preferred column" {
+    var tf = TextFieldState.init(testing.allocator);
+    defer tf.deinit();
+    try tf.setText("hello\nhi\nworld"); // lines: 0:"hello" 1:"hi" 2:"world"
+    // Put the caret at column 4 of the first line ("hell|o").
+    tf.caret = 4;
+    tf.moveDown(false); // line 1 "hi" is shorter -> clamp to its end (col 2, byte 8)
+    try testing.expectEqual(@as(usize, 8), tf.caret);
+    tf.moveDown(false); // line 2 "world" -> preferred column 4 restored ("worl|d", byte 9+4)
+    try testing.expectEqual(@as(usize, 13), tf.caret);
+    // Home/End and 1-based line/col.
+    tf.home(false);
+    try testing.expectEqual(@as(usize, 9), tf.caret);
+    const lc = tf.lineCol();
+    try testing.expectEqual(@as(usize, 3), lc.line);
+    try testing.expectEqual(@as(usize, 1), lc.col);
+    tf.end(false);
+    try testing.expectEqual(@as(usize, 14), tf.caret);
+}
+
+test "TextFieldState: forward delete and revision tracking" {
+    var tf = TextFieldState.init(testing.allocator);
+    defer tf.deinit();
+    try tf.setText("abc");
+    const r0 = tf.revision;
+    tf.caret = 1;
+    tf.deleteForward(); // removes 'b'
+    try testing.expectEqualStrings("ac", tf.text());
+    try testing.expectEqual(@as(usize, 1), tf.caret);
+    try testing.expect(tf.revision != r0); // a mutation bumped the revision
+    tf.caret = tf.buffer.items.len;
+    tf.deleteForward(); // at end -> no-op
+    try testing.expectEqualStrings("ac", tf.text());
+}
+
+test "view: editorPrefixWidth snaps tabs to tab stops" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    const face = &env.font.face;
+    const px: f32 = 14;
+    const tab_w = editorTabMetrics(face, px).tab;
+    // A leading tab advances exactly one tab stop.
+    try testing.expectApproxEqAbs(tab_w, editorPrefixWidth(face, px, "\t"), 0.01);
+    // Text then a tab snaps forward to the *next* stop (never less than the text).
+    const w_ab = shape.measureLineWidth(face, "ab", px);
+    const after = editorPrefixWidth(face, px, "ab\t");
+    try testing.expect(after > w_ab);
+    try testing.expectApproxEqAbs(@as(f32, 0), @mod(after, tab_w), 0.01);
+}
+
+test "view: TextEditor paints line numbers and places the caret on click" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ed = TextFieldState.init(testing.allocator);
+    defer ed.deinit();
+    var sc = ScrollState{};
+    try ed.setText("alpha\nbeta\ngamma");
+    ed.caret = 0;
+    ed.last_caret = 0;
+
+    var fb = try renderToFb(&env, &c, TextEditor(&ed, &sc, true), .{ .x = 0, .y = 0, .width = 300, .height = 200 }, 300, 200);
+    defer fb.deinit();
+    // The editor registers one hit region (the whole rect) carrying a text_click.
+    try testing.expectEqual(@as(usize, 1), env.hits.items.len);
+    try testing.expect(env.hits.items[0].action == .text_click);
+
+    // Click on the second visible line -> caret lands on line 1 ("beta").
+    const lh = shape.lineHeight(&env.font.face, c.theme.typography.body.size);
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 200, .y = 8 + lh + 2 }));
+    try testing.expect(ed.focused);
+    try testing.expectEqual(@as(usize, 1), lineIndexOf(ed.text(), ed.caret));
+}
+
+test "view: TextEditor mouse drag selects a range" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ed = TextFieldState.init(testing.allocator);
+    defer ed.deinit();
+    var sc = ScrollState{};
+    try ed.setText("alpha\nbeta\ngamma");
+
+    var fb = try renderToFb(&env, &c, TextEditor(&ed, &sc, true), .{ .x = 0, .y = 0, .width = 300, .height = 200 }, 300, 200);
+    defer fb.deinit();
+    const lh = shape.lineHeight(&env.font.face, c.theme.typography.body.size);
+
+    // Press near the start of line 0 ("alpha"), then drag to the end of line 1.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 2, .y = 8 + 2 }));
+    try testing.expect(!ed.hasSelection()); // a press alone is just a caret
+    dispatchDrag(env.hits.items, .{ .x = 250, .y = 8 + lh + 2 });
+    const r = ed.selectionRange().?;
+    try testing.expectEqual(@as(usize, 0), r.start);
+    try testing.expectEqual(@as(usize, 10), r.end); // through the end of "beta"
+    endDrag();
+    // After the drag ends, a further "motion" must not change the selection.
+    dispatchDrag(env.hits.items, .{ .x = 10, .y = 8 + 2 });
+    try testing.expectEqual(@as(usize, 10), ed.selectionRange().?.end);
 }
 
 test "view: TextField paints, focuses on tap, and shows a caret" {

@@ -68,6 +68,16 @@ pub fn setBusyCheck(f: ?*const fn () bool) void {
     g_busy_fn = f;
 }
 
+/// An optional application key handler, called first on every key-down with the
+/// SDL keycode (`SDLK_*`) and modifier mask (`SDL_KMOD_*`, both reachable via
+/// `app.c`). Return true to mark the key consumed — the loop then skips its
+/// default text-field editing for that event. Use it for app shortcuts and
+/// clipboard (e.g. ⌘S / ⌘O / ⌘C / ⌘V). Mirrors `setBusyCheck`.
+var g_key_fn: ?*const fn (key: u32, mods: u16) bool = null;
+pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
+    g_key_fn = f;
+}
+
 // ---------------------------------------------------------------------------
 // System tray / menu bar (cross-platform via SDL3's native tray API:
 // NSStatusItem on macOS, Shell_NotifyIcon on Windows, StatusNotifierItem on
@@ -362,8 +372,16 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
             const p = zigui.geometry.Point{ .x = ev.button.x, .y = ev.button.y };
             zigui.clearFocus(); // a click defocuses; dispatch may refocus a field
+            zigui.endDrag(); // reset any stale drag; dispatchTap re-arms over an editor
             _ = zigui.dispatchTap(hits, p);
         },
+        // Drag the mouse with the left button held to extend a text selection.
+        c.SDL_EVENT_MOUSE_MOTION => {
+            if ((ev.motion.state & c.SDL_BUTTON_LMASK) != 0) {
+                zigui.dispatchDrag(hits, .{ .x = ev.motion.x, .y = ev.motion.y });
+            }
+        },
+        c.SDL_EVENT_MOUSE_BUTTON_UP => zigui.endDrag(),
         c.SDL_EVENT_MOUSE_WHEEL => {
             var mx: f32 = 0;
             var my: f32 = 0;
@@ -377,12 +395,26 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             }
         },
         c.SDL_EVENT_KEY_DOWN => {
+            // App shortcuts/clipboard get first refusal; a true return consumes
+            // the key so default editing below is skipped.
+            if (g_key_fn) |kf| {
+                if (kf(ev.key.key, @intCast(ev.key.mod))) return;
+            }
             if (zigui.focusedField()) |f| {
+                const shift = (ev.key.mod & c.SDL_KMOD_SHIFT) != 0;
                 switch (ev.key.key) {
                     c.SDLK_BACKSPACE => f.backspace(),
-                    c.SDLK_LEFT => f.moveLeft(),
-                    c.SDLK_RIGHT => f.moveRight(),
-                    c.SDLK_RETURN => zigui.submitFocused(),
+                    c.SDLK_DELETE => f.deleteForward(),
+                    c.SDLK_LEFT => f.moveLeft(shift),
+                    c.SDLK_RIGHT => f.moveRight(shift),
+                    c.SDLK_UP => f.moveUp(shift),
+                    c.SDLK_DOWN => f.moveDown(shift),
+                    c.SDLK_HOME => f.home(shift),
+                    c.SDLK_END => f.end(shift),
+                    // Multi-line editors insert a newline; single-line fields submit.
+                    c.SDLK_RETURN, c.SDLK_KP_ENTER => if (f.multiline) f.insert("\n") catch {} else zigui.submitFocused(),
+                    // Tab indents a multi-line editor (no focus traversal here).
+                    c.SDLK_TAB => if (f.multiline) f.insert("    ") catch {},
                     c.SDLK_ESCAPE => zigui.clearFocus(),
                     else => {},
                 }

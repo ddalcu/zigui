@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     addExample(b, mod, target, optimize, "settings", "examples/settings/main.zig");
     addExample(b, mod, target, optimize, "showcase", "examples/showcase/main.zig");
     addExample(b, mod, target, optimize, "llm-chat", "examples/llm-chat/main.zig");
+    addExample(b, mod, target, optimize, "edit", "examples/edit/main.zig");
 
     // A headless screenshot tool: renders a UI to a BMP using *only* the pure
     // `zigui` module + libc (no SDL), so CI can produce a per-OS screenshot on

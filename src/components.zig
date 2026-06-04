@@ -39,6 +39,7 @@ pub const Label = view.Label;
 pub const Image = view.Image;
 pub const TextField = view.TextField;
 pub const TextFieldState = view.TextFieldState;
+pub const TextEditor = view.TextEditor;
 
 // Controls
 pub const Button = view.Button;

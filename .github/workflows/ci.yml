@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The core library has no C dependencies, so the full test suite runs on every
+  # OS with just the Zig toolchain — no GPU or window server needed.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - name: Run tests
+        run: zig build test --summary all
+
+  # The SDL3-backed examples are built (not run) to verify the backend links.
+  examples:
+    name: build examples (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+      - name: Install SDL3 (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sdl3
+      - name: Install SDL3 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsdl3-dev || echo "libsdl3-dev not available; examples build is best-effort"
+      - name: Build examples
+        run: zig build hello settings
+
+  # Reproduce the Linux test run inside Docker (mirrors local `docker build`).
+  docker:
+    name: docker linux test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & test in Docker
+        run: docker build -t zigui-test .

@@ -7,9 +7,11 @@ on:
 
 jobs:
   # The core library has no C dependencies, so the full test suite runs on every
-  # OS with just the Zig toolchain — no GPU or window server needed.
+  # OS with just the Zig toolchain. Each OS also renders a UI screenshot (pure
+  # renderer, no SDL) and uploads it as an artifact, so you can see — and diff —
+  # how zigui looks on each platform.
   test:
-    name: test (${{ matrix.os }})
+    name: test + screenshot (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -17,35 +19,39 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      # setup-zig@v2 resolves tagged releases like 0.16.0 (v1's mirrors 404 for it).
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
       - name: Run tests
         run: zig build test --summary all
+      - name: Render UI screenshot (pure renderer, no SDL)
+        shell: bash
+        continue-on-error: true
+        run: zig build run-screenshot -Doptimize=ReleaseFast -- "zigui-${{ matrix.os }}.bmp"
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-${{ matrix.os }}
+          path: "zigui-${{ matrix.os }}.bmp"
+          if-no-files-found: warn
 
   # The SDL3-backed examples are built (not run) to verify the backend links.
+  # macOS only: SDL3 installs cleanly via Homebrew, whereas it isn't yet packaged
+  # in the Ubuntu runner's apt. (Core Linux coverage is the test + docker jobs.)
   examples:
-    name: build examples (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: build examples (macOS)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v1
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - name: Install SDL3 (macOS)
-        if: runner.os == 'macOS'
+      - name: Install SDL3
         run: brew install sdl3
-      - name: Install SDL3 (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libsdl3-dev || echo "libsdl3-dev not available; examples build is best-effort"
       - name: Build examples
-        run: zig build hello settings
+        run: zig build hello settings showcase llm-chat
 
   # Reproduce the Linux test run inside Docker (mirrors local `docker build`).
   docker:

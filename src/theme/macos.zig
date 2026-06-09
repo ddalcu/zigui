@@ -32,12 +32,18 @@ pub const light = Theme{
         .secondary_label = Color.black.withAlpha(0.50),
         .tertiary_label = Color.black.withAlpha(0.26),
         .on_accent = Color.white,
-        .window_background = Color.fromRgb8(236, 236, 236),
-        .secondary_background = Color.fromRgb8(246, 246, 246),
+        // macOS 26 windows read brighter and a touch warmer than the flat grey.
+        .window_background = Color.fromRgb8(242, 242, 247),
+        .secondary_background = Color.fromRgb8(250, 250, 252),
         .control_background = Color.white,
         .separator = Color.black.withAlpha(0.10),
         .selection = Color.fromRgb8(0, 122, 255),
         .destructive = Color.fromRgb8(255, 59, 48), // System Red
+        // Liquid Glass
+        .hover = Color.black.withAlpha(0.06),
+        .control_border = Color.black.withAlpha(0.08),
+        .glass = Color.white.withAlpha(0.65),
+        .control_track = Color.black.withAlpha(0.06),
     },
 };
 
@@ -50,12 +56,17 @@ pub const dark = Theme{
         .secondary_label = Color.white.withAlpha(0.55),
         .tertiary_label = Color.white.withAlpha(0.25),
         .on_accent = Color.white,
-        .window_background = Color.fromRgb8(30, 30, 30),
-        .secondary_background = Color.fromRgb8(40, 40, 40),
-        .control_background = Color.fromRgb8(44, 44, 46),
+        .window_background = Color.fromRgb8(28, 28, 30),
+        .secondary_background = Color.fromRgb8(38, 38, 41),
+        .control_background = Color.fromRgb8(54, 54, 58),
         .separator = Color.white.withAlpha(0.15),
         .selection = Color.fromRgb8(10, 132, 255),
         .destructive = Color.fromRgb8(255, 69, 58),
+        // Liquid Glass
+        .hover = Color.white.withAlpha(0.10),
+        .control_border = Color.white.withAlpha(0.14),
+        .glass = Color.fromRgb8(60, 60, 64).withAlpha(0.55),
+        .control_track = Color.white.withAlpha(0.10),
     },
 };
 

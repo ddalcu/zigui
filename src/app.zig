@@ -503,10 +503,13 @@ pub fn run(
             // framebuffer clear and Context agree with whatever the body painted.
             _ = frame_arena.reset(.retain_capacity);
             const arena = frame_arena.allocator();
+            const theme = if (g_theme_fn) |f| f() else fr.cfg.theme;
+            // Publish the active theme's selection tints so composed constructors
+            // (Sidebar/Table/RadioGroup) pick up dark mode and custom accents.
+            zigui.setThemeTokens(theme);
             zigui.beginBuild(arena);
             const root = body(fr.st);
             zigui.endBuild();
-            const theme = if (g_theme_fn) |f| f() else fr.cfg.theme;
 
             // Reset to empty (not clearRetainingCapacity): the previous buffer was
             // arena-allocated and the reset above reclaimed it, so keeping the old

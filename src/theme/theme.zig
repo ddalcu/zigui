@@ -53,6 +53,21 @@ pub const Colors = struct {
     selection: Color,
     /// Destructive / error (System Red).
     destructive: Color,
+
+    // --- macOS 26 "Liquid Glass" roles ------------------------------------
+    // Translucent, layered surfaces with bright edge highlights. These let
+    // controls read as panes of frosted glass rather than flat fills.
+
+    /// A subtle fill painted behind a control/row while the cursor hovers it.
+    hover: Color,
+    /// The bright hairline edge along the top/sides of a glass control, giving
+    /// it the lit-from-above "liquid glass" rim.
+    control_border: Color,
+    /// A translucent tint laid over blurred content for glass panels (sidebars,
+    /// toolbars, sheets). Pair with a blur for true vibrancy.
+    glass: Color,
+    /// Fill for an unselected segmented/glass control track.
+    control_track: Color,
 };
 
 /// The typographic scale, mirroring SwiftUI's `Font.TextStyle` cases at macOS
@@ -84,12 +99,16 @@ pub const Metrics = struct {
     spacing_large: f32 = 16,
     /// Default content padding.
     padding: f32 = 8,
-    /// Corner radius for cards / grouped containers.
-    corner_radius: f32 = 8,
+    /// Corner radius for cards / grouped containers (macOS 26 rounds these more).
+    corner_radius: f32 = 12,
     /// Corner radius for push buttons and controls.
-    control_corner_radius: f32 = 6,
+    control_corner_radius: f32 = 7,
+    /// Corner radius for large glass panels (sidebars, sheets, popovers).
+    panel_corner_radius: f32 = 16,
     /// Standard control (button/field) height.
     control_height: f32 = 28,
+    /// Rounded selection-highlight radius for sidebar / list rows.
+    selection_corner_radius: f32 = 8,
     /// Window corner radius.
     window_corner_radius: f32 = 10,
     /// Hairline thickness for separators/borders at 1x.
@@ -148,5 +167,7 @@ test "Theme: font() resolves named styles" {
 test "Metrics: sensible defaults" {
     const m = Metrics{};
     try testing.expectEqual(@as(f32, 8), m.spacing);
-    try testing.expectEqual(@as(f32, 6), m.control_corner_radius);
+    try testing.expectEqual(@as(f32, 7), m.control_corner_radius);
+    // Liquid Glass rounds panels more than controls.
+    try testing.expect(m.panel_corner_radius > m.corner_radius);
 }

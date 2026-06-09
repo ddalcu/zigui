@@ -23,18 +23,22 @@ seams each one uses.
 ## Build / test / run — and the gotchas
 
 ```sh
-zig build test --summary all                # 152 tests, headless. THIS is the inner loop.
-zig build hello settings showcase llm-chat edit  # build the examples (does NOT run them)
+zig build test --summary all                # 169 tests, headless. THIS is the inner loop.
+zig build showcase edit                      # build the two examples (does NOT run them)
 zig build run-showcase                       # opens a window — blocks on the event loop
 docker build -t zigui-test .                 # run the full suite on Linux
 
-# Headless proof the llm-chat networking works against a real LLM (no window):
-./zig-out/bin/llm-chat --smoke "say hi" --model <name>            # one-shot
-./zig-out/bin/llm-chat --smoke "count to 5" --model <name> --stream  # SSE path
-
-# Headless UI iteration for the text editor (renders one frame to a BMP):
+# Headless UI iteration (renders one frame to a BMP, no window):
+./zig-out/bin/showcase --screenshot /tmp/sc.bmp [section] [--dark] [--accent N]
 ./zig-out/bin/edit --screenshot /tmp/edit.bmp [file] [--demo-find|--demo-dialog]
+# sips -s format png /tmp/sc.bmp --out /tmp/sc.png   # to view on macOS
 ```
+
+There are exactly **two examples**: `examples/showcase` (the kitchen-sink gallery
+— every public component across sidebar sections, plus live light/dark and accent
+switchers, built on the macOS 26 theme) and `examples/edit` (the multi-line text
+editor). The old `hello`/`settings`/`llm-chat`/`screenshot` examples were folded
+into `showcase` and removed.
 
 - **Use `zig build test`, NOT `zig test src/zigui.zig`.** The bundled Inter font
   is an anonymous import `inter_font` wired only in `build.zig`
@@ -42,8 +46,8 @@ docker build -t zigui-test .                 # run the full suite on Linux
   `@embedFile("inter_font")`. The raw `zig test` invocation has no such import
   and fails.
 - **Never run `zig build run-*` in a headless/agent context** — it opens an SDL
-  window and blocks in `SDL_WaitEvent`. Use `zig build hello settings` to verify
-  the backend compiles/links.
+  window and blocks in `SDL_WaitEvent`. Use `zig build showcase edit` to verify
+  the backend compiles/links, or the `--screenshot` flag to render one frame.
 - Tests are **inline** (`test "..." {}` blocks). A module's tests only run if the
   root (`src/zigui.zig`) imports it — add a `pub const x = @import(...)` there.
 - **Zig 0.16 gotchas hit during the build** (so you don't rediscover them):
@@ -169,12 +173,57 @@ rows, and returns a `VStack` of `HStack`s; `LazyHGrid` is the transpose. Cells g
 padded with invisible `Empty()` cells so **columns stay aligned**. No `Kind`-level
 grid was needed. (`view.zig`; tests `LazyVGrid …`/`LazyHGrid …`.)
 
+### macOS 26 "Liquid Glass" theme — extra `Colors`/`Metrics` tokens + glassy paint
+The theme grew translucent-surface roles (`colors.hover`, `control_border`,
+`glass`, `control_track`) and rounder metrics (`corner_radius` 12,
+`control_corner_radius` 7, `panel_corner_radius` 16, `selection_corner_radius`).
+The glassy *look* is in the paint functions: `paintButton`/`paintToggle`(on)/
+`paintPicker`(selected segment) now emit a **vertical `linear_gradient` sheen**
+(`Color.lighten`/`darken`, added to `color.zig`) plus a bright white-alpha rim
+`stroke_rrect`, instead of a flat `fill_rrect`. Keep that pattern for new glass
+controls. `examples/showcase` pick it all up for free.
+
+### Build-time theme tokens — `setThemeTokens` / `BuildTokens` (for composed controls)
+Composed constructors have **no `Context`** (the long-standing reason
+`NavigationSplitView` takes a `sidebar_fill: Color`), but selection-driven ones
+need the accent/hover tints at *build* time. So `view.zig` keeps a thread-local
+`BuildTokens` (accent, on_accent, hover, row_stripe) that the app publishes once
+per frame via `setThemeTokens(theme)` — wired in `app.zig` right before
+`beginBuild`. Defaults match the macOS **light** theme, so headless tests and
+un-wired callers render correctly with no setup. `selectAction(binding, value)`
+is the matching reusable `Callback` (a build-arena `{binding,value}` + thunk, like
+`NavPushCtx`) that lets selection be pure composition over `onTap` — no new
+`HitAction`. Sidebar/Table/RadioGroup all use it.
+
+### Sidebar / Table / RadioGroup — new macOS components (all pure composition)
+- **`Sidebar(items: []const SidebarItem, selection: Binding(i64))`** — a source-
+  list of rows (`SidebarItem{label, icon: ?IconName}`) with a rounded accent
+  selection highlight, leading icon, and `hoverFill`. Each row is an `HStack`
+  `.onTap(selectAction(...))`. **Gotcha:** the row's children must be allocated in
+  `buildAlloc()` — `makeStackFromSlice` keeps the slice, so a stack-local array
+  dangles after the constructor returns.
+- **`Table(columns: []const TableColumn, rows: []const []const []const u8,
+  selection: ?Binding(i64))`** — a header `HStack` over a `ScrollView` of row
+  `HStack`s, with zebra striping (`build_tokens.row_stripe`) and an accent
+  selected row. `TableColumn{title, width: ?f32}` (null width = flexible). Cells
+  are left-aligned via `tableCell` (`HStack(.{content, Spacer()})`). Wrap in a
+  fixed frame for the scrollable look.
+- **`RadioGroup(selection: Binding(i64), options: []const []const u8)`** — a
+  vertical list of rows; the dot is `radioIndicator` (layered `Circle`s: accent
+  disc + white center when selected, hollow ring otherwise).
+
+`examples/showcase` demos every component (sidebar shell + per-category pages)
+and has a headless `--screenshot <out.bmp> [section]` path (libc BMP writer, wires
+the icon cache + `setThemeTokens`) for visual iteration without a window.
+
 ### TabView — `Tab` + `TabView` (composition, reuses `.select`)
-`TabView(selection: Binding(i64), tabs: []const Tab)` →
-`VStack(.{ tabs[sel].content.frameMaxWidth(), Divider(), bar })`. The tab **bar is
-a `Picker`** over the tab labels — that reuses `Picker`'s `.select` `HitAction` and
-its selected-segment styling for free, so no new interaction was added. The body
-switches on the binding; rebuilt each frame.
+`TabView(selection: Binding(i64), tabs: []const Tab)` → a **centered glass
+segmented bar on top** (macOS style), then `Divider()`, then the selected tab's
+content filling the rest: `VStack(.{ bar, Divider(), content.frameMaxWidth()
+.frameMaxHeight() }).spacing(0)`, where `bar = HStack(.{ Spacer(), Picker(...),
+Spacer() })`. The tab **bar is a `Picker`** over the tab labels — that reuses
+`Picker`'s `.select` `HitAction` and its selected-segment styling for free, so no
+new interaction was added. The body switches on the binding; rebuilt each frame.
 
 ### Navigation — `NavigationSplitView` + `NavState`/`NavigationLink`/`NavBackButton`
 - **Split view:** `NavigationSplitView(sidebar, detail, sidebar_fill: Color)` =

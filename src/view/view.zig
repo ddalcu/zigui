@@ -76,6 +76,25 @@ pub fn actionCtx(comptime T: type, ctx: *T, comptime f: fn (*T) void) Callback {
     }.g };
 }
 
+/// Closure context for `selectAction`: a (binding, value) pair bound at build
+/// time and stored in the per-frame build arena, which outlives the frame until
+/// the next rebuild, so a hit region's callback can safely read it.
+const SelectCtx = struct { binding: Binding(i64), value: i64 };
+
+fn selectThunk(p: ?*anyopaque) void {
+    const c: *SelectCtx = @ptrCast(@alignCast(p.?));
+    c.binding.set(c.value);
+}
+
+/// A `Callback` that sets `binding` to `value` — the building block for selection
+/// in composed controls (sidebar rows, radio options, table rows). Lets those
+/// stay pure composition over `onTap` without a dedicated `HitAction`.
+pub fn selectAction(binding: Binding(i64), value: i64) Callback {
+    const c = buildAlloc().create(SelectCtx) catch @panic("oom");
+    c.* = .{ .binding = binding, .value = value };
+    return .{ .ctx = c, .func = selectThunk };
+}
+
 // ---------------------------------------------------------------------------
 // Fills, fonts, modifiers
 // ---------------------------------------------------------------------------
@@ -171,7 +190,10 @@ pub const Modifiers = struct {
     /// field's `TextFieldState` during paint; see `submitFocused`.
     on_submit: ?Callback = null,
     disabled: bool = false,
-    overlay: ?OverlayMod = null,
+    /// Overlays presented from this view (sheets/alerts/popovers). A slice so a
+    /// view can stack more than one — chaining `.sheet(...).alert(...)` appends
+    /// rather than overwriting.
+    overlay: []const OverlayMod = &.{},
     /// Overrides the auto-derived accessibility label for this view.
     a11y_label: ?[]const u8 = null,
     /// Hides this view (and its subtree) from the accessibility tree.
@@ -855,8 +877,14 @@ pub const View = struct {
     fn withOverlay(self: View, presented: Binding(bool), content: View, style: OverlayStyle) View {
         const boxed = buildAlloc().create(View) catch @panic("oom");
         boxed.* = content;
+        // Append to any overlays already attached so `.sheet(...).alert(...)` keeps
+        // both rather than the second clobbering the first.
+        const old = self.mods.overlay;
+        const list = buildAlloc().alloc(OverlayMod, old.len + 1) catch @panic("oom");
+        @memcpy(list[0..old.len], old);
+        list[old.len] = .{ .presented = presented, .content = boxed, .style = style };
         var v = self;
-        v.mods.overlay = .{ .presented = presented, .content = boxed, .style = style };
+        v.mods.overlay = list;
         return v;
     }
     /// Override the accessibility label exposed for this view.
@@ -893,6 +921,32 @@ pub const View = struct {
 // ---------------------------------------------------------------------------
 
 threadlocal var current_arena: ?Allocator = null;
+
+/// The handful of theme colors that *composed* (theme-less) constructors need at
+/// build time — chiefly selection tints for `Sidebar`/`Table`/`RadioGroup`.
+/// Constructors have no `Context`, so the app publishes these once per frame via
+/// `setThemeTokens`. The defaults match the macOS light theme, so headless tests
+/// and un-wired callers render correctly without any setup.
+pub const BuildTokens = struct {
+    accent: Color = Color.fromRgb8(0, 122, 255),
+    on_accent: Color = Color.white,
+    /// Subtle fill behind a hovered row.
+    hover: Color = Color.black.withAlpha(0.06),
+    /// Alternating-row stripe in tables.
+    row_stripe: Color = Color.black.withAlpha(0.03),
+};
+threadlocal var build_tokens: BuildTokens = .{};
+
+/// Publish the active theme's build-time tokens for composed constructors. Call
+/// once per frame (the app does this in its build step) before building views.
+pub fn setThemeTokens(t: Theme) void {
+    build_tokens = .{
+        .accent = t.colors.accent,
+        .on_accent = t.colors.on_accent,
+        .hover = t.colors.hover,
+        .row_stripe = if (t.scheme == .dark) Color.white.withAlpha(0.04) else Color.black.withAlpha(0.03),
+    };
+}
 
 /// Set the arena used by view constructors for the duration of building a view
 /// tree. The framework calls this each frame; tests call it directly.
@@ -1099,11 +1153,12 @@ pub fn LazyHGrid(rows: usize, spc: f32, items: anytype, comptime mapFn: anytype)
 /// shown when that tab is selected.
 pub const Tab = struct { label: []const u8, content: View };
 
-/// A tabbed container: shows the content of the selected tab above a segmented
-/// tab bar. Built by composition — the bar is a `Picker` over the tab labels, so
-/// tapping a segment drives the same `.select` interaction as `Picker` (and the
-/// `selection` binding is what the body switches on). Rebuilt each frame, so
-/// "switching tabs" is just the binding changing.
+/// A tabbed container in the macOS style: a centered glass segmented control at
+/// the top, a hairline, then the selected tab's content filling the space below.
+/// Built by composition — the bar is a `Picker` over the tab labels, so tapping a
+/// segment drives the same `.select` interaction as `Picker` (and the `selection`
+/// binding is what the body switches on). Rebuilt each frame, so "switching tabs"
+/// is just the binding changing.
 pub fn TabView(selection: Binding(i64), tabs: []const Tab) View {
     const n = tabs.len;
     if (n == 0) return Empty();
@@ -1111,19 +1166,170 @@ pub fn TabView(selection: Binding(i64), tabs: []const Tab) View {
     const sel: usize = @intCast(std.math.clamp(selection.get(), 0, hi));
     const labels = buildAlloc().alloc([]const u8, n) catch @panic("oom");
     for (tabs, 0..) |tab, i| labels[i] = tab.label;
-    const bar = Picker(selection, labels).frameMaxWidth();
-    return VStack(.{ tabs[sel].content.frameMaxWidth(), Divider(), bar });
+    // Center the segmented control like a macOS tab bar (it sizes to its content).
+    const bar = HStack(.{ Spacer(), Picker(selection, labels), Spacer() })
+        .paddingInsets(.{ .top = 6, .leading = 8, .bottom = 6, .trailing = 8 })
+        .frameMaxWidth();
+    return VStack(.{
+        bar,
+        Divider(),
+        tabs[sel].content.frameMaxWidth().frameMaxHeight(),
+    }).spacing(0);
 }
 
 /// A two-column master/detail layout: a fixed-width `sidebar` pane (filled with
 /// `sidebar_fill` so it stays themable), a vertical hairline, and a `detail`
-/// pane that fills the remaining width. Pure composition over `HStack`.
+/// pane that fills the remaining width. Pure composition over `HStack`. For the
+/// macOS 26 look, fill the sidebar with a `Material` (frosted glass) and put a
+/// `Sidebar` list inside it.
 pub fn NavigationSplitView(sidebar: View, detail: View, sidebar_fill: Color) View {
     return makeStack(.horizontal, 0, .center, .{
         sidebar.frameWidth(220).frameMaxHeight().background(sidebar_fill),
         VDivider(),
         detail.frameMaxWidth().frameMaxHeight(),
     });
+}
+
+/// One row of a `Sidebar`: a title and an optional leading icon. Mirrors
+/// SwiftUI's `Label(item, systemImage:)` rows in a `.sidebar`-styled `List`.
+pub const SidebarItem = struct { label: []const u8, icon: ?icons.Icon = null };
+
+/// A macOS 26 source-list sidebar: a vertical list of selectable rows with a
+/// rounded "liquid glass" selection highlight, a leading icon, and a live hover
+/// fill. Pure composition — each row is an `HStack` with an `onTap(selectAction)`
+/// that drives `selection`. Drop it inside a `NavigationSplitView`'s sidebar pane
+/// (ideally over a `Material`).
+pub fn Sidebar(items: []const SidebarItem, selection: Binding(i64)) View {
+    const rows = buildAlloc().alloc(View, items.len) catch @panic("oom");
+    for (items, 0..) |item, i| {
+        const is_sel = selection.get() == @as(i64, @intCast(i));
+        const fg: ?Color = if (is_sel) build_tokens.on_accent else null;
+        // Allocate the row's children in the build arena — `makeStackFromSlice`
+        // keeps the slice, so a stack-local array would dangle after we return.
+        const contents = buildAlloc().alloc(View, 3) catch @panic("oom");
+        var k: usize = 0;
+        if (item.icon) |ic| {
+            contents[k] = Icon(ic, 15, fg);
+            k += 1;
+        }
+        var label = Text(item.label);
+        if (fg) |c| label = label.foreground(c);
+        contents[k] = label;
+        k += 1;
+        contents[k] = Spacer();
+        k += 1;
+        var rowv = makeStackFromSlice(.horizontal, 8, .center, contents[0..k])
+            .paddingInsets(.{ .top = 6, .leading = 10, .bottom = 6, .trailing = 8 })
+            .frameMaxWidth()
+            .cornerRadius(8) // sidebar selection radius
+            .onTap(selectAction(selection, @intCast(i)));
+        if (is_sel) {
+            rowv = rowv.background(build_tokens.accent);
+        } else {
+            rowv = rowv.hoverFill(build_tokens.hover);
+        }
+        rows[i] = rowv;
+    }
+    return makeStackFromSlice(.vertical, 2, .leading, rows).frameMaxWidth();
+}
+
+/// A vertical radio-button group bound to a selected index (SwiftUI's
+/// `.pickerStyle(.radioGroup)`). Pure composition: each option is a row with a
+/// concentric-circle indicator (a filled accent dot when selected) and a tap that
+/// sets `selection`.
+pub fn RadioGroup(selection: Binding(i64), options: []const []const u8) View {
+    const rows = buildAlloc().alloc(View, options.len) catch @panic("oom");
+    for (options, 0..) |opt, i| {
+        const is_sel = selection.get() == @as(i64, @intCast(i));
+        rows[i] = HStack(.{
+            radioIndicator(is_sel),
+            Text(opt),
+            Spacer(),
+        }).spacing(8)
+            .frameMaxWidth()
+            .onTap(selectAction(selection, @intCast(i)));
+    }
+    return makeStackFromSlice(.vertical, 8, .leading, rows).frameMaxWidth();
+}
+
+/// The 16×16 radio dot: an accent-filled disc with a white center when selected,
+/// or a hollow ring when not. Built from layered `Circle`s (which fill, centered,
+/// inside a `ZStack`).
+fn radioIndicator(selected: bool) View {
+    if (selected) {
+        return ZStack(.{
+            Circle(build_tokens.accent).frame(16, 16),
+            Circle(build_tokens.on_accent).frame(6, 6),
+        }).frame(16, 16);
+    }
+    return ZStack(.{
+        Circle(Color.black.withAlpha(0.25)).frame(16, 16),
+        Circle(Color.white).frame(13, 13),
+    }).frame(16, 16);
+}
+
+/// One column of a `Table`: a header title and the width the column occupies. A
+/// `null` width makes the column flexible (it shares the leftover space evenly
+/// with the other flexible columns).
+pub const TableColumn = struct { title: []const u8, width: ?f32 = null };
+
+/// A multi-column data table (SwiftUI `Table`): a header row over scrollable data
+/// rows, with an optional single-selection binding that highlights the selected
+/// row. `rows[r][c]` is the text for row `r`, column `c`. Pure composition over
+/// stacks; selectable rows reuse `selectAction`. Wrap it in a fixed `.frameHeight`
+/// to get the scrollable, bordered look.
+pub fn Table(columns: []const TableColumn, rows: []const []const []const u8, selection: ?Binding(i64)) View {
+    // Header
+    const header_cells = buildAlloc().alloc(View, columns.len) catch @panic("oom");
+    for (columns, 0..) |col, c| header_cells[c] = tableCell(Text(col.title).font(.subheadline), col.width, true);
+    const header = makeStackFromSlice(.horizontal, 0, .center, header_cells)
+        .paddingInsets(.{ .top = 5, .leading = 8, .bottom = 5, .trailing = 8 })
+        .frameMaxWidth();
+
+    // Body rows
+    const row_views = buildAlloc().alloc(View, rows.len) catch @panic("oom");
+    for (rows, 0..) |row, r| {
+        const cells = buildAlloc().alloc(View, columns.len) catch @panic("oom");
+        const is_sel = if (selection) |s| s.get() == @as(i64, @intCast(r)) else false;
+        const fg: ?Color = if (is_sel) build_tokens.on_accent else null;
+        for (columns, 0..) |col, c| {
+            const txt = if (c < row.len) row[c] else "";
+            var cellv = Text(txt);
+            if (fg) |fc| cellv = cellv.foreground(fc);
+            cells[c] = tableCell(cellv, col.width, false);
+        }
+        var rv = makeStackFromSlice(.horizontal, 0, .center, cells)
+            .paddingInsets(.{ .top = 5, .leading = 8, .bottom = 5, .trailing = 8 })
+            .frameMaxWidth();
+        if (selection) |s| {
+            rv = rv.onTap(selectAction(s, @intCast(r)));
+            if (is_sel) {
+                rv = rv.background(build_tokens.accent);
+            } else if (r % 2 == 1) {
+                // Subtle zebra striping like a macOS table.
+                rv = rv.background(build_tokens.row_stripe);
+            }
+        } else if (r % 2 == 1) {
+            rv = rv.background(build_tokens.row_stripe);
+        }
+        row_views[r] = rv;
+    }
+    const body = makeStackFromSlice(.vertical, 0, .leading, row_views).frameMaxWidth();
+
+    return VStack(.{
+        header,
+        Divider(),
+        ScrollView(body).frameMaxWidth().frameMaxHeight(),
+    }).spacing(0).frameMaxWidth();
+}
+
+fn tableCell(content: View, width: ?f32, leading: bool) View {
+    _ = leading;
+    // Left-align the cell's content (macOS tables are leading-aligned); the frame
+    // default centers, so a trailing Spacer pushes content to the leading edge.
+    const v = HStack(.{ content, Spacer() });
+    if (width) |w| return v.frameWidth(w);
+    return v.frameMaxWidth();
 }
 
 /// Closure context for a `NavigationLink` tap: a (NavState, route) pair bound at
@@ -1835,10 +2041,11 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     }
 
     // A presented overlay is not drawn inline — it is enqueued for the drain
-    // pass in `render`, anchored to this view's frame.
-    if (v.mods.overlay) |ov| {
-        if (ov.presented.get()) {
-            if (ctx.overlays) |overlays| {
+    // pass in `render`, anchored to this view's frame. A view can carry several
+    // (e.g. both `.sheet` and `.alert`); each is enqueued when its binding is on.
+    if (ctx.overlays) |overlays| {
+        for (v.mods.overlay) |ov| {
+            if (ov.presented.get()) {
                 try overlays.append(ctx.arena, .{
                     .content = ov.content.*,
                     .style = ov.style,
@@ -1975,10 +2182,22 @@ fn paintShape(canvas: *Canvas, sh: ShapeData, rect: Rect, op: f32) !void {
 
 fn paintButton(ctx: *const Context, b: ButtonData, rect: Rect, canvas: *Canvas) !void {
     const m = ctx.theme.metrics;
+    const op = ctx.opacity;
     const dim: f32 = if (ctx.disabled) 0.4 else 1.0;
+    const radius = m.control_corner_radius;
     if (b.role != .plain) {
         const bg = if (b.role == .destructive) ctx.theme.colors.destructive else ctx.theme.colors.accent;
-        try canvas.fillRoundedRect(rect, m.control_corner_radius, bg.multiplyAlpha(ctx.opacity * dim));
+        // Liquid Glass: a vertical sheen (lighter at top) instead of a flat fill,
+        // finished with a bright rim so the pill reads as a pane of glass.
+        try canvas.push(.{ .linear_gradient = .{
+            .rect = rect,
+            .radius = radius,
+            .start = .{ .x = rect.x, .y = rect.y },
+            .end = .{ .x = rect.x, .y = rect.maxY() },
+            .c0 = bg.lighten(0.18).multiplyAlpha(op * dim),
+            .c1 = bg.darken(0.04).multiplyAlpha(op * dim),
+        } });
+        try canvas.strokeRoundedRect(rect, radius, m.hairline, Color.white.withAlpha(0.28 * dim).multiplyAlpha(op));
     }
     const label_color = if (b.role == .plain) ctx.theme.colors.accent else ctx.theme.colors.on_accent;
     const px = ctx.theme.typography.body.size;
@@ -2018,11 +2237,26 @@ fn paintToggle(ctx: *const Context, t: ToggleData, rect: Rect, canvas: *Canvas) 
     // switch on the trailing edge
     const sw = Rect{ .x = rect.maxX() - switch_w, .y = vcenter(rect, switch_h), .width = switch_w, .height = switch_h };
     const on = t.value.get();
-    const track = if (on) ctx.theme.colors.accent else ctx.theme.colors.separator.over(ctx.theme.colors.control_background);
-    try canvas.fillRoundedRect(sw, switch_h / 2, track.multiplyAlpha(op));
+    if (on) {
+        // Glassy accent track: vertical sheen + bright rim.
+        const acc = ctx.theme.colors.accent;
+        try canvas.push(.{ .linear_gradient = .{
+            .rect = sw,
+            .radius = switch_h / 2,
+            .start = .{ .x = sw.x, .y = sw.y },
+            .end = .{ .x = sw.x, .y = sw.maxY() },
+            .c0 = acc.lighten(0.16).multiplyAlpha(op),
+            .c1 = acc.darken(0.04).multiplyAlpha(op),
+        } });
+    } else {
+        try canvas.fillRoundedRect(sw, switch_h / 2, ctx.theme.colors.control_track.over(ctx.theme.colors.control_background).multiplyAlpha(op));
+        try canvas.strokeRoundedRect(sw, switch_h / 2, ctx.theme.metrics.hairline, ctx.theme.colors.control_border.multiplyAlpha(op));
+    }
     const knob_r = switch_h / 2 - 2;
     const knob_cx = if (on) sw.maxX() - knob_r - 2 else sw.x + knob_r + 2;
     try canvas.fillCircle(.{ .x = knob_cx, .y = sw.midY() }, knob_r, Color.white.multiplyAlpha(op));
+    // a faint rim grounds the knob against the track
+    try canvas.strokeRoundedRect(.{ .x = knob_cx - knob_r, .y = sw.midY() - knob_r, .width = 2 * knob_r, .height = 2 * knob_r }, knob_r, ctx.theme.metrics.hairline, Color.black.withAlpha(0.10).multiplyAlpha(op));
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .toggle = t.value }, .disabled = ctx.disabled });
 }
 
@@ -2305,20 +2539,33 @@ fn paintPicker(ctx: *const Context, pk: PickerData, rect: Rect, canvas: *Canvas)
     const m = ctx.theme.metrics;
     const n = pk.options.len;
     if (n == 0) return;
-    // segmented-control background
-    try canvas.fillRoundedRect(rect, m.control_corner_radius, ctx.theme.colors.separator.over(ctx.theme.colors.window_background).multiplyAlpha(op));
+    // Glass segmented track: a recessed translucent trough with a hairline rim.
+    try canvas.fillRoundedRect(rect, m.control_corner_radius, ctx.theme.colors.control_track.over(ctx.theme.colors.window_background).multiplyAlpha(op));
+    try canvas.strokeRoundedRect(rect, m.control_corner_radius, m.hairline, ctx.theme.colors.control_border.multiplyAlpha(op));
     const seg_w = rect.width / @as(f32, @floatFromInt(n));
     const px = ctx.theme.typography.body.size;
     const lh = shape.lineHeight(ctx.cache.face, px);
     const selected = pk.selection.get();
     for (pk.options, 0..) |opt, i| {
         const seg = Rect{ .x = rect.x + @as(f32, @floatFromInt(i)) * seg_w, .y = rect.y, .width = seg_w, .height = rect.height };
-        if (@as(i64, @intCast(i)) == selected) {
+        const is_sel = @as(i64, @intCast(i)) == selected;
+        if (is_sel) {
+            // The selected segment floats as a brighter glass chip.
             const inner = seg.insetBy(2, 2);
-            try canvas.fillRoundedRect(inner, m.control_corner_radius - 1, ctx.theme.colors.control_background.multiplyAlpha(op));
+            const r = m.control_corner_radius - 2;
+            try canvas.push(.{ .linear_gradient = .{
+                .rect = inner,
+                .radius = r,
+                .start = .{ .x = inner.x, .y = inner.y },
+                .end = .{ .x = inner.x, .y = inner.maxY() },
+                .c0 = ctx.theme.colors.control_background.lighten(0.04).multiplyAlpha(op),
+                .c1 = ctx.theme.colors.control_background.darken(0.02).multiplyAlpha(op),
+            } });
+            try canvas.strokeRoundedRect(inner, r, m.hairline, Color.white.withAlpha(0.5).multiplyAlpha(op));
         }
         const tw = shape.measureLineWidth(ctx.cache.face, opt, px);
-        drawTextC(ctx, canvas, opt, px, ctx.foreground.multiplyAlpha(op), .{
+        const seg_text = if (is_sel) ctx.theme.colors.label else ctx.theme.colors.secondary_label;
+        drawTextC(ctx, canvas, opt, px, seg_text.multiplyAlpha(op), .{
             .x = seg.x + (seg.width - tw) / 2,
             .y = vcenter(seg, lh),
         }) catch {};
@@ -3578,6 +3825,80 @@ test "view: Picker selects a segment on tap" {
     try testing.expectEqual(@as(i64, 2), sel.get());
 }
 
+test "view: RadioGroup selects an option on tap" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, 0);
+    defer sel.deinit();
+    const opts = [_][]const u8{ "One", "Two", "Three" };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, RadioGroup(sel.binding(), &opts), .{ .x = 0, .y = 0, .width = 200, .height = 120 }, &canvas);
+    try testing.expectEqual(@as(usize, 3), env.hits.items.len); // one tap target per option
+    // tapping the second row sets the binding to index 1
+    try testing.expect(dispatchTap(env.hits.items, env.hits.items[1].rect.center()));
+    try testing.expectEqual(@as(i64, 1), sel.get());
+}
+
+test "view: Sidebar selects a row on tap and highlights the selection" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, 0);
+    defer sel.deinit();
+    const items = [_]SidebarItem{
+        .{ .label = "Inbox", .icon = .mail },
+        .{ .label = "Sent" },
+        .{ .label = "Drafts" },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, Sidebar(&items, sel.binding()), .{ .x = 0, .y = 0, .width = 220, .height = 300 }, &canvas);
+    try testing.expectEqual(@as(usize, 3), env.hits.items.len);
+    // the selected (row 0) draws an accent highlight behind it
+    var has_accent = false;
+    for (canvas.commands.items) |cmd| {
+        if (cmd == .fill_rrect and cmd.fill_rrect.color.approxEql(c.theme.colors.accent, 0.05)) has_accent = true;
+    }
+    try testing.expect(has_accent);
+    // tapping the third row selects it
+    try testing.expect(dispatchTap(env.hits.items, env.hits.items[2].rect.center()));
+    try testing.expectEqual(@as(i64, 2), sel.get());
+}
+
+test "view: Table shows a header + rows and selects a row on tap" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, -1);
+    defer sel.deinit();
+    const cols = [_]TableColumn{ .{ .title = "Name" }, .{ .title = "Age", .width = 60 } };
+    const rows = [_][]const []const u8{
+        &.{ "Ada", "36" },
+        &.{ "Alan", "41" },
+        &.{ "Grace", "45" },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, Table(&cols, &rows, sel.binding()), .{ .x = 0, .y = 0, .width = 300, .height = 200 }, &canvas);
+    // selection enabled -> one callback tap target per data row (header has none)
+    var row_hits: usize = 0;
+    var second: ?Rect = null;
+    for (env.hits.items) |hr| {
+        if (hr.action == .callback) {
+            if (row_hits == 1) second = hr.rect;
+            row_hits += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), row_hits);
+    try testing.expect(dispatchTap(env.hits.items, second.?.center()));
+    try testing.expectEqual(@as(i64, 1), sel.get());
+}
+
 fn gridCell(cell_color: Color) View {
     return Rectangle(cell_color).frameHeight(20);
 }
@@ -3933,6 +4254,41 @@ test "view: sheet enqueues an overlay, draws a scrim over content, dismisses on 
     try raster.render(testing.allocator, &fb, canvas.commands.items);
     try testing.expect(countRed(&fb) > 100);
     try testing.expect(fb.at(100, 20).luminance() < 0.95);
+}
+
+test "view: chaining .sheet and .alert keeps both overlays (neither clobbers)" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var sheet_on = state.State(bool).init(testing.allocator, true);
+    defer sheet_on.deinit();
+    var alert_on = state.State(bool).init(testing.allocator, false);
+    defer alert_on.deinit();
+
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 200, .height = 200 };
+    const base = Text("Base")
+        .sheet(sheet_on.binding(), Rectangle(Color.red).frame(80, 40))
+        .alert(alert_on.binding(), Rectangle(Color.blue).frame(80, 40));
+
+    // Only the sheet is presented → exactly one overlay, and it's the sheet.
+    try render(&c, base, root, &canvas);
+    try testing.expectEqual(@as(usize, 1), ovs.items.len);
+    try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
+
+    // Turn the alert on too → both present (the .alert did not overwrite .sheet).
+    ovs.clearRetainingCapacity();
+    env.hits.clearRetainingCapacity();
+    canvas.clearCommands();
+    alert_on.set(true);
+    try render(&c, base, root, &canvas);
+    try testing.expectEqual(@as(usize, 2), ovs.items.len);
+    try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
+    try testing.expectEqual(OverlayStyle.alert, ovs.items[1].style);
 }
 
 test "view: popover content is positioned near its (top) anchor" {

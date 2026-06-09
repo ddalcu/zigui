@@ -7,11 +7,9 @@ on:
 
 jobs:
   # The core library has no C dependencies, so the full test suite runs on every
-  # OS with just the Zig toolchain. Each OS also renders a UI screenshot (pure
-  # renderer, no SDL) and uploads it as an artifact, so you can see — and diff —
-  # how zigui looks on each platform.
+  # OS with just the Zig toolchain — no GPU, window server, or SDL required.
   test:
-    name: test + screenshot (${{ matrix.os }})
+    name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -25,23 +23,14 @@ jobs:
           version: 0.16.0
       - name: Run tests
         run: zig build test --summary all
-      - name: Render UI screenshot (pure renderer, no SDL)
-        shell: bash
-        continue-on-error: true
-        run: zig build run-screenshot -Doptimize=ReleaseFast -- "zigui-${{ matrix.os }}.bmp"
-      - name: Upload screenshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshot-${{ matrix.os }}
-          path: "zigui-${{ matrix.os }}.bmp"
-          if-no-files-found: warn
 
-  # The SDL3-backed examples are built (not run) to verify the backend links.
+  # The SDL3-backed examples are built (not run) to verify the backend links, and
+  # the showcase renders one frame to a BMP via its headless `--screenshot` flag
+  # (pure software rasterizer — no window) which is uploaded as an artifact.
   # macOS only: SDL3 installs cleanly via Homebrew, whereas it isn't yet packaged
   # in the Ubuntu runner's apt. (Core Linux coverage is the test + docker jobs.)
   examples:
-    name: build examples (macOS)
+    name: build examples + screenshot (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +40,17 @@ jobs:
       - name: Install SDL3
         run: brew install sdl3
       - name: Build examples
-        run: zig build hello settings showcase llm-chat
+        run: zig build showcase edit -Doptimize=ReleaseFast
+      - name: Render UI screenshot (headless, no window)
+        continue-on-error: true
+        run: ./zig-out/bin/showcase --screenshot "zigui-showcase.bmp"
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: showcase-screenshot
+          path: "zigui-showcase.bmp"
+          if-no-files-found: warn
 
   # Reproduce the Linux test run inside Docker (mirrors local `docker build`).
   docker:

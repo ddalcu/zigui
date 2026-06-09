@@ -110,18 +110,17 @@ Run the demo apps (require SDL3 — `brew install sdl3` on macOS,
 `apt install libsdl3-dev` on Linux):
 
 ```sh
-zig build run-hello                  # minimal counter
-zig build run-settings               # macOS-like Settings demo
-zig build run-showcase               # nav · tabs · sheet · material · a11y
-zig build run-llm-chat               # streaming chat over an OpenAI-compatible API
+zig build run-showcase               # the kitchen-sink gallery: every component,
+                                     # light/dark + accent switchers (macOS 26 look)
 zig build run-edit                   # a multi-line text editor (TextEdit/gedit-like)
-zig build hello settings showcase llm-chat edit   # build the examples without running them
+zig build showcase edit              # build the examples without running them
+
+# Render one frame to a BMP without a window (great for screenshots / CI):
+./zig-out/bin/showcase --screenshot out.bmp [section] [--dark] [--accent N]
 ```
 
 > Run with `-Doptimize=ReleaseFast` for smooth UI — the CPU software rasterizer
-> is much slower in the default Debug build. The `llm-chat` demo talks to a local
-> OpenAI-compatible server (e.g. `mlx-serve --serve --model <model> --port 11234`);
-> see [`examples/llm-chat`](examples/llm-chat).
+> is much slower in the default Debug build.
 
 ### Validate on Linux via Docker
 

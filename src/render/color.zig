@@ -84,6 +84,21 @@ pub const Color = struct {
     pub fn multiplyAlpha(c: Color, factor: f32) Color {
         return c.withAlpha(c.a * factor);
     }
+    /// Lighten toward white by `amount` (0..1), preserving alpha. Used for the
+    /// top sheen of "liquid glass" controls.
+    pub fn lighten(c: Color, amount: f32) Color {
+        return .{
+            .r = c.r + (1 - c.r) * amount,
+            .g = c.g + (1 - c.g) * amount,
+            .b = c.b + (1 - c.b) * amount,
+            .a = c.a,
+        };
+    }
+    /// Darken toward black by `amount` (0..1), preserving alpha.
+    pub fn darken(c: Color, amount: f32) Color {
+        const k = 1 - amount;
+        return .{ .r = c.r * k, .g = c.g * k, .b = c.b * k, .a = c.a };
+    }
     /// Linear interpolation per channel; t in 0..1.
     pub fn lerp(a: Color, b: Color, t: f32) Color {
         return .{

@@ -61,6 +61,11 @@ pub const Framebuffer = struct {
     fn blend(self: *Framebuffer, x: u32, y: u32, src: Color, coverage: f32) void {
         if (coverage <= 0) return;
         const i = y * self.width + x;
+        // Opaque pixel at full coverage: plain store, no compositing math.
+        if (coverage >= 1 and src.a >= 1) {
+            self.pixels[i] = src;
+            return;
+        }
         const s = src.withAlpha(src.a * coverage);
         self.pixels[i] = s.over(self.pixels[i]);
     }
@@ -259,7 +264,16 @@ fn clipCoverage(clips: []const Clip, px: f32, py: f32) f32 {
     return cov;
 }
 
-const PixelBounds = struct { x0: u32, y0: u32, x1: u32, y1: u32 };
+const PixelBounds = struct {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+
+    fn empty(self: PixelBounds) bool {
+        return self.x1 <= self.x0 or self.y1 <= self.y0;
+    }
+};
 
 /// Integer pixel range covering `rect` (expanded by `pad` for AA), clamped to fb.
 fn boundsOf(fb: *const Framebuffer, rect: Rect, pad: f32) PixelBounds {
@@ -275,31 +289,132 @@ fn boundsOf(fb: *const Framebuffer, rect: Rect, pad: f32) PixelBounds {
     };
 }
 
+/// Per-command clip analysis: the pixel bounds of `rect` (padded for AA)
+/// intersected with every clip rect — so fully-clipped pixels (e.g. scrolled-
+/// away content) are never visited — plus whether any per-pixel clip coverage
+/// is still needed. When the padded shape sits fully inside every clip's safe
+/// interior (inset by radius/2 + 1, where coverage is provably 1), the inner
+/// loops skip `clipCoverage` entirely.
+const ClippedBounds = struct { bounds: PixelBounds, check_clip: bool };
+
+fn clippedBoundsOf(fb: *const Framebuffer, clips: []const Clip, rect: Rect, pad: f32) ClippedBounds {
+    var b = boundsOf(fb, rect, pad);
+    var check = false;
+    for (clips) |cl| {
+        const cb = boundsOf(fb, cl.rect, 1);
+        b.x0 = @max(b.x0, cb.x0);
+        b.y0 = @max(b.y0, cb.y0);
+        b.x1 = @min(b.x1, cb.x1);
+        b.y1 = @min(b.y1, cb.y1);
+        if (!check) {
+            const inset = cl.radius / 2 + 1;
+            check = rect.minX() - pad < cl.rect.minX() + inset or
+                rect.maxX() + pad > cl.rect.maxX() - inset or
+                rect.minY() - pad < cl.rect.minY() + inset or
+                rect.maxY() + pad > cl.rect.maxY() - inset;
+        }
+    }
+    return .{ .bounds = b, .check_clip = check };
+}
+
+/// For the row of pixel centers at `py`, the half-width around `rect.midX()`
+/// within which fill coverage is exactly 1 (sd <= -0.5), or null when no pixel
+/// of this row is fully covered. `r` must already be clamped to the half-size.
+fn fullSpanHalfWidth(rect: Rect, r: f32, py: f32) ?f32 {
+    const qy = @abs(py - rect.midY()) - (rect.height / 2 - r);
+    const rr = r - 0.5;
+    if (qy > rr) return null; // top/bottom AA fringe (or outside)
+    if (qy >= 0) {
+        // corner band: the full-coverage span follows the inset corner circle
+        return (rect.width / 2 - r) + @sqrt(rr * rr - qy * qy);
+    }
+    return rect.width / 2 - 0.5;
+}
+
 fn fillShape(fb: *Framebuffer, clips: []const Clip, rect: Rect, radius: f32, paint: Paint) void {
-    const b = boundsOf(fb, rect, 1);
+    const cc = clippedBoundsOf(fb, clips, rect, 1);
+    const b = cc.bounds;
+    if (b.empty()) return;
+    const r = @min(radius, @min(rect.width, rect.height) / 2);
+    // Solid paints — and vertical gradients, which all the theme sheens are —
+    // have one color per row, computed outside the inner loop.
+    const row_const = switch (paint) {
+        .solid => true,
+        .gradient => |g| g.start.x == g.end.x,
+    };
     var y = b.y0;
     while (y < b.y1) : (y += 1) {
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const row_color = if (row_const) paint.colorAt(rect.midX(), py) else Color.transparent;
+
+        // The span of pixels this row where shape coverage is exactly 1: those
+        // skip the SDF; an opaque row-constant color becomes a plain @memset.
+        var sx0 = b.x1;
+        var sx1 = b.x1;
+        if (fullSpanHalfWidth(rect, r, py)) |half| {
+            const fx0 = rect.midX() - half;
+            const fx1 = rect.midX() + half;
+            if (fx1 > fx0) {
+                sx0 = std.math.clamp(@as(u32, @intFromFloat(@max(0, @ceil(fx0 - 0.5)))), b.x0, b.x1);
+                sx1 = std.math.clamp(@as(u32, @intFromFloat(@max(0, @floor(fx1 - 0.5) + 1))), sx0, b.x1);
+            }
+        }
+
+        const row_idx = y * fb.width;
         var x = b.x0;
         while (x < b.x1) : (x += 1) {
+            if (x >= sx0 and x < sx1 and !cc.check_clip) {
+                // Fully-covered interior run.
+                if (row_const and row_color.a >= 1) {
+                    @memset(fb.pixels[row_idx + sx0 .. row_idx + sx1], row_color);
+                } else {
+                    var ix = x;
+                    while (ix < sx1) : (ix += 1) {
+                        const c = if (row_const) row_color else paint.colorAt(@as(f32, @floatFromInt(ix)) + 0.5, py);
+                        fb.blend(ix, y, c, 1);
+                    }
+                }
+                x = sx1 - 1; // resume the AA fringe after the span
+                continue;
+            }
             const px = @as(f32, @floatFromInt(x)) + 0.5;
-            const py = @as(f32, @floatFromInt(y)) + 0.5;
-            const cov = fillCoverage(px, py, rect, radius) * clipCoverage(clips, px, py);
-            if (cov > 0) fb.blend(x, y, paint.colorAt(px, py), cov);
+            var cov = if (x >= sx0 and x < sx1) 1 else fillCoverage(px, py, rect, r);
+            if (cc.check_clip and cov > 0) cov *= clipCoverage(clips, px, py);
+            if (cov > 0) {
+                const c = if (row_const) row_color else paint.colorAt(px, py);
+                fb.blend(x, y, c, cov);
+            }
         }
     }
 }
 
 fn strokeShape(fb: *Framebuffer, clips: []const Clip, rect: Rect, radius: f32, width: f32, color: Color) void {
     const half = width / 2;
-    const b = boundsOf(fb, rect, half + 1);
+    const cc = clippedBoundsOf(fb, clips, rect, half + 1);
+    const b = cc.bounds;
+    if (b.empty()) return;
+    const r = @min(radius, @min(rect.width, rect.height) / 2);
+    // Rows clear of the top/bottom edges and corners only have coverage in two
+    // narrow bands around the vertical edges — skip the hollow interior.
+    const band = half + 1.5;
+    const mid_y0 = rect.minY() + r + band;
+    const mid_y1 = rect.maxY() - r - band;
+    const lx1: u32 = @intFromFloat(std.math.clamp(@ceil(rect.minX() + band), 0, @as(f32, @floatFromInt(fb.width))));
+    const rx0: u32 = @intFromFloat(std.math.clamp(@floor(rect.maxX() - band), 0, @as(f32, @floatFromInt(fb.width))));
     var y = b.y0;
     while (y < b.y1) : (y += 1) {
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const edge_row = py <= mid_y0 or py >= mid_y1;
         var x = b.x0;
         while (x < b.x1) : (x += 1) {
+            if (!edge_row and x >= lx1 and x < rx0) {
+                x = rx0 - 1; // jump the hollow interior to the right band
+                continue;
+            }
             const px = @as(f32, @floatFromInt(x)) + 0.5;
-            const py = @as(f32, @floatFromInt(y)) + 0.5;
-            const d = @abs(sdRoundBox(px, py, rect, radius)) - half;
-            const cov = std.math.clamp(0.5 - d, 0, 1) * clipCoverage(clips, px, py);
+            const d = @abs(sdRoundBox(px, py, rect, r)) - half;
+            var cov = std.math.clamp(0.5 - d, 0, 1);
+            if (cc.check_clip and cov > 0) cov *= clipCoverage(clips, px, py);
             if (cov > 0) fb.blend(x, y, color, cov);
         }
     }
@@ -323,7 +438,9 @@ fn drawLine(fb: *Framebuffer, clips: []const Clip, a: Point, b: Point, width: f3
     const minx = @min(a.x, b.x);
     const miny = @min(a.y, b.y);
     const rect = Rect{ .x = minx, .y = miny, .width = @abs(b.x - a.x), .height = @abs(b.y - a.y) };
-    const bounds = boundsOf(fb, rect, half + 1);
+    const cc = clippedBoundsOf(fb, clips, rect, half + 1);
+    const bounds = cc.bounds;
+    if (bounds.empty()) return;
     var y = bounds.y0;
     while (y < bounds.y1) : (y += 1) {
         var x = bounds.x0;
@@ -331,7 +448,8 @@ fn drawLine(fb: *Framebuffer, clips: []const Clip, a: Point, b: Point, width: f3
             const px = @as(f32, @floatFromInt(x)) + 0.5;
             const py = @as(f32, @floatFromInt(y)) + 0.5;
             const d = sdSegment(px, py, a, b) - half;
-            const cov = std.math.clamp(0.5 - d, 0, 1) * clipCoverage(clips, px, py);
+            var cov = std.math.clamp(0.5 - d, 0, 1);
+            if (cc.check_clip and cov > 0) cov *= clipCoverage(clips, px, py);
             if (cov > 0) fb.blend(x, y, color, cov);
         }
     }
@@ -339,22 +457,29 @@ fn drawLine(fb: *Framebuffer, clips: []const Clip, a: Point, b: Point, width: f3
 
 fn drawGlyph(fb: *Framebuffer, clips: []const Clip, rect: Rect, color: Color, cov: canvas_mod.Coverage) void {
     if (cov.width == 0 or cov.height == 0) return;
-    const b = boundsOf(fb, rect, 0);
+    const cc = clippedBoundsOf(fb, clips, rect, 0);
+    const b = cc.bounds;
+    if (b.empty()) return;
+    // pixel -> coverage texel (nearest); divisions hoisted out of the loops
+    const usc = @as(f32, @floatFromInt(cov.width)) / rect.width;
+    const vsc = @as(f32, @floatFromInt(cov.height)) / rect.height;
     var y = b.y0;
     while (y < b.y1) : (y += 1) {
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const v = (py - rect.y) * vsc;
+        if (v < 0) continue;
+        const vi: u32 = @intFromFloat(v);
+        if (vi >= cov.height) continue;
+        const row = cov.data[vi * cov.width ..];
         var x = b.x0;
         while (x < b.x1) : (x += 1) {
             const px = @as(f32, @floatFromInt(x)) + 0.5;
-            const py = @as(f32, @floatFromInt(y)) + 0.5;
-            // map pixel -> coverage texel (nearest)
-            const u = (px - rect.x) / rect.width * @as(f32, @floatFromInt(cov.width));
-            const v = (py - rect.y) / rect.height * @as(f32, @floatFromInt(cov.height));
-            if (u < 0 or v < 0) continue;
+            const u = (px - rect.x) * usc;
+            if (u < 0) continue;
             const ui: u32 = @intFromFloat(u);
-            const vi: u32 = @intFromFloat(v);
-            if (ui >= cov.width or vi >= cov.height) continue;
-            const a = @as(f32, @floatFromInt(cov.data[vi * cov.width + ui])) / 255.0;
-            const c = a * clipCoverage(clips, px, py);
+            if (ui >= cov.width) continue;
+            var c = @as(f32, @floatFromInt(row[ui])) / 255.0;
+            if (cc.check_clip and c > 0) c *= clipCoverage(clips, px, py);
             if (c > 0) fb.blend(x, y, color, c);
         }
     }
@@ -362,19 +487,25 @@ fn drawGlyph(fb: *Framebuffer, clips: []const Clip, rect: Rect, color: Color, co
 
 fn drawImage(fb: *Framebuffer, clips: []const Clip, rect: Rect, img: canvas_mod.Image) void {
     if (img.width == 0 or img.height == 0) return;
-    const b = boundsOf(fb, rect, 0);
+    const cc = clippedBoundsOf(fb, clips, rect, 0);
+    const b = cc.bounds;
+    if (b.empty()) return;
+    const usc = @as(f32, @floatFromInt(img.width)) / rect.width;
+    const vsc = @as(f32, @floatFromInt(img.height)) / rect.height;
     var y = b.y0;
     while (y < b.y1) : (y += 1) {
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const v = (py - rect.y) * vsc;
+        if (v < 0) continue;
+        const vi: u32 = @intFromFloat(v);
+        if (vi >= img.height) continue;
         var x = b.x0;
         while (x < b.x1) : (x += 1) {
             const px = @as(f32, @floatFromInt(x)) + 0.5;
-            const py = @as(f32, @floatFromInt(y)) + 0.5;
-            const u = (px - rect.x) / rect.width * @as(f32, @floatFromInt(img.width));
-            const v = (py - rect.y) / rect.height * @as(f32, @floatFromInt(img.height));
-            if (u < 0 or v < 0) continue;
+            const u = (px - rect.x) * usc;
+            if (u < 0) continue;
             const ui: u32 = @intFromFloat(u);
-            const vi: u32 = @intFromFloat(v);
-            if (ui >= img.width or vi >= img.height) continue;
+            if (ui >= img.width) continue;
             const idx = (vi * img.width + ui) * 4;
             const src = Color.fromRgba8(
                 img.pixels[idx + 0],
@@ -382,7 +513,8 @@ fn drawImage(fb: *Framebuffer, clips: []const Clip, rect: Rect, img: canvas_mod.
                 img.pixels[idx + 2],
                 img.pixels[idx + 3],
             );
-            fb.blend(x, y, src, clipCoverage(clips, px, py));
+            const cov: f32 = if (cc.check_clip) clipCoverage(clips, px, py) else 1;
+            fb.blend(x, y, src, cov);
         }
     }
 }

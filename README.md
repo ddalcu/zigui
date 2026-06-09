@@ -8,11 +8,22 @@ native macOS / SwiftUI look and feel to macOS, Linux, and Windows.
 
 ## Screenshots
 
-| Settings demo | Showcase (nav · tabs · sheet · material) | Streaming LLM chat |
-|---|---|---|
-| ![Settings](docs/settings.png) | ![Showcase](docs/showcase.png) | ![LLM chat](docs/llm-chat.png) |
+The `showcase` example, rendered in each built-in theme family:
 
-All three are the **same pure-Zig renderer** — no native widgets.
+| macOS (Liquid Glass, light) | macOS (Liquid Glass, dark) | Windows 10 (dark) |
+|---|---|---|
+| ![macOS light](docs/macos-light.png) | ![macOS dark](docs/macos-dark.png) | ![Windows 10](docs/windows10.png) |
+
+| Windows 2000 | KDE Plasma (Breeze) | Material |
+|---|---|---|
+| ![Windows 2000](docs/win2000.png) | ![KDE Plasma](docs/kde.png) | ![Material](docs/material.png) |
+
+And the `edit` example — a multi-line text editor:
+
+![Text editor](docs/edit.png)
+
+Every frame is the **same pure-Zig renderer** — no native widgets, themes are
+just palettes + painters.
 
 ## Why
 
@@ -53,6 +64,32 @@ Modifiers chain fluently: `.padding()` `.frame()` `.background()`
 `.foreground()` `.font()` `.cornerRadius()` `.border()` `.opacity()` `.onTap()`
 `.disabled()` `.frameMaxWidth()` …
 
+## Themes
+
+A `Theme` bundles a color `Palette`, a type scale, layout `Metrics`, and a
+`Painter` (the vtable that draws every control's chrome). Five families ship —
+**macOS** (Liquid Glass), **Windows 10** (flat/Fluent-lite), **Windows 2000**
+(chiseled bevels), **KDE Plasma** (Breeze), and **Material** (Google Material
+Design) — each as a light and dark theme. Pick one with
+`themeForScheme(family, scheme)`, and follow the OS appearance by recomputing it
+from `app.colorScheme()` inside a theme provider:
+
+```zig
+// Pick a family and resolve it for a color scheme.
+const theme = zigui.themeForScheme(.macos, .dark); // ThemeFamily: .macos/.windows10/.win2000/.kde/.mui
+
+// Follow the OS dark/light appearance live (SDL3 backend):
+fn themeProvider() zigui.Theme {
+    return zigui.themeForScheme(.macos, app.colorScheme()); // .light or .dark
+}
+// ...
+app.setThemeProvider(themeProvider); // re-resolved each frame before the view builds
+```
+
+To author your own look, implement the `Painter` methods (`button`, `field`,
+`slider`, `switchTrack`/`switchKnob`, `stepperBox`, `progress`, `segmented*`,
+`panel`) — they draw only chrome into a `Surface`, never touching the view layer.
+
 ## Architecture at a glance
 
 | Layer | Choice |
@@ -61,7 +98,7 @@ Modifiers chain fluently: `.padding()` `.frame()` `.background()`
 | State | observable `State(T)` + `Binding(T)` + dirty flag |
 | Layout | two-pass measure/arrange engine (SwiftUI-style proposals) |
 | Text | bundled Inter (OFL) + pure-Zig TrueType rasterizer + glyph cache |
-| Theme | macOS light/dark, fully tokenized |
+| Theme | five families (macOS, Windows 10, Windows 2000, KDE Plasma, Material), light/dark, fully tokenized |
 | 2D drawing | retained `Canvas` command list |
 | Renderer (tests / headless) | **pure-Zig software rasterizer** (SDF anti-aliasing) |
 | Renderer (on-screen) | software rasterizer presented via **SDL3** |

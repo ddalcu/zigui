@@ -32,6 +32,8 @@ docker build -t zigui-test .                 # run the full suite on Linux
 ./zig-out/bin/showcase --screenshot /tmp/sc.bmp [section] [--dark] [--accent N]
 ./zig-out/bin/edit --screenshot /tmp/edit.bmp [file] [--demo-find|--demo-dialog]
 # sips -s format png /tmp/sc.bmp --out /tmp/sc.png   # to view on macOS
+# --bench N re-rasterizes the frame N times and prints ms/frame (build with
+# -Doptimize=ReleaseFast) — use it when touching src/render/raster.zig.
 ```
 
 There are exactly **two examples**: `examples/showcase` (the kitchen-sink gallery
@@ -86,15 +88,18 @@ app.zig (SDL3): build → render → upload framebuffer to texture → present �
 
 | File | Responsibility |
 |---|---|
-| `src/view/view.zig` | **The hub.** `View`, `Kind` union, constructors, `Modifiers`, `buildNode`/`measure`/`render`/`paint`/`paintContent`, `HitAction`/`dispatchTap`, focus. Most features touch this. |
+| `src/view/view.zig` | **The engine + facade.** `View`, `Kind` union, `Modifiers`, `Context`, `buildNode`/`buildContentNode`/`measure`/`render`/`paint`/`paintContent`, `HitAction`/`dispatchTap`, focus, overlays, the text context-menu, and the primitive components (text/shape/button/toggle/slider/stepper/progress/picker/textfield/editor/icon/scroll). Re-exports the `components/` modules so historical `view.X` names stay stable. |
+| `src/components/*.zig` | Cohesive, separable components split out of the hub: `navigation`, `tabs`, `menu`, `grid`, `list`, `collections` (Sidebar/Table/RadioGroup), and `text_buffer` (`TextFieldState` + pure UTF-8 line/column geometry). Each imports `view.zig` for the shared primitives/helpers; `view.zig` re-exports their public names. |
 | `src/layout/engine.zig` | `Node` union, `Proposal`, `SizingHints`, `measure`, `arrange`→`LayoutResult`. Pure, tested. |
 | `src/layout/stack.zig` | `distribute()` — the stack space-allocation math. Pure. |
 | `src/render/canvas.zig` | `DrawCommand` union + `Canvas` builder. The renderer-agnostic seam. |
 | `src/render/raster.zig` | `Framebuffer` + software rasterizer (SDF AA). Where new draw primitives get pixels. |
 | `src/text/*` | `ttf` (parser+rasterizer), `atlas` (`GlyphCache`), `shape` (measure/wrap), `font` (`drawText`). |
-| `src/theme/*` | `Theme` tokens; `macos.light`/`macos.dark`. |
+| `src/theme/theme.zig` | `Theme`, `Palette`, `Metrics`, `Typography`, and the **`Painter`** vtable + `Surface`/`ControlState`/`Role`. The color-scheme/painter vocabulary. |
+| `src/theme/{macos,win2000,windows10,kde}.zig` | The four built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (glass / bevels / flat / Breeze). |
+| `src/theme/registry.zig` | `Family` enum + `forScheme(family, scheme)` — picks a `Theme` for the OS appearance (light-only families ignore dark). |
 | `src/state/*` | `State(T)`, `Binding(T)`, `Observer`. |
-| `src/app.zig` | SDL3 window/event loop. **Only file that links C.** Where overlays, animation ticking, HiDPI scale, and key routing get wired. |
+| `src/app.zig` | SDL3 window/event loop. **Only file that links C.** Where overlays, animation ticking, HiDPI scale, key routing, and `systemTheme()`/`colorScheme()` (OS dark/light) get wired. |
 | `src/components.zig`, `src/zigui.zig` | Public re-exports. |
 
 ### Key invariants
@@ -173,15 +178,36 @@ rows, and returns a `VStack` of `HStack`s; `LazyHGrid` is the transpose. Cells g
 padded with invisible `Empty()` cells so **columns stay aligned**. No `Kind`-level
 grid was needed. (`view.zig`; tests `LazyVGrid …`/`LazyHGrid …`.)
 
-### macOS 26 "Liquid Glass" theme — extra `Colors`/`Metrics` tokens + glassy paint
-The theme grew translucent-surface roles (`colors.hover`, `control_border`,
-`glass`, `control_track`) and rounder metrics (`corner_radius` 12,
-`control_corner_radius` 7, `panel_corner_radius` 16, `selection_corner_radius`).
-The glassy *look* is in the paint functions: `paintButton`/`paintToggle`(on)/
-`paintPicker`(selected segment) now emit a **vertical `linear_gradient` sheen**
-(`Color.lighten`/`darken`, added to `color.zig`) plus a bright white-alpha rim
-`stroke_rrect`, instead of a flat `fill_rrect`. Keep that pattern for new glass
-controls. `examples/showcase` pick it all up for free.
+### Themes & painters — `Palette` + `Painter` seam (macOS / Win2000 / Win10 / KDE)
+A `Theme` is **palette + metrics + typography + `Painter`**. The palette
+(`theme.Palette`, the renamed `Colors`) holds the semantic color roles resolved
+for one `ColorScheme`; it gained translucent "liquid glass" roles
+(`hover`/`control_border`/`glass`/`control_track`) and **defaulted** chiseled-bevel
+roles (`control_face`/`control_highlight`/`control_light`/`control_shadow`/
+`control_dark_shadow`/`on_control`) that only Win2000 sets.
+
+The **look** is owned by a per-theme **`Painter`** — a small vtable
+(`button`/`field`/`segmentedTrack`/`segmentedSelection`/`switchTrack`) that draws
+only *chrome* into a `theme.Surface` (canvas + palette + metrics + scheme +
+opacity, with `fill`/`stroke`/`vGradient`/`lineSeg` helpers). **Painters depend
+only on the renderer + tokens, never on the view layer** — so the seam has no
+dependency cycle: the view layer keeps text/layout/hit-regions and calls
+`ctx.theme.painter.*` (via `ctx.surface(canvas)`) for decoration; `painter.button`
+even *returns* the label color so a theme controls both at once. To add a glassy
+vs. bevelled vs. flat control, implement the painter method per family — don't
+hard-code a look in `view.zig`.
+
+The four families live in `src/theme/{macos,win2000,windows10,kde}.zig`:
+macОС = vertical gradient sheen + white rim (the original look, reproduced
+exactly so the pixel tests still pass); Win2000 = 2-ring raised/sunken bevels +
+silver `control_face`, **light-only**; Windows 10 = flat fills + 1px borders;
+KDE/Breeze = subtle gradients + thin borders + 3px corners.
+`theme/registry.zig` exposes `Family` + `forScheme(family, scheme)` (light-only
+families ignore a dark request). `app.systemTheme()`/`app.colorScheme()` read the
+OS preference (SDL3) so an app/theme-provider follows dark/light live; the
+`showcase` footer has a theme-family **`RadioGroup`** and seeds dark mode from the
+OS on the first frame. Headless: `showcase --screenshot <out.bmp> --theme N
+[--dark]`.
 
 ### Build-time theme tokens — `setThemeTokens` / `BuildTokens` (for composed controls)
 Composed constructors have **no `Context`** (the long-standing reason

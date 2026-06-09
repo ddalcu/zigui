@@ -112,6 +112,14 @@ pub fn systemTheme() SystemTheme {
     };
 }
 
+/// The OS color scheme as a `zigui.ColorScheme`, ready to hand to
+/// `zigui.themeForScheme(family, app.colorScheme())`. Falls back to `.light`
+/// when the platform can't report a preference. Re-query it each frame (or in a
+/// theme provider) to follow the OS live.
+pub fn colorScheme() zigui.ColorScheme {
+    return if (systemTheme() == .dark) .dark else .light;
+}
+
 /// An optional application key handler, called first on every key-down with the
 /// SDL keycode (`SDLK_*`) and modifier mask (`SDL_KMOD_*`, both reachable via
 /// `app.c`). Return true to mark the key consumed — the loop then skips its
@@ -662,6 +670,9 @@ fn waitOne(running: *bool, st: anytype, cfg: Config) void {
 }
 
 fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, scrolls: []const zigui.ScrollRegion) void {
+    // With frame logging on, also log which events wake the loop (each wake
+    // costs a full rebuild+raster) so redraw storms can be attributed.
+    if (g_frame_log) std.debug.print("[zigui] event 0x{x}\n", .{ev.type});
     switch (ev.type) {
         c.SDL_EVENT_QUIT => running.* = false,
         // The close button: hide-to-tray when configured, else quit. (⌘Q still

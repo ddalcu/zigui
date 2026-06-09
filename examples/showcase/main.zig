@@ -15,6 +15,7 @@ const app = @import("zigui_app");
 // libc file write for the headless `--screenshot` path (std.fs needs std.Io in 0.16).
 const cstdio = @cImport({
     @cInclude("stdio.h");
+    @cInclude("time.h"); // clock() for --bench (std.time.Timer needs std.Io in 0.16)
 });
 
 // ── Theme: appearance (light/dark) × accent ───────────────────────────────────
@@ -54,9 +55,26 @@ fn accentSwatches(st: *AppState) zigui.View {
 var g_theme = zigui.default_theme;
 var g_app: ?*AppState = null;
 
+/// The built-in theme families offered by the switcher, in display order.
+const families = zigui.theme_registry.all;
+/// Their display names, for the family switcher's radio list.
+const family_names = blk: {
+    var names: [families.len][]const u8 = undefined;
+    for (families, 0..) |f, i| names[i] = f.displayName();
+    break :blk names;
+};
+
 fn themeProvider() zigui.Theme {
     const st = g_app orelse return g_theme;
-    var th = if (st.dark.get()) zigui.macos.dark else zigui.macos.light;
+    // On the first frame (now that SDL is up), seed the appearance from the OS.
+    if (!st.os_synced) {
+        st.dark.set(app.systemTheme() == .dark);
+        st.os_synced = true;
+    }
+    const fi: usize = @intCast(std.math.clamp(st.theme_family.get(), 0, families.len - 1));
+    const scheme: zigui.ColorScheme = if (st.dark.get()) .dark else .light;
+    var th = zigui.themeForScheme(families[fi], scheme);
+    // The accent switcher recolors the tint/selection across every theme.
     const ai: usize = @intCast(std.math.clamp(st.accent.get(), 0, accents.len - 1));
     th.colors.accent = accents[ai].color;
     th.colors.selection = accents[ai].color;
@@ -76,6 +94,10 @@ const AppState = struct {
     section: zigui.State(i64),
     dark: zigui.State(bool),
     accent: zigui.State(i64),
+    /// Index into `families` — the active theme family (macOS, Win10, …).
+    theme_family: zigui.State(i64),
+    /// Set once the appearance has been seeded from the OS preference.
+    os_synced: bool,
     nav: zigui.NavState,
 
     // Controls
@@ -517,7 +539,11 @@ fn sidebar(st: *AppState) zigui.View {
         zigui.Sidebar(&sidebar_items, st.section.binding()),
         zigui.Spacer(),
         zigui.Divider(),
-        // Appearance + accent theme switchers.
+        // Theme family + appearance + accent switchers.
+        zigui.VStack(.{
+            leading(zigui.Text("Theme").font(.footnote).foreground(t().colors.secondary_label)),
+            zigui.RadioGroup(st.theme_family.binding(), &family_names),
+        }).spacing(6).padding(6),
         row("Dark mode", zigui.Toggle("", st.dark.binding())).padding(6),
         zigui.VStack(.{
             leading(zigui.Text("Accent").font(.footnote).foreground(t().colors.secondary_label)),
@@ -542,7 +568,8 @@ fn body(st: *AppState) zigui.View {
     const alert_content = zigui.VStack(.{
         zigui.Icon(.info, 28, t().colors.accent),
         zigui.Text("Heads up").font(.headline),
-        zigui.Text("This is a centered alert overlay."),
+        zigui.WrappedText("A centered alert. Long unbreakable tokens wrap too: " ++
+            "/Users/david/models/unsloth/FLUX.2-klein-4B-GGUF.safetensors"),
         zigui.Button("OK", zigui.actionCtx(AppState, st, AppState.closeAlert)),
     }).spacing(12).padding(20).frameWidth(300);
 
@@ -589,7 +616,7 @@ fn writeBmp(path: [:0]const u8, fb: *const zigui.Framebuffer) void {
     }
 }
 
-fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8) !void {
+fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8, bench: usize) !void {
     const w: u32 = 900;
     const h: u32 = 640;
     const theme = themeProvider();
@@ -623,6 +650,29 @@ fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8) !void {
     try zigui.raster.render(gpa, &fb, canvas.commands.items);
     writeBmp(out, &fb);
     std.debug.print("wrote {s} ({d}x{d})\n", .{ out, w, h });
+
+    // `--bench N`: re-rasterize the same frame N times and report ms/frame,
+    // for iterating on rasterizer performance without a window.
+    if (bench > 0) {
+        const t0 = cstdio.clock();
+        var i: usize = 0;
+        while (i < bench) : (i += 1) {
+            fb.clear(theme.colors.window_background);
+            try zigui.raster.render(gpa, &fb, canvas.commands.items);
+        }
+        const elapsed: f64 = @as(f64, @floatFromInt(cstdio.clock() - t0)) / @as(f64, @floatFromInt(cstdio.CLOCKS_PER_SEC));
+        const ms = elapsed * 1000.0 / @as(f64, @floatFromInt(bench));
+        std.debug.print("raster: {d:.2} ms/frame over {d} frames ({d} commands)\n", .{ ms, bench, canvas.commands.items.len });
+
+        // And the f32 -> RGBA8 conversion that runs on every present.
+        const rgba = try gpa.alloc(u8, @as(usize, w) * h * 4);
+        defer gpa.free(rgba);
+        const t1 = cstdio.clock();
+        var j: usize = 0;
+        while (j < bench) : (j += 1) fb.toRgba8(rgba);
+        const conv: f64 = @as(f64, @floatFromInt(cstdio.clock() - t1)) / @as(f64, @floatFromInt(cstdio.CLOCKS_PER_SEC));
+        std.debug.print("toRgba8: {d:.2} ms/frame\n", .{conv * 1000.0 / @as(f64, @floatFromInt(bench))});
+    }
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -631,6 +681,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .section = zigui.State(i64).init(alloc, 0),
         .dark = zigui.State(bool).init(alloc, false),
         .accent = zigui.State(i64).init(alloc, 0),
+        .theme_family = zigui.State(i64).init(alloc, 0),
+        .os_synced = false,
         .nav = zigui.NavState.init(alloc),
         .toggle_a = zigui.State(bool).init(alloc, true),
         .toggle_b = zigui.State(bool).init(alloc, false),
@@ -656,6 +708,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         st.section.deinit();
         st.dark.deinit();
         st.accent.deinit();
+        st.theme_family.deinit();
         st.nav.deinit();
         st.toggle_a.deinit();
         st.toggle_b.deinit();
@@ -688,6 +741,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // `--screenshot <out.bmp> [section]` renders one frame headlessly (no window).
     var shot: ?[:0]const u8 = null;
     var section: i64 = 0;
+    var bench: usize = 0;
     var it = try std.process.Args.iterateAllocator(init.args, alloc);
     defer it.deinit();
     _ = it.next(); // argv[0]
@@ -696,8 +750,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             shot = it.next();
         } else if (std.mem.eql(u8, a, "--dark")) {
             st.dark.set(true);
+        } else if (std.mem.eql(u8, a, "--theme")) {
+            if (it.next()) |n| st.theme_family.set(std.fmt.parseInt(i64, n, 10) catch 0);
         } else if (std.mem.eql(u8, a, "--accent")) {
             if (it.next()) |n| st.accent.set(std.fmt.parseInt(i64, n, 10) catch 0);
+        } else if (std.mem.eql(u8, a, "--bench")) {
+            if (it.next()) |n| bench = std.fmt.parseInt(usize, n, 10) catch 0;
         } else if (std.mem.eql(u8, a, "--sheet")) {
             st.show_sheet.set(true);
         } else if (std.mem.eql(u8, a, "--alert")) {
@@ -708,7 +766,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     if (shot) |out| {
         st.section.set(section);
-        return screenshot(alloc, &st, out);
+        // Headless: honor the explicit --dark/--theme flags instead of probing
+        // the OS (SDL isn't initialized on the screenshot path).
+        st.os_synced = true;
+        return screenshot(alloc, &st, out, bench);
     }
 
     try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660 }, body);

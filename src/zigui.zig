@@ -61,10 +61,25 @@ pub const drawText = font.drawText;
 
 pub const theme = @import("theme/theme.zig");
 pub const macos = @import("theme/macos.zig");
+pub const win2000 = @import("theme/win2000.zig");
+pub const windows10 = @import("theme/windows10.zig");
+pub const kde = @import("theme/kde.zig");
+pub const mui = @import("theme/mui.zig");
+pub const theme_registry = @import("theme/registry.zig");
 pub const Theme = theme.Theme;
+pub const Palette = theme.Palette;
+pub const Painter = theme.Painter;
+// Painter-authoring types — so third parties can implement a theme's chrome.
+pub const Surface = theme.Surface;
+pub const ControlState = theme.ControlState;
+pub const Role = theme.Role;
 pub const TextStyle = theme.TextStyle;
 pub const FontWeight = theme.FontWeight;
 pub const ColorScheme = theme.ColorScheme;
+/// Built-in theme families (macOS, Windows 10, Windows 2000, KDE Plasma).
+pub const ThemeFamily = theme_registry.Family;
+/// Resolve a theme family to a concrete `Theme` for the OS color scheme.
+pub const themeForScheme = theme_registry.forScheme;
 /// The default theme (macOS light).
 pub const default_theme = macos.light;
 
@@ -117,6 +132,7 @@ pub const VStack = view.VStack;
 pub const HStack = view.HStack;
 pub const ZStack = view.ZStack;
 pub const Spacer = view.Spacer;
+pub const MinSpacer = view.MinSpacer;
 pub const Divider = view.Divider;
 pub const ForEach = view.ForEach;
 pub const Button = view.Button;
@@ -137,6 +153,7 @@ pub const IconButton = view.IconButton;
 pub const IconName = view.IconName;
 pub const ScrollView = view.ScrollView;
 pub const ScrollViewState = view.ScrollViewState;
+pub const ScrollViewOffset = view.ScrollViewOffset;
 pub const List = view.List;
 pub const LazyVGrid = view.LazyVGrid;
 pub const LazyHGrid = view.LazyHGrid;

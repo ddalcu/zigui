@@ -1,11 +1,36 @@
-//! Theme: the design-token vocabulary that gives zigui its look. A `Theme`
-//! bundles semantic color roles, a typographic scale, and layout metrics.
-//! Components read tokens from the active theme rather than hard-coding values,
-//! so the whole UI restyles by swapping one struct (see `theme/macos.zig` for
-//! the default macOS light/dark presets).
+//! Theme: the design-token vocabulary *and* drawing strategy that give a zigui
+//! app its look. A `Theme` bundles three things:
+//!
+//!   * a **`Palette`** of semantic color roles (resolved for one `ColorScheme`),
+//!   * a typographic scale and layout **`Metrics`**, and
+//!   * a **`Painter`** — a small vtable of functions that draw the *chrome* of
+//!     the theme-defining controls (buttons, switches, fields, segmented
+//!     controls).
+//!
+//! Splitting the palette from the painter is what lets very different looks
+//! coexist: macOS draws translucent "liquid glass" with gradient sheens, while
+//! Windows 2000 chisels raised/sunken bevels from the same token vocabulary.
+//! Components read tokens and call the painter rather than hard-coding a look,
+//! so the whole UI restyles by swapping one `Theme`.
+//!
+//! A `Painter` depends only on the renderer (`Canvas`, `Color`, geometry) and
+//! these tokens — never on the view layer — so the two compose without a
+//! dependency cycle: the view layer owns text, layout, and interaction; the
+//! painter owns decoration.
+//!
+//! Concrete themes live alongside this file (`macos.zig`, `win2000.zig`,
+//! `windows10.zig`, `kde.zig`); `registry.zig` selects one for the OS color
+//! scheme.
 
 const std = @import("std");
 const Color = @import("../render/color.zig").Color;
+const geom = @import("../layout/geometry.zig");
+const canvas_mod = @import("../render/canvas.zig");
+
+const Allocator = std.mem.Allocator;
+const Rect = geom.Rect;
+const Point = geom.Point;
+const Canvas = canvas_mod.Canvas;
 
 pub const ColorScheme = enum { light, dark };
 
@@ -30,9 +55,15 @@ pub const TextStyle = struct {
     line_height: f32 = 1.2,
 };
 
-/// Semantic color roles. Names follow macOS's dynamic system colors so the same
-/// role resolves to an appropriate value in light or dark mode.
-pub const Colors = struct {
+/// The semantic appearance of a control, used by buttons (and reusable by other
+/// roled controls). `plain` is a borderless, label-only button.
+pub const Role = enum { normal, destructive, plain };
+
+/// Semantic color roles, resolved for a single `ColorScheme`. The first block
+/// follows macOS's dynamic system colors; the bevel block at the end is only
+/// meaningful for chiseled (Windows-9x/2000) painters and is defaulted so flat
+/// themes can ignore it.
+pub const Palette = struct {
     /// The accent / tint color (macOS "System Blue" by default).
     accent: Color,
     /// Primary text/content color (labelColor).
@@ -53,10 +84,35 @@ pub const Colors = struct {
     selection: Color,
     /// Destructive / error (System Red).
     destructive: Color,
+
+    // --- Translucent "liquid glass" roles (macOS) -------------------------
+    /// A subtle fill painted behind a control/row while the cursor hovers it.
+    hover: Color,
+    /// The bright hairline edge along the top/sides of a glass control.
+    control_border: Color,
+    /// A translucent tint laid over blurred content for glass panels.
+    glass: Color,
+    /// Fill for an unselected segmented/glass control track.
+    control_track: Color,
+
+    // --- Chiseled bevel roles (Windows 2000 / 9x) -------------------------
+    // The 3D edge colors of the classic raised/sunken look. Defaulted so flat
+    // and glass themes need not spell them out.
+    /// The face color of a raised control (the button body).
+    control_face: Color = Color.fromRgb8(212, 208, 200),
+    /// Brightest bevel edge (outer top-left of a raised control).
+    control_highlight: Color = Color.white,
+    /// Light bevel edge (inner top-left).
+    control_light: Color = Color.fromRgb8(223, 223, 223),
+    /// Shadow bevel edge (inner bottom-right).
+    control_shadow: Color = Color.fromRgb8(128, 128, 128),
+    /// Darkest bevel edge (outer bottom-right).
+    control_dark_shadow: Color = Color.fromRgb8(64, 64, 64),
+    /// Label color on a raised/grey control (vs. `on_accent` for tinted ones).
+    on_control: Color = Color.black,
 };
 
-/// The typographic scale, mirroring SwiftUI's `Font.TextStyle` cases at macOS
-/// point sizes.
+/// The typographic scale, mirroring SwiftUI's `Font.TextStyle` cases.
 pub const Typography = struct {
     large_title: TextStyle,
     title: TextStyle,
@@ -85,22 +141,121 @@ pub const Metrics = struct {
     /// Default content padding.
     padding: f32 = 8,
     /// Corner radius for cards / grouped containers.
-    corner_radius: f32 = 8,
+    corner_radius: f32 = 12,
     /// Corner radius for push buttons and controls.
-    control_corner_radius: f32 = 6,
+    control_corner_radius: f32 = 7,
+    /// Corner radius for large panels (sidebars, sheets, popovers).
+    panel_corner_radius: f32 = 16,
     /// Standard control (button/field) height.
     control_height: f32 = 28,
+    /// Rounded selection-highlight radius for sidebar / list rows.
+    selection_corner_radius: f32 = 8,
     /// Window corner radius.
     window_corner_radius: f32 = 10,
     /// Hairline thickness for separators/borders at 1x.
     hairline: f32 = 1,
 };
 
-pub const Theme = struct {
+// ---------------------------------------------------------------------------
+// Painter: the per-theme drawing strategy
+// ---------------------------------------------------------------------------
+
+/// The interaction state of a control, passed to painter functions so a theme
+/// can render pressed/hovered/focused/disabled variants.
+pub const ControlState = struct {
+    pressed: bool = false,
+    hovered: bool = false,
+    focused: bool = false,
+    disabled: bool = false,
+};
+
+/// Everything a painter needs to draw chrome: the target `canvas`, the active
+/// `palette`/`metrics`, the `scheme` (light/dark), and the inherited `opacity`.
+/// Convenience methods apply `opacity` so painters read declaratively.
+pub const Surface = struct {
+    canvas: *Canvas,
+    palette: *const Palette,
+    metrics: *const Metrics,
     scheme: ColorScheme,
-    colors: Colors,
+    opacity: f32 = 1,
+
+    pub fn fill(s: Surface, rect: Rect, radius: f32, c: Color) Allocator.Error!void {
+        try s.canvas.fillRoundedRect(rect, radius, c.multiplyAlpha(s.opacity));
+    }
+    pub fn stroke(s: Surface, rect: Rect, radius: f32, width: f32, c: Color) Allocator.Error!void {
+        try s.canvas.strokeRoundedRect(rect, radius, width, c.multiplyAlpha(s.opacity));
+    }
+    /// A top-to-bottom (vertical) gradient filling `rect`.
+    pub fn vGradient(s: Surface, rect: Rect, radius: f32, top: Color, bottom: Color) Allocator.Error!void {
+        try s.canvas.push(.{ .linear_gradient = .{
+            .rect = rect,
+            .radius = radius,
+            .start = .{ .x = rect.x, .y = rect.y },
+            .end = .{ .x = rect.x, .y = rect.maxY() },
+            .c0 = top.multiplyAlpha(s.opacity),
+            .c1 = bottom.multiplyAlpha(s.opacity),
+        } });
+    }
+    pub fn lineSeg(s: Surface, a: Point, b: Point, width: f32, c: Color) Allocator.Error!void {
+        try s.canvas.line(a, b, width, c.multiplyAlpha(s.opacity));
+    }
+    pub fn fillCircle(s: Surface, center: Point, r: f32, c: Color) Allocator.Error!void {
+        try s.canvas.fillCircle(center, r, c.multiplyAlpha(s.opacity));
+    }
+};
+
+/// A vtable of chrome-drawing functions — the heart of a theme's identity. Each
+/// draws only decoration (fills, borders, bevels, gradients); the view layer
+/// draws labels, lays things out, and registers hit regions around them.
+pub const Painter = struct {
+    /// Draw a push-button's background/border in `rect`, then return the color
+    /// its label should be drawn in (so a theme controls both at once).
+    button: *const fn (s: Surface, rect: Rect, role: Role, st: ControlState) Allocator.Error!Color,
+    /// Draw a text-input surface (background + border) with the given corner
+    /// `radius`; `st.focused` selects the focused appearance.
+    field: *const fn (s: Surface, rect: Rect, radius: f32, st: ControlState) Allocator.Error!void,
+    /// Draw the recessed track behind a whole segmented control.
+    segmentedTrack: *const fn (s: Surface, rect: Rect) Allocator.Error!void,
+    /// Draw the highlight chip behind the selected segment (`seg`), then return
+    /// the color its label should be drawn in (an accent-filled chip needs
+    /// `on_accent` text; a pale chip keeps `label`).
+    segmentedSelection: *const fn (s: Surface, seg: Rect) Allocator.Error!Color,
+    /// Draw an on/off switch track. The sliding knob is drawn separately by
+    /// `switchKnob` (the view layer owns the knob *geometry* and calls both in
+    /// sequence).
+    switchTrack: *const fn (s: Surface, rect: Rect, on: bool) Allocator.Error!void,
+    /// Draw the toggle's sliding thumb within `knob` (a square bounding the
+    /// circular knob); `on` lets a theme tint it differently per state.
+    switchKnob: *const fn (s: Surface, knob: Rect, on: bool) Allocator.Error!void,
+    /// Draw a slider: the unfilled `track`, the filled portion (`track` scaled by
+    /// `frac` in 0..1), and the handle within `knob`.
+    slider: *const fn (s: Surface, track: Rect, frac: f32, knob: Rect, st: ControlState) Allocator.Error!void,
+    /// Draw the +/- control box chrome (fill + border/bevel); the divider and
+    /// glyph lines are drawn by the view layer.
+    stepperBox: *const fn (s: Surface, rect: Rect, st: ControlState) Allocator.Error!void,
+    /// Draw a determinate progress bar: the track, then the filled portion
+    /// (`rect` scaled by `frac` in 0..1).
+    progress: *const fn (s: Surface, rect: Rect, frac: f32) Allocator.Error!void,
+    /// Draw the frame (background + border/bevel) for a floating panel — sheets,
+    /// alerts, popovers, and menus — with the given corner `radius`.
+    panel: *const fn (s: Surface, rect: Rect, radius: f32) Allocator.Error!void,
+};
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+/// A fully-resolved theme for one `ColorScheme`: a palette, a type scale, layout
+/// metrics, and the painter that gives it its look. Built per scheme by the
+/// concrete theme modules; `registry.zig` picks one for the OS appearance.
+pub const Theme = struct {
+    /// Human-readable name of the theme family (e.g. "macOS", "Windows 2000").
+    name: []const u8 = "zigui",
+    scheme: ColorScheme,
+    colors: Palette,
     typography: Typography,
     metrics: Metrics = .{},
+    painter: Painter,
 
     /// Resolve a named text style.
     pub fn font(self: Theme, name: enum {
@@ -148,5 +303,13 @@ test "Theme: font() resolves named styles" {
 test "Metrics: sensible defaults" {
     const m = Metrics{};
     try testing.expectEqual(@as(f32, 8), m.spacing);
-    try testing.expectEqual(@as(f32, 6), m.control_corner_radius);
+    try testing.expectEqual(@as(f32, 7), m.control_corner_radius);
+    // Liquid Glass rounds panels more than controls.
+    try testing.expect(m.panel_corner_radius > m.corner_radius);
+}
+
+test "Palette: bevel tokens default for non-chiseled themes" {
+    const macos = @import("macos.zig");
+    // macOS doesn't set bevel tokens, so they fall back to the struct defaults.
+    try testing.expect(macos.light.colors.control_highlight.approxEql(Color.white, 0.001));
 }

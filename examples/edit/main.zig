@@ -28,7 +28,27 @@ const cstdio = @cImport({
     @cInclude("stdio.h");
 });
 
-const t = zigui.default_theme;
+/// The live theme, recomputed by `themeProvider` from the app state each frame
+/// (so every view built this frame sees the same scheme). `g_app` lets the
+/// provider read the appearance selection.
+var g_theme = zigui.default_theme;
+
+fn themeProvider() zigui.Theme {
+    const st = g_app orelse return g_theme;
+    // On the first frame (now that SDL is up), seed the appearance from the OS.
+    if (!st.os_synced) {
+        st.dark.set(app.systemTheme() == .dark);
+        st.os_synced = true;
+    }
+    const scheme: zigui.ColorScheme = if (st.dark.get()) .dark else .light;
+    g_theme = zigui.themeForScheme(.macos, scheme);
+    return g_theme;
+}
+
+/// Shorthand for the live theme inside view builders / the screenshot path.
+inline fn t() zigui.Theme {
+    return g_theme;
+}
 
 // --- application state -------------------------------------------------------
 
@@ -45,6 +65,12 @@ const AppState = struct {
 
     line_numbers: zigui.State(bool),
     zoom: zigui.State(i64), // index into the font-size ladder; 3 == body
+
+    /// Dark appearance, seeded from the OS preference on the first frame.
+    dark: zigui.State(bool),
+    /// Set once the appearance has been seeded from the OS (kept off in headless
+    /// screenshots so they stay deterministic).
+    os_synced: bool = false,
 
     // A single path-entry dialog, reused for Open and Save As (only one overlay
     // can be presented at a time, so `dialog_save` picks which it is).
@@ -326,7 +352,7 @@ fn toolbar(st: *AppState) zigui.View {
 
 fn findBar(st: *AppState) zigui.View {
     return zigui.HStack(.{
-        zigui.Text("Find").font(.subheadline).foreground(t.colors.secondary_label),
+        zigui.Text("Find").font(.subheadline).foreground(t().colors.secondary_label),
         zigui.TextField("Search…", &st.find_field)
             .frameMaxWidth()
             .onSubmit(zigui.actionCtx(AppState, st, findNext)),
@@ -335,7 +361,7 @@ fn findBar(st: *AppState) zigui.View {
         zigui.components.ButtonRoled("Done", .plain, zigui.actionCtx(AppState, st, toggleFind)),
     }).spacing(10)
         .paddingInsets(.{ .top = 7, .leading = 14, .bottom = 7, .trailing = 14 })
-        .background(t.colors.secondary_background)
+        .background(t().colors.secondary_background)
         .frameMaxWidth();
 }
 
@@ -346,9 +372,9 @@ fn statusBar(st: *AppState) zigui.View {
     const lines = std.mem.count(u8, text, "\n") + 1;
     const meta = zigui.components.fmt("Ln {d}, Col {d}    {d} chars    {d} lines", .{ lc.line, lc.col, chars, lines });
     return zigui.HStack(.{
-        zigui.Text(meta).font(.footnote).foreground(t.colors.secondary_label),
+        zigui.Text(meta).font(.footnote).foreground(t().colors.secondary_label),
         zigui.Spacer(),
-        zigui.Text(st.status()).font(.footnote).foreground(t.colors.tertiary_label),
+        zigui.Text(st.status()).font(.footnote).foreground(t().colors.tertiary_label),
     }).spacing(14)
         .paddingInsets(.{ .top = 6, .leading = 14, .bottom = 6, .trailing = 14 })
         .frameMaxWidth();
@@ -358,7 +384,7 @@ fn dialogView(st: *AppState) zigui.View {
     const onConfirm = zigui.actionCtx(AppState, st, confirmDialog);
     return zigui.VStack(.{
         leading(zigui.Text(if (st.dialog_save) "Save As" else "Open").font(.title3)),
-        leading(zigui.Text("File path:").font(.subheadline).foreground(t.colors.secondary_label)),
+        leading(zigui.Text("File path:").font(.subheadline).foreground(t().colors.secondary_label)),
         zigui.TextField("/path/to/file.txt", &st.path_field)
             .frameMaxWidth()
             .onSubmit(onConfirm),
@@ -444,9 +470,9 @@ fn renderScreenshot(gpa: std.mem.Allocator, st: *AppState, path: [:0]const u8, d
             zigui.beginBuild(a);
             const root = body(s);
             zigui.endBuild();
-            var ctx = zigui.Context.initFull(t, ce, a, hh, oo, null);
+            var ctx = zigui.Context.initFull(t(), ce, a, hh, oo, null);
             ctx.scroll_regions = ss;
-            try ca.fillRect(rect, t.colors.window_background);
+            try ca.fillRect(rect, t().colors.window_background);
             try zigui.render(&ctx, root, rect, ca);
         }
     }.run;
@@ -456,7 +482,7 @@ fn renderScreenshot(gpa: std.mem.Allocator, st: *AppState, path: [:0]const u8, d
     // Simulate a real mouse drag through the collected hit regions, then re-render
     // so the screenshot shows what the dispatched selection actually produces.
     if (drag) {
-        const lh = zigui.shape.lineHeight(&font.face, t.typography.body.size);
+        const lh = zigui.shape.lineHeight(&font.face, t().typography.body.size);
         _ = zigui.dispatchTap(hits.items, .{ .x = 70, .y = 8 + 4 * lh + 2 }); // press on line 5
         zigui.dispatchDrag(hits.items, .{ .x = 250, .y = 8 + 7 * lh + 2 }); // drag to line 8
         zigui.endDrag();
@@ -465,7 +491,7 @@ fn renderScreenshot(gpa: std.mem.Allocator, st: *AppState, path: [:0]const u8, d
 
     var fb = try zigui.Framebuffer.init(gpa, w, h);
     defer fb.deinit();
-    fb.clear(t.colors.window_background);
+    fb.clear(t().colors.window_background);
     try zigui.raster.render(gpa, &fb, canvas.commands.items);
     writeBmp(path, &fb);
 }
@@ -518,6 +544,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .doc = zigui.TextFieldState.init(gpa),
         .line_numbers = zigui.State(bool).init(gpa, true),
         .zoom = zigui.State(i64).init(gpa, 3),
+        .dark = zigui.State(bool).init(gpa, false),
         .show_dialog = zigui.State(bool).init(gpa, false),
         .path_field = zigui.TextFieldState.init(gpa),
         .show_find = zigui.State(bool).init(gpa, false),
@@ -528,6 +555,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         st.path.deinit(gpa);
         st.line_numbers.deinit();
         st.zoom.deinit();
+        st.dark.deinit();
         st.show_dialog.deinit();
         st.path_field.deinit();
         st.show_find.deinit();
@@ -535,6 +563,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     st.doc.multiline = true;
     st.setStatus("Ready", .{});
+    g_app = &st;
 
     // Args: an optional file to open, and a headless --screenshot <path>.
     var open_path: ?[]const u8 = null;
@@ -543,6 +572,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var demo_dialog = false;
     var demo_select = false;
     var demo_drag = false;
+    var force_dark = false;
     var arg_it = try std.process.Args.iterateAllocator(init.args, gpa);
     defer arg_it.deinit();
     _ = arg_it.next(); // argv[0]
@@ -557,6 +587,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             demo_select = true;
         } else if (std.mem.eql(u8, a, "--demo-drag")) {
             demo_drag = true;
+        } else if (std.mem.eql(u8, a, "--dark")) {
+            force_dark = true;
         } else if (!std.mem.startsWith(u8, a, "-")) {
             open_path = a;
         }
@@ -565,6 +597,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (open_path) |p| loadPath(&st, p);
 
     if (screenshot_path) |path| {
+        // Deterministic theme: honor --dark, never probe the OS when headless.
+        st.dark.set(force_dark);
+        st.os_synced = true;
+        _ = themeProvider();
         if (st.doc.text().len == 0) {
             st.doc.setText(sample_doc) catch {};
             st.doc.caret = 0;
@@ -590,8 +626,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
-    g_app = &st;
     app.setKeyHandler(&keyHandler);
+    app.setThemeProvider(themeProvider); // follow the OS dark/light appearance
     zigui.setFocus(&st.doc); // ready to type immediately
 
     try app.run(gpa, AppState, &st, .{

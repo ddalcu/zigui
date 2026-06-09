@@ -10,19 +10,24 @@ const Allocator = std.mem.Allocator;
 
 pub const PositionedGlyph = struct {
     glyph: u16,
+    /// Face the glyph belongs to (the primary face or one of its fallbacks).
+    /// Glyph indices are per-face, so rasterize from this, not the line's face.
+    face: *const ttf.Font,
     /// Pen x at the glyph's origin (before its left-side bearing), in pixels.
     x: f32,
     advance: f32,
 };
 
-/// Measure the advance width (pixels) of a single line of text.
+/// Measure the advance width (pixels) of a single line of text. Each codepoint
+/// is resolved through the face's fallback chain, using the resolving face's own
+/// units-per-em scale (fonts differ), so fallback glyphs advance correctly.
 pub fn measureLineWidth(face: *const ttf.Font, text: []const u8, pixel_size: f32) f32 {
-    const scale = face.scaleForPixelSize(pixel_size);
     var width: f32 = 0;
     var it = codepoints(text);
     while (it.next()) |cp| {
-        const g = face.glyphIndex(cp);
-        width += @as(f32, @floatFromInt(face.advanceWidth(g))) * scale;
+        const r = face.resolve(cp);
+        const scale = r.face.scaleForPixelSize(pixel_size);
+        width += @as(f32, @floatFromInt(r.face.advanceWidth(r.glyph))) * scale;
     }
     return width;
 }
@@ -44,15 +49,15 @@ pub fn ascentPixels(face: *const ttf.Font, pixel_size: f32) f32 {
 /// Lay out a single line into positioned glyphs starting at pen x = `start_x`.
 /// Caller owns the returned slice.
 pub fn layoutLine(allocator: Allocator, face: *const ttf.Font, text: []const u8, pixel_size: f32, start_x: f32) ![]PositionedGlyph {
-    const scale = face.scaleForPixelSize(pixel_size);
     var out: std.ArrayList(PositionedGlyph) = .empty;
     errdefer out.deinit(allocator);
     var pen = start_x;
     var it = codepoints(text);
     while (it.next()) |cp| {
-        const g = face.glyphIndex(cp);
-        const adv = @as(f32, @floatFromInt(face.advanceWidth(g))) * scale;
-        try out.append(allocator, .{ .glyph = g, .x = pen, .advance = adv });
+        const r = face.resolve(cp);
+        const scale = r.face.scaleForPixelSize(pixel_size);
+        const adv = @as(f32, @floatFromInt(r.face.advanceWidth(r.glyph))) * scale;
+        try out.append(allocator, .{ .glyph = r.glyph, .face = r.face, .x = pen, .advance = adv });
         pen += adv;
     }
     return out.toOwnedSlice(allocator);
@@ -61,8 +66,9 @@ pub fn layoutLine(allocator: Allocator, face: *const ttf.Font, text: []const u8,
 pub const WrappedLine = struct { start: usize, end: usize, width: f32 };
 
 /// Greedy word-wrap of `text` to `max_width` pixels. Returns byte ranges into
-/// `text` for each line. Words are split on ASCII spaces; an over-long word is
-/// placed on its own line (no mid-word breaking). Caller owns the slice.
+/// `text` for each line. Words are split on ASCII spaces; a word wider than a
+/// whole line on its own (a path, a URL) is broken at codepoint boundaries.
+/// Caller owns the slice.
 pub fn wrapText(allocator: Allocator, face: *const ttf.Font, text: []const u8, pixel_size: f32, max_width: f32) ![]WrappedLine {
     var lines: std.ArrayList(WrappedLine) = .empty;
     errdefer lines.deinit(allocator);
@@ -86,6 +92,30 @@ pub fn wrapText(allocator: Allocator, face: *const ttf.Font, text: []const u8, p
                 .width = measureLineWidth(face, text[line_start..line_end], pixel_size),
             });
             line_start = word_start;
+        }
+        // An unbreakable word that overflows a whole line by itself: emit
+        // codepoint-boundary chunks; the final chunk stays as the open line so
+        // following words can join it.
+        if (line_start == word_start and
+            measureLineWidth(face, text[word_start..word_end], pixel_size) > max_width)
+        {
+            var it = codepoints(text[word_start..word_end]);
+            var chunk_start = word_start;
+            var chunk_w: f32 = 0;
+            while (true) {
+                const off = word_start + it.i;
+                const cp = it.next() orelse break;
+                const r = face.resolve(cp);
+                const adv = @as(f32, @floatFromInt(r.face.advanceWidth(r.glyph))) * r.face.scaleForPixelSize(pixel_size);
+                if (chunk_w + adv > max_width and off > chunk_start) {
+                    try lines.append(allocator, .{ .start = chunk_start, .end = off, .width = chunk_w });
+                    chunk_start = off;
+                    chunk_w = adv;
+                } else {
+                    chunk_w += adv;
+                }
+            }
+            line_start = chunk_start;
         }
         line_end = word_end;
 
@@ -180,6 +210,30 @@ test "shape: wrapText breaks on width and on newlines" {
     const nl = try wrapText(testing.allocator, &face, "a\nb", 16, 10000);
     defer testing.allocator.free(nl);
     try testing.expectEqual(@as(usize, 2), nl.len);
+}
+
+test "shape: wrapText breaks an unbreakable over-long word mid-token" {
+    var face = try ttf.Font.parse(ttf.inter_ttf);
+    // A path-like token with no spaces, wrapped far narrower than its width.
+    const token = "/Users/david/models/unsloth/FLUX.2-klein-4B-GGUF.safetensors";
+    const max = measureLineWidth(&face, token, 16) / 3;
+    const lines = try wrapText(testing.allocator, &face, token, 16, max);
+    defer testing.allocator.free(lines);
+    try testing.expect(lines.len >= 3);
+    // every emitted line fits, and together they cover the whole token
+    var covered: usize = 0;
+    for (lines) |l| {
+        try testing.expect(l.width <= max);
+        covered += l.end - l.start;
+    }
+    try testing.expectEqual(token.len, covered);
+
+    // a broken word's tail still shares its line with the following word
+    const text = "/an/over/long/unbreakable/path then words";
+    const max2 = measureLineWidth(&face, text, 16) / 2;
+    const mixed = try wrapText(testing.allocator, &face, text, 16, max2);
+    defer testing.allocator.free(mixed);
+    for (mixed) |l| try testing.expect(l.width <= max2 + 0.01);
 }
 
 test "shape: invalid UTF-8 yields a measurable result (no crash)" {

@@ -27,8 +27,24 @@ const shape = @import("../text/shape.zig");
 const font_mod = @import("../text/font.zig");
 const ttf = @import("../text/ttf.zig");
 const state = @import("../state/state.zig");
+const icons = @import("../icons.zig");
+
+// Component modules. The view layer is the engine + a thin facade: each module
+// in `components/` owns a cohesive set of constructors (and, where relevant,
+// their painting), and the public names are re-exported below.
+const navigation = @import("../components/navigation.zig");
+const tabs_mod = @import("../components/tabs.zig");
+const menu_mod = @import("../components/menu.zig");
+const grid = @import("../components/grid.zig");
+const list_mod = @import("../components/list.zig");
+const collections = @import("../components/collections.zig");
+const text_buffer = @import("../components/text_buffer.zig");
 
 pub const Binding = state.Binding;
+/// The icon catalog enum. Call sites usually rely on enum-literal inference
+/// (`Icon(.heart, …)`) and never spell this out; it's exported for the rare
+/// explicit annotation. The `Icon`/`IconButton` constructors are below.
+pub const IconName = icons.Icon;
 
 const Allocator = std.mem.Allocator;
 const Rect = geom.Rect;
@@ -38,6 +54,27 @@ const EdgeInsets = geom.EdgeInsets;
 const Alignment = geom.Alignment;
 const Theme = theme_mod.Theme;
 const inf = std.math.inf(f32);
+
+// --- Facade re-exports from component modules ------------------------------
+// These keep the historical `view.X` public names stable while the
+// implementations live in `components/`.
+pub const NavState = navigation.NavState;
+pub const NavigationSplitView = navigation.NavigationSplitView;
+pub const NavigationLink = navigation.NavigationLink;
+pub const NavBackButton = navigation.NavBackButton;
+pub const Tab = tabs_mod.Tab;
+pub const TabView = tabs_mod.TabView;
+pub const Menu = menu_mod.Menu;
+pub const ContextMenu = menu_mod.ContextMenu;
+pub const LazyVGrid = grid.LazyVGrid;
+pub const LazyHGrid = grid.LazyHGrid;
+pub const List = list_mod.List;
+pub const Sidebar = collections.Sidebar;
+pub const SidebarItem = collections.SidebarItem;
+pub const RadioGroup = collections.RadioGroup;
+pub const Table = collections.Table;
+pub const TableColumn = collections.TableColumn;
+pub const TextFieldState = text_buffer.TextFieldState;
 
 // ---------------------------------------------------------------------------
 // Callbacks
@@ -71,6 +108,25 @@ pub fn actionCtx(comptime T: type, ctx: *T, comptime f: fn (*T) void) Callback {
     }.g };
 }
 
+/// Closure context for `selectAction`: a (binding, value) pair bound at build
+/// time and stored in the per-frame build arena, which outlives the frame until
+/// the next rebuild, so a hit region's callback can safely read it.
+const SelectCtx = struct { binding: Binding(i64), value: i64 };
+
+fn selectThunk(p: ?*anyopaque) void {
+    const c: *SelectCtx = @ptrCast(@alignCast(p.?));
+    c.binding.set(c.value);
+}
+
+/// A `Callback` that sets `binding` to `value` — the building block for selection
+/// in composed controls (sidebar rows, radio options, table rows). Lets those
+/// stay pure composition over `onTap` without a dedicated `HitAction`.
+pub fn selectAction(binding: Binding(i64), value: i64) Callback {
+    const c = buildAlloc().create(SelectCtx) catch @panic("oom");
+    c.* = .{ .binding = binding, .value = value };
+    return .{ .ctx = c, .func = selectThunk };
+}
+
 // ---------------------------------------------------------------------------
 // Fills, fonts, modifiers
 // ---------------------------------------------------------------------------
@@ -84,14 +140,17 @@ pub const Material = enum {
     regular,
     thick,
 
-    pub const Spec = struct { tint: Color, sigma: f32 };
+    /// A blur `sigma` and an `alpha_scale` applied to the active theme's
+    /// `Palette.glass` tint (so the frost is scheme-correct: light glass in light
+    /// mode, dark glass in dark mode).
+    pub const Spec = struct { alpha_scale: f32, sigma: f32 };
 
     pub fn spec(self: Material) Spec {
         return switch (self) {
-            .ultra_thin => .{ .tint = Color.white.withAlpha(0.20), .sigma = 8 },
-            .thin => .{ .tint = Color.white.withAlpha(0.35), .sigma = 10 },
-            .regular => .{ .tint = Color.white.withAlpha(0.55), .sigma = 12 },
-            .thick => .{ .tint = Color.white.withAlpha(0.75), .sigma = 14 },
+            .ultra_thin => .{ .alpha_scale = 0.35, .sigma = 8 },
+            .thin => .{ .alpha_scale = 0.55, .sigma = 10 },
+            .regular => .{ .alpha_scale = 0.85, .sigma = 12 },
+            .thick => .{ .alpha_scale = 1.0, .sigma = 14 },
         };
     }
 };
@@ -158,11 +217,18 @@ pub const Modifiers = struct {
     border_width: f32 = 1,
     opacity: f32 = 1,
     on_tap: ?Callback = null,
+    /// A background painted only while the cursor is within this view's frame
+    /// (see `Context.hover_point`). Gives menu rows / list rows a live hover
+    /// highlight without per-widget state.
+    hover_fill: ?Color = null,
     /// Fired when a focused `TextField` is submitted (Enter). Stashed on the
     /// field's `TextFieldState` during paint; see `submitFocused`.
     on_submit: ?Callback = null,
     disabled: bool = false,
-    overlay: ?OverlayMod = null,
+    /// Overlays presented from this view (sheets/alerts/popovers). A slice so a
+    /// view can stack more than one — chaining `.sheet(...).alert(...)` appends
+    /// rather than overwriting.
+    overlay: []const OverlayMod = &.{},
     /// Overrides the auto-derived accessibility label for this view.
     a11y_label: ?[]const u8 = null,
     /// Hides this view (and its subtree) from the accessibility tree.
@@ -185,7 +251,9 @@ pub const StackData = struct {
     alignment: Alignment,
     children: []const View,
 };
-pub const ButtonRole = enum { normal, destructive, plain };
+/// The semantic appearance of a button. Defined by the theme layer (so painters
+/// can switch on it) and re-exported here for view-side call sites.
+pub const ButtonRole = theme_mod.Role;
 pub const ButtonData = struct { label: []const u8, action: Callback, role: ButtonRole = .normal };
 
 pub const ToggleData = struct { value: Binding(bool), label: []const u8 = "" };
@@ -194,318 +262,22 @@ pub const StepperData = struct { value: Binding(i64), label: []const u8 = "", mi
 pub const ProgressData = struct { value: f32 = 0, label: []const u8 = "" };
 pub const ImageData = struct { image: canvas_mod.Image };
 pub const LabelData = struct { title: []const u8, symbol_color: Color };
+/// A glyph from the bundled icon font, tinted `color` (null = inherit the
+/// environment's foreground) and laid out as a `size`×`size` square.
+pub const IconData = struct { icon: icons.Icon, size: f32, color: ?Color = null };
+/// A tappable icon: the glyph centered in a square control with a tap callback.
+pub const IconButtonData = struct { icon: icons.Icon, size: f32, action: Callback };
 pub const ScrollData = struct { axis: engine.Direction, offset: f32, content: *const View };
 
-/// Editable text buffer + caret for a `TextField` or `TextEditor`. Owned by the
-/// app (like a `State`), so editing survives across frames. Key events call its
-/// methods. Beyond a caret it tracks an optional selection (`sel_anchor`) and,
-/// for multi-line editors, the machinery for vertical motion and caret-follow
-/// scrolling.
-pub const TextFieldState = struct {
-    buffer: std.ArrayList(u8) = .empty,
-    caret: usize = 0, // byte index
-    /// Selection anchor (byte index). When non-null and different from `caret`,
-    /// the selection is the ordered range [min, max]. A plain (un-shifted) move
-    /// or any edit collapses it (back to `null`).
-    sel_anchor: ?usize = null,
-    focused: bool = false,
-    /// True for a `TextEditor` (multi-line). The event loop then inserts a
-    /// newline on Enter (instead of submitting) and routes Up/Down/Home/End/Tab.
-    /// Set by `paintTextEditor` each frame.
-    multiline: bool = false,
-    /// Preferred column (codepoints from the line start) for vertical motion, so
-    /// a run of Up/Down keeps the original column across shorter lines. Reset by
-    /// any horizontal move or edit.
-    pref_col: ?usize = null,
-    /// The caret seen at the previous paint. `TextEditor` auto-scrolls to follow
-    /// the caret only when it actually moved, so the wheel can scroll freely
-    /// otherwise.
-    last_caret: usize = 0,
-    /// Bumped on every mutation so an app can cheaply detect "modified since
-    /// saved" without diffing the buffer (see `examples/edit`).
-    revision: u64 = 0,
-    /// The `.onSubmit` callback for this field, refreshed during paint while the
-    /// field is focused so `submitFocused()` (called from the event loop on
-    /// Enter) can fire it without the view tree. See `paintTextField`.
-    on_submit: ?Callback = null,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator) TextFieldState {
-        return .{ .allocator = allocator };
-    }
-    pub fn deinit(self: *TextFieldState) void {
-        self.buffer.deinit(self.allocator);
-    }
-    pub fn text(self: *const TextFieldState) []const u8 {
-        return self.buffer.items;
-    }
-    pub fn setText(self: *TextFieldState, s: []const u8) !void {
-        self.buffer.clearRetainingCapacity();
-        try self.buffer.appendSlice(self.allocator, s);
-        self.caret = self.buffer.items.len;
-        self.sel_anchor = null;
-        self.pref_col = null;
-        self.last_caret = self.caret;
-        self.revision +%= 1;
-    }
-
-    // --- selection ---------------------------------------------------------
-
-    /// The current selection as an ordered byte range, or null when the caret is
-    /// a plain insertion point (no anchor, or an empty selection).
-    pub fn selectionRange(self: *const TextFieldState) ?struct { start: usize, end: usize } {
-        const a = self.sel_anchor orelse return null;
-        if (a == self.caret) return null;
-        return .{ .start = @min(a, self.caret), .end = @max(a, self.caret) };
-    }
-    pub fn hasSelection(self: *const TextFieldState) bool {
-        return self.selectionRange() != null;
-    }
-    pub fn selectAll(self: *TextFieldState) void {
-        if (self.buffer.items.len == 0) {
-            self.sel_anchor = null;
-            return;
-        }
-        self.sel_anchor = 0;
-        self.caret = self.buffer.items.len;
-        self.pref_col = null;
-    }
-    /// Delete the selected range, if any. Returns true if something was removed.
-    pub fn deleteSelection(self: *TextFieldState) bool {
-        const r = self.selectionRange() orelse {
-            self.sel_anchor = null;
-            return false;
-        };
-        const n = r.end - r.start;
-        std.mem.copyForwards(u8, self.buffer.items[r.start..], self.buffer.items[r.end..]);
-        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - n);
-        self.caret = r.start;
-        self.sel_anchor = null;
-        self.pref_col = null;
-        self.revision +%= 1;
-        return true;
-    }
-
-    // --- editing -----------------------------------------------------------
-
-    pub fn insert(self: *TextFieldState, s: []const u8) !void {
-        _ = self.deleteSelection();
-        try self.buffer.insertSlice(self.allocator, self.caret, s);
-        self.caret += s.len;
-        self.sel_anchor = null;
-        self.pref_col = null;
-        self.revision +%= 1;
-    }
-    pub fn backspace(self: *TextFieldState) void {
-        if (self.deleteSelection()) return;
-        if (self.caret == 0) return;
-        const start = prevCpStart(self.buffer.items, self.caret);
-        const n = self.caret - start;
-        std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[self.caret..]);
-        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - n);
-        self.caret = start;
-        self.pref_col = null;
-        self.revision +%= 1;
-    }
-    /// Forward-delete (the Delete key): remove the codepoint after the caret.
-    pub fn deleteForward(self: *TextFieldState) void {
-        if (self.deleteSelection()) return;
-        const items = self.buffer.items;
-        if (self.caret >= items.len) return;
-        const len = std.unicode.utf8ByteSequenceLength(items[self.caret]) catch 1;
-        const stop = @min(self.caret + len, items.len);
-        std.mem.copyForwards(u8, self.buffer.items[self.caret..], self.buffer.items[stop..]);
-        self.buffer.shrinkRetainingCapacity(items.len - (stop - self.caret));
-        self.pref_col = null;
-        self.revision +%= 1;
-    }
-
-    // --- caret movement (extend = Shift held, growing the selection) -------
-
-    fn beginExtend(self: *TextFieldState, extend: bool) void {
-        if (extend) {
-            if (self.sel_anchor == null) self.sel_anchor = self.caret;
-        } else self.sel_anchor = null;
-    }
-    pub fn moveLeft(self: *TextFieldState, extend: bool) void {
-        self.pref_col = null;
-        if (!extend) {
-            if (self.selectionRange()) |r| {
-                self.caret = r.start;
-                self.sel_anchor = null;
-                return;
-            }
-        }
-        self.beginExtend(extend);
-        if (self.caret > 0) self.caret = prevCpStart(self.buffer.items, self.caret);
-    }
-    pub fn moveRight(self: *TextFieldState, extend: bool) void {
-        self.pref_col = null;
-        if (!extend) {
-            if (self.selectionRange()) |r| {
-                self.caret = r.end;
-                self.sel_anchor = null;
-                return;
-            }
-        }
-        self.beginExtend(extend);
-        const items = self.buffer.items;
-        if (self.caret < items.len) {
-            const len = std.unicode.utf8ByteSequenceLength(items[self.caret]) catch 1;
-            self.caret = @min(self.caret + len, items.len);
-        }
-    }
-    pub fn home(self: *TextFieldState, extend: bool) void {
-        self.beginExtend(extend);
-        self.caret = lineStartIndex(self.buffer.items, self.caret);
-        self.pref_col = null;
-    }
-    pub fn end(self: *TextFieldState, extend: bool) void {
-        self.beginExtend(extend);
-        self.caret = lineEndIndex(self.buffer.items, self.caret);
-        self.pref_col = null;
-    }
-    pub fn moveUp(self: *TextFieldState, extend: bool) void {
-        self.beginExtend(extend);
-        const b = self.buffer.items;
-        const ls = lineStartIndex(b, self.caret);
-        if (self.pref_col == null) self.pref_col = columnOf(b, self.caret);
-        if (ls == 0) {
-            self.caret = 0; // already on the first line
-            return;
-        }
-        const prev_end = ls - 1; // the '\n' that ends the previous line
-        const prev_start = lineStartIndex(b, prev_end);
-        self.caret = indexForColumn(b, prev_start, prev_end, self.pref_col.?);
-    }
-    pub fn moveDown(self: *TextFieldState, extend: bool) void {
-        self.beginExtend(extend);
-        const b = self.buffer.items;
-        const le = lineEndIndex(b, self.caret);
-        if (self.pref_col == null) self.pref_col = columnOf(b, self.caret);
-        if (le >= b.len) {
-            self.caret = b.len; // already on the last line
-            return;
-        }
-        const next_start = le + 1;
-        const next_end = lineEndIndex(b, next_start);
-        self.caret = indexForColumn(b, next_start, next_end, self.pref_col.?);
-    }
-    /// The caret's 1-based line and column (counting codepoints), for a status bar.
-    pub fn lineCol(self: *const TextFieldState) struct { line: usize, col: usize } {
-        return .{
-            .line = lineIndexOf(self.buffer.items, self.caret) + 1,
-            .col = columnOf(self.buffer.items, self.caret) + 1,
-        };
-    }
-};
-
-fn prevCpStart(bytes: []const u8, i: usize) usize {
-    var j = i;
-    if (j == 0) return 0;
-    j -= 1;
-    while (j > 0 and (bytes[j] & 0xC0) == 0x80) j -= 1; // skip UTF-8 continuation bytes
-    return j;
-}
-
-// --- pure line/column geometry over a UTF-8 byte buffer --------------------
-// Lines are separated by '\n'; a column counts codepoints from the line start.
-// Shared by `TextFieldState` movement and `paintTextEditor`.
-
-fn lineStartIndex(bytes: []const u8, i: usize) usize {
-    var j = @min(i, bytes.len);
-    while (j > 0 and bytes[j - 1] != '\n') j -= 1;
-    return j;
-}
-fn lineEndIndex(bytes: []const u8, i: usize) usize {
-    var j = @min(i, bytes.len);
-    while (j < bytes.len and bytes[j] != '\n') j += 1;
-    return j;
-}
-fn columnOf(bytes: []const u8, i: usize) usize {
-    const lim = @min(i, bytes.len);
-    var col: usize = 0;
-    var j = lineStartIndex(bytes, lim);
-    while (j < lim) : (j += 1) {
-        if ((bytes[j] & 0xC0) != 0x80) col += 1; // count non-continuation bytes
-    }
-    return col;
-}
-fn lineIndexOf(bytes: []const u8, i: usize) usize {
-    const lim = @min(i, bytes.len);
-    var n: usize = 0;
-    for (bytes[0..lim]) |b| {
-        if (b == '\n') n += 1;
-    }
-    return n;
-}
-fn countLines(bytes: []const u8) usize {
-    var n: usize = 1;
-    for (bytes) |b| {
-        if (b == '\n') n += 1;
-    }
-    return n;
-}
-/// The byte index `col` codepoints into the line spanning [line_start, line_end].
-fn indexForColumn(bytes: []const u8, line_start: usize, line_end: usize, col: usize) usize {
-    var j = line_start;
-    var c: usize = 0;
-    while (j < line_end and c < col) {
-        j += std.unicode.utf8ByteSequenceLength(bytes[j]) catch 1;
-        c += 1;
-    }
-    return @min(j, line_end);
-}
-/// The byte range [start, end) of the `n`-th line (0-based), clamped to the last.
-fn nthLineRange(bytes: []const u8, n: usize) struct { start: usize, end: usize } {
-    var start: usize = 0;
-    var seen: usize = 0;
-    var j: usize = 0;
-    while (j < bytes.len) : (j += 1) {
-        if (bytes[j] == '\n') {
-            if (seen == n) return .{ .start = start, .end = j };
-            seen += 1;
-            start = j + 1;
-        }
-    }
-    return .{ .start = start, .end = bytes.len };
-}
-/// Editor tab width, in spaces (tabs snap to the next multiple of this).
-const editor_tab_size: f32 = 4;
-
-/// The advance of a single space and a tab stop at `px`, used to lay out the
-/// editor's monospace-ish tab handling.
-fn editorTabMetrics(face: *const ttf.Font, px: f32) struct { space: f32, tab: f32 } {
-    const space = shape.measureLineWidth(face, " ", px);
-    return .{ .space = space, .tab = space * editor_tab_size };
-}
-
-/// Pixel width of `slice`, honoring tab stops (so `\t` advances to the next
-/// multiple of the tab width rather than drawing a `.notdef` box). Shared by the
-/// caret, selection, and click math so they all agree.
-fn editorPrefixWidth(face: *const ttf.Font, px: f32, slice: []const u8) f32 {
-    const sc = face.scaleForPixelSize(px);
-    const tab_w = editorTabMetrics(face, px).tab;
-    var x: f32 = 0;
-    var i: usize = 0;
-    while (i < slice.len) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(slice[i]) catch 1;
-        const e = @min(i + cp_len, slice.len);
-        if (slice[i] == '\t') {
-            x = (@floor(x / tab_w) + 1) * tab_w;
-        } else {
-            const cp = std.unicode.utf8Decode(slice[i..e]) catch slice[i];
-            x += @as(f32, @floatFromInt(face.advanceWidth(face.glyphIndex(cp)))) * sc;
-        }
-        i = e;
-    }
-    return x;
-}
+// TextFieldState + the pure UTF-8 line/column geometry and tab-aware
+// metrics moved to `components/text_buffer.zig` (re-exported as
+// `view.TextFieldState`). `drawEditorLine` below stays here because it
+// needs the render context.
 
 /// Draw a single editor line, rendering tabs as gaps to the next tab stop
 /// (drawing text between tabs run-by-run) so caret/selection x's line up with it.
 fn drawEditorLine(ctx: *const Context, canvas: *Canvas, line: []const u8, px: f32, color: Color, origin: Point) void {
-    const tab_w = editorTabMetrics(ctx.cache.face, px).tab;
+    const tab_w = text_buffer.editorTabMetrics(ctx.cache.face, px).tab;
     var x: f32 = 0;
     var seg_start: usize = 0;
     for (line, 0..) |ch, i| {
@@ -522,60 +294,6 @@ fn drawEditorLine(ctx: *const Context, canvas: *Canvas, line: []const u8, px: f3
     if (tail.len > 0) drawTextC(ctx, canvas, tail, px, color, .{ .x = origin.x + x, .y = origin.y }) catch {};
 }
 
-/// The byte offset within `line` whose glyph boundary is nearest to pixel
-/// `target_x` (measured from the line's left edge). Tab-aware; used for click-
-/// to-position.
-fn caretInLine(face: *const ttf.Font, px: f32, line: []const u8, target_x: f32) usize {
-    if (target_x <= 0) return 0;
-    const sc = face.scaleForPixelSize(px);
-    const tab_w = editorTabMetrics(face, px).tab;
-    var x: f32 = 0;
-    var i: usize = 0;
-    while (i < line.len) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        const e = @min(i + cp_len, line.len);
-        const adv = if (line[i] == '\t')
-            (@floor(x / tab_w) + 1) * tab_w - x
-        else
-            @as(f32, @floatFromInt(face.advanceWidth(face.glyphIndex(std.unicode.utf8Decode(line[i..e]) catch line[i])))) * sc;
-        if (target_x < x + adv / 2) return i; // nearer this cell's left edge
-        x += adv;
-        i = e;
-    }
-    return line.len;
-}
-
-/// A navigation route stack for `NavigationStack`-style flows. Owned by the app
-/// (like `TextFieldState`), so it survives across frames; the per-frame body
-/// switches on `top()` to choose the screen. Routes are opaque integer tokens
-/// the app interprets. Because the tree is rebuilt every frame, "navigation" is
-/// just mutating this stack.
-pub const NavState = struct {
-    stack: std.ArrayList(i64) = .empty,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator) NavState {
-        return .{ .allocator = allocator };
-    }
-    pub fn deinit(self: *NavState) void {
-        self.stack.deinit(self.allocator);
-    }
-    pub fn push(self: *NavState, route: i64) void {
-        self.stack.append(self.allocator, route) catch {};
-    }
-    pub fn pop(self: *NavState) void {
-        if (self.stack.items.len > 0) _ = self.stack.pop();
-    }
-    /// The current (top-most) route, or null when at the root.
-    pub fn top(self: *const NavState) ?i64 {
-        const n = self.stack.items.len;
-        return if (n == 0) null else self.stack.items[n - 1];
-    }
-    pub fn depth(self: *const NavState) usize {
-        return self.stack.items.len;
-    }
-};
-
 /// Scroll position for a `ScrollViewState`, owned by the app (like
 /// `TextFieldState`) so it survives across frames and can be driven by the event
 /// loop (mouse wheel) and by code (auto-follow). `content_h`/`viewport_h` are
@@ -585,6 +303,10 @@ pub const ScrollState = struct {
     offset: f32 = 0,
     content_h: f32 = 0,
     viewport_h: f32 = 0,
+    /// Wall-clock time (ms, in the app's `setFrameTime` clock) of the most recent
+    /// scroll. The overlay scrollbar shows only briefly after this, then fades out
+    /// (see `paintScrollbar`). 0 means "never scrolled" → no bar.
+    last_active_ms: u64 = 0,
 
     /// The furthest the content can be scrolled (0 when it fits the viewport).
     pub fn maxOffset(self: *const ScrollState) f32 {
@@ -635,6 +357,8 @@ pub const Kind = union(enum) {
     stepper: StepperData,
     progress: ProgressData,
     image: ImageData,
+    icon: IconData,
+    icon_button: IconButtonData,
     label: LabelData,
     scroll: ScrollData,
     /// A vertical scroll view whose offset lives in an app-owned `ScrollState`
@@ -754,6 +478,13 @@ pub const View = struct {
         v.mods.on_tap = cb;
         return v;
     }
+    /// Paint `color` behind this view only while the cursor hovers it (honoring
+    /// the view's `corner_radius`). Pair with `onTap` for menu/list rows.
+    pub fn hoverFill(self: View, color: Color) View {
+        var v = self;
+        v.mods.hover_fill = color;
+        return v;
+    }
     /// Fire `cb` when this (focused) `TextField` is submitted with Enter.
     pub fn onSubmit(self: View, cb: Callback) View {
         var v = self;
@@ -780,8 +511,14 @@ pub const View = struct {
     fn withOverlay(self: View, presented: Binding(bool), content: View, style: OverlayStyle) View {
         const boxed = buildAlloc().create(View) catch @panic("oom");
         boxed.* = content;
+        // Append to any overlays already attached so `.sheet(...).alert(...)` keeps
+        // both rather than the second clobbering the first.
+        const old = self.mods.overlay;
+        const list = buildAlloc().alloc(OverlayMod, old.len + 1) catch @panic("oom");
+        @memcpy(list[0..old.len], old);
+        list[old.len] = .{ .presented = presented, .content = boxed, .style = style };
         var v = self;
-        v.mods.overlay = .{ .presented = presented, .content = boxed, .style = style };
+        v.mods.overlay = list;
         return v;
     }
     /// Override the accessibility label exposed for this view.
@@ -802,6 +539,15 @@ pub const View = struct {
         if (v.kind == .stack) v.kind.stack.spacing = s;
         return v;
     }
+
+    /// Override a stack's cross-axis alignment (default `.center`). For a
+    /// `VStack` this controls horizontal alignment of its children, e.g.
+    /// `.leading` to left-align them.
+    pub fn alignment(self: View, a: Alignment) View {
+        var v = self;
+        if (v.kind == .stack) v.kind.stack.alignment = a;
+        return v;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -809,6 +555,32 @@ pub const View = struct {
 // ---------------------------------------------------------------------------
 
 threadlocal var current_arena: ?Allocator = null;
+
+/// The handful of theme colors that *composed* (theme-less) constructors need at
+/// build time — chiefly selection tints for `Sidebar`/`Table`/`RadioGroup`.
+/// Constructors have no `Context`, so the app publishes these once per frame via
+/// `setThemeTokens`. The defaults match the macOS light theme, so headless tests
+/// and un-wired callers render correctly without any setup.
+pub const BuildTokens = struct {
+    accent: Color = Color.fromRgb8(0, 122, 255),
+    on_accent: Color = Color.white,
+    /// Subtle fill behind a hovered row.
+    hover: Color = Color.black.withAlpha(0.06),
+    /// Alternating-row stripe in tables.
+    row_stripe: Color = Color.black.withAlpha(0.03),
+};
+threadlocal var build_tokens: BuildTokens = .{};
+
+/// Publish the active theme's build-time tokens for composed constructors. Call
+/// once per frame (the app does this in its build step) before building views.
+pub fn setThemeTokens(t: Theme) void {
+    build_tokens = .{
+        .accent = t.colors.accent,
+        .on_accent = t.colors.on_accent,
+        .hover = t.colors.hover,
+        .row_stripe = if (t.scheme == .dark) Color.white.withAlpha(0.04) else Color.black.withAlpha(0.03),
+    };
+}
 
 /// Set the arena used by view constructors for the duration of building a view
 /// tree. The framework calls this each frame; tests call it directly.
@@ -818,8 +590,15 @@ pub fn beginBuild(arena: Allocator) void {
 pub fn endBuild() void {
     current_arena = null;
 }
-fn buildAlloc() Allocator {
+/// The per-frame build arena. Public so component modules in `components/` can
+/// allocate the slices/children their constructors own.
+pub fn buildAlloc() Allocator {
     return current_arena orelse @panic("zigui: view constructed outside beginBuild()/endBuild()");
+}
+
+/// The active build-time theme tokens, for composed (theme-less) constructors.
+pub fn buildTokens() BuildTokens {
+    return build_tokens;
 }
 
 pub fn Text(s: []const u8) View {
@@ -882,6 +661,18 @@ pub fn ProgressView(value: f32) View {
 pub fn Image(image: canvas_mod.Image) View {
     return .{ .kind = .{ .image = .{ .image = image } } };
 }
+/// A glyph from the bundled icon set, laid out as a `size`×`size` square and
+/// tinted `color` (pass `null` to inherit the surrounding `.foreground`). Call
+/// sites lean on enum-literal inference: `Icon(.heart, 18, null)`.
+pub fn Icon(icon: icons.Icon, size: f32, color: ?Color) View {
+    return .{ .kind = .{ .icon = .{ .icon = icon, .size = size, .color = color } } };
+}
+/// A tappable icon (toolbar/affordance style): the glyph centered in a square
+/// control with a tap callback. The icon inherits the environment foreground;
+/// compose `.foreground`/`.padding`/`.background` for styling.
+pub fn IconButton(icon: icons.Icon, size: f32, on_tap: Callback) View {
+    return .{ .kind = .{ .icon_button = .{ .icon = icon, .size = size, .action = on_tap } } };
+}
 /// A title with a small leading symbol swatch (placeholder for an icon set).
 pub fn Label(title: []const u8, symbol_color: Color) View {
     return .{ .kind = .{ .label = .{ .title = title, .symbol_color = symbol_color } } };
@@ -934,147 +725,9 @@ pub fn ScrollViewState(scroll_state: *ScrollState, content: View) View {
     return .{ .kind = .{ .scroll_state = .{ .state = scroll_state, .content = child } } };
 }
 
-/// A SwiftUI-style List: a scrolling vertical container with hairline dividers
-/// between rows and grouped-background styling.
-pub fn List(rows: anytype) View {
-    const views = toViews(rows);
-    const flat = flattenGroups(views);
-    // interleave dividers
-    var with_dividers = buildAlloc().alloc(View, if (flat.len == 0) 0 else flat.len * 2 - 1) catch @panic("oom");
-    var i: usize = 0;
-    for (flat, 0..) |row, idx| {
-        with_dividers[i] = row.paddingInsets(.{ .top = 6, .leading = 12, .bottom = 6, .trailing = 12 }).frameMaxWidth();
-        i += 1;
-        if (idx + 1 < flat.len) {
-            with_dividers[i] = Divider();
-            i += 1;
-        }
-    }
-    const stack = makeStackFromSlice(.vertical, 0, .leading, with_dividers);
-    return ScrollView(stack);
-}
+// List, LazyVGrid/LazyHGrid, TabView, Sidebar/RadioGroup/Table moved to
+// `components/{list,grid,tabs,collections}.zig` (re-exported via the facade).
 
-/// A grid that grows vertically: `items` are mapped to cells via `mapFn` and
-/// laid out left-to-right, top-to-bottom into `columns` even columns. Built by
-/// composition — a `VStack` of `HStack` rows — so it needs no new layout
-/// primitive. Each cell is `.frameMaxWidth()` so columns share width evenly;
-/// the trailing slots of a short final row are filled with invisible cells so
-/// every column stays aligned. `spacing` applies between both rows and columns.
-pub fn LazyVGrid(columns: usize, spc: f32, items: anytype, comptime mapFn: anytype) View {
-    const cols = if (columns == 0) 1 else columns;
-    const n = items.len;
-    const rows = if (n == 0) 0 else (n + cols - 1) / cols; // ceil(n/cols)
-    const row_views = buildAlloc().alloc(View, rows) catch @panic("oom");
-    var r: usize = 0;
-    while (r < rows) : (r += 1) {
-        const cells = buildAlloc().alloc(View, cols) catch @panic("oom");
-        var ci: usize = 0;
-        while (ci < cols) : (ci += 1) {
-            const idx = r * cols + ci;
-            cells[ci] = if (idx < n) mapFn(items[idx]).frameMaxWidth() else Empty().frameMaxWidth();
-        }
-        row_views[r] = makeStackFromSlice(.horizontal, spc, .center, cells);
-    }
-    return makeStackFromSlice(.vertical, spc, .center, row_views);
-}
-
-/// A grid that grows horizontally: the transpose of `LazyVGrid`. `items` fill
-/// `rows` even rows top-to-bottom, then wrap to the next column. Built as an
-/// `HStack` of `VStack` columns; each cell is `.frameMaxHeight()`.
-pub fn LazyHGrid(rows: usize, spc: f32, items: anytype, comptime mapFn: anytype) View {
-    const rws = if (rows == 0) 1 else rows;
-    const n = items.len;
-    const cols = if (n == 0) 0 else (n + rws - 1) / rws; // ceil(n/rows)
-    const col_views = buildAlloc().alloc(View, cols) catch @panic("oom");
-    var col: usize = 0;
-    while (col < cols) : (col += 1) {
-        const cells = buildAlloc().alloc(View, rws) catch @panic("oom");
-        var ri: usize = 0;
-        while (ri < rws) : (ri += 1) {
-            const idx = col * rws + ri;
-            cells[ri] = if (idx < n) mapFn(items[idx]).frameMaxHeight() else Empty().frameMaxHeight();
-        }
-        col_views[col] = makeStackFromSlice(.vertical, spc, .center, cells);
-    }
-    return makeStackFromSlice(.horizontal, spc, .center, col_views);
-}
-
-/// One page of a `TabView`: a title for its tab-bar segment plus the content
-/// shown when that tab is selected.
-pub const Tab = struct { label: []const u8, content: View };
-
-/// A tabbed container: shows the content of the selected tab above a segmented
-/// tab bar. Built by composition — the bar is a `Picker` over the tab labels, so
-/// tapping a segment drives the same `.select` interaction as `Picker` (and the
-/// `selection` binding is what the body switches on). Rebuilt each frame, so
-/// "switching tabs" is just the binding changing.
-pub fn TabView(selection: Binding(i64), tabs: []const Tab) View {
-    const n = tabs.len;
-    if (n == 0) return Empty();
-    const hi: i64 = @intCast(n - 1);
-    const sel: usize = @intCast(std.math.clamp(selection.get(), 0, hi));
-    const labels = buildAlloc().alloc([]const u8, n) catch @panic("oom");
-    for (tabs, 0..) |tab, i| labels[i] = tab.label;
-    const bar = Picker(selection, labels).frameMaxWidth();
-    return VStack(.{ tabs[sel].content.frameMaxWidth(), Divider(), bar });
-}
-
-/// A two-column master/detail layout: a fixed-width `sidebar` pane (filled with
-/// `sidebar_fill` so it stays themable), a vertical hairline, and a `detail`
-/// pane that fills the remaining width. Pure composition over `HStack`.
-pub fn NavigationSplitView(sidebar: View, detail: View, sidebar_fill: Color) View {
-    return makeStack(.horizontal, 0, .center, .{
-        sidebar.frameWidth(220).frameMaxHeight().background(sidebar_fill),
-        VDivider(),
-        detail.frameMaxWidth().frameMaxHeight(),
-    });
-}
-
-/// Closure context for a `NavigationLink` tap: a (NavState, route) pair bound at
-/// build time. Allocated in the per-frame build arena, which outlives the frame
-/// until the next rebuild, so the hit region's callback can safely read it.
-const NavPushCtx = struct { nav: *NavState, route: i64 };
-
-fn navPushThunk(p: ?*anyopaque) void {
-    const ctx: *NavPushCtx = @ptrCast(@alignCast(p.?));
-    ctx.nav.push(ctx.route);
-}
-
-/// A button that, when tapped, pushes `route` onto `nav`'s route stack. Reuses
-/// the plain `.callback` hit action (no new interaction kind needed).
-pub fn NavigationLink(label: []const u8, route: i64, nav: *NavState) View {
-    const ctx = buildAlloc().create(NavPushCtx) catch @panic("oom");
-    ctx.* = .{ .nav = nav, .route = route };
-    return Button(label, .{ .ctx = ctx, .func = navPushThunk });
-}
-
-/// A button that pops the top route off `nav` (the navigation "back" button).
-/// Render it in the screen's top bar when `nav.depth() > 0`.
-pub fn NavBackButton(label: []const u8, nav: *NavState) View {
-    return ButtonRoled(label, .plain, actionCtx(NavState, nav, NavState.pop));
-}
-
-fn toggleBoolState(s: *state.State(bool)) void {
-    s.set(!s.get());
-}
-
-/// A button that toggles a popover menu of `items` (a tuple or `[]const View`).
-/// `open` is app-owned `State(bool)` tracking whether the menu is shown; tapping
-/// the button toggles it, tapping the scrim dismisses it.
-pub fn Menu(label: []const u8, open: *state.State(bool), items: anytype) View {
-    const content = VStack(items).padding(6);
-    return Button(label, actionCtx(state.State(bool), open, toggleBoolState))
-        .popover(open.binding(), content);
-}
-
-/// Attach a popover menu of `items` to an arbitrary `trigger` view: tapping the
-/// trigger toggles the menu. The right-click/long-press analogue of `Menu`.
-pub fn ContextMenu(trigger: View, open: *state.State(bool), items: anytype) View {
-    const content = VStack(items).padding(6);
-    return trigger
-        .onTap(actionCtx(state.State(bool), open, toggleBoolState))
-        .popover(open.binding(), content);
-}
 
 pub fn VStack(children: anytype) View {
     return makeStack(.vertical, 8, .center, children);
@@ -1086,11 +739,13 @@ pub fn ZStack(children: anytype) View {
     return makeStack(.depth, 0, .center, children);
 }
 
-fn makeStack(direction: engine.Direction, spc: f32, alignment: Alignment, children: anytype) View {
+pub fn makeStack(direction: engine.Direction, spc: f32, alignment: Alignment, children: anytype) View {
     return makeStackFromSlice(direction, spc, alignment, toViews(children));
 }
 
-fn makeStackFromSlice(direction: engine.Direction, spc: f32, alignment: Alignment, views: []const View) View {
+/// Build a stack `View` from an already-allocated slice of children. Public so
+/// composite components in `components/` can assemble rows/columns.
+pub fn makeStackFromSlice(direction: engine.Direction, spc: f32, alignment: Alignment, views: []const View) View {
     return .{ .kind = .{ .stack = .{
         .direction = direction,
         .spacing = spc,
@@ -1112,7 +767,9 @@ pub fn fmt(comptime f: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(buildAlloc(), f, args) catch @panic("oom");
 }
 
-fn toViews(children: anytype) []View {
+/// Normalize a tuple literal or `[]const View` into an owned `[]View` in the
+/// build arena. Public for composite components that accept variadic children.
+pub fn toViews(children: anytype) []View {
     const T = @TypeOf(children);
     // Accept either a tuple literal `.{a, b}` or a slice `[]const View`.
     if (T == []const View or T == []View) {
@@ -1126,7 +783,9 @@ fn toViews(children: anytype) []View {
     return out;
 }
 
-fn flattenGroups(views: []const View) []const View {
+/// Splice any `.group` children (from `ForEach`) into a flat child list.
+/// Public so composite containers (e.g. `List`) can flatten before laying out.
+pub fn flattenGroups(views: []const View) []const View {
     var total: usize = 0;
     for (views) |v| total += if (v.kind == .group) v.kind.group.len else 1;
     if (total == views.len) return views; // nothing to flatten
@@ -1185,12 +844,12 @@ pub const TextClick = struct {
 /// the document (a point above/below/left maps to the nearest edge).
 fn caretIndexAt(tc: TextClick, p: Point) usize {
     const txt = tc.state.text();
-    const total = countLines(txt);
+    const total = text_buffer.countLines(txt);
     const rel_y = p.y - tc.origin.y + tc.scroll_y;
     var li: usize = if (rel_y <= 0) 0 else @intFromFloat(rel_y / tc.line_height);
     if (li >= total) li = total - 1;
-    const r = nthLineRange(txt, li);
-    return r.start + caretInLine(tc.face, tc.px, txt[r.start..r.end], p.x - tc.origin.x);
+    const r = text_buffer.nthLineRange(txt, li);
+    return r.start + text_buffer.caretInLine(tc.face, tc.px, txt[r.start..r.end], p.x - tc.origin.x);
 }
 
 pub const HitRegion = struct { rect: Rect, action: HitAction, disabled: bool };
@@ -1256,6 +915,14 @@ pub const Context = struct {
     scroll_regions: ?*std.ArrayList(ScrollRegion) = null,
     /// Device-pixel scale used by `renderScaled` (1 = logical points == pixels).
     scale: f32 = 1,
+    /// The cursor's current location in layout points, or null when the pointer
+    /// is outside the window. Drives `Modifiers.hover_fill`. The app updates it
+    /// on mouse-motion (and the main loop already redraws per event, so hover
+    /// highlights track the cursor for free).
+    hover_point: ?Point = null,
+    /// Glyph cache for the bundled icon font (`Font.icons()`). When null, `Icon`
+    /// and `IconButton` paint nothing — wire it (app + tests) to draw icons.
+    icon_cache: ?*atlas.GlyphCache = null,
 
     pub fn init(theme: Theme, cache: *atlas.GlyphCache, arena_alloc: Allocator, hits: *std.ArrayList(HitRegion)) Context {
         return .{
@@ -1282,6 +949,20 @@ pub const Context = struct {
         ctx.overlays = overlays;
         ctx.a11y = a11y;
         return ctx;
+    }
+
+    /// Build a `theme.Surface` for the painter to draw chrome into — bundling
+    /// the canvas with the active palette/metrics/scheme and the inherited
+    /// opacity. The palette/metrics are borrowed from `self.theme`, valid for
+    /// the duration of the painter call.
+    pub fn surface(self: *const Context, canvas: *Canvas) theme_mod.Surface {
+        return .{
+            .canvas = canvas,
+            .palette = &self.theme.colors,
+            .metrics = &self.theme.metrics,
+            .scheme = self.theme.scheme,
+            .opacity = self.opacity,
+        };
     }
 };
 
@@ -1315,6 +996,8 @@ const progress_h: f32 = 6;
 const stepper_w: f32 = 68;
 const label_icon: f32 = 14;
 const label_gap: f32 = 6;
+/// Padding around the glyph in an `IconButton`, enlarging its tap target.
+const icon_button_pad: f32 = 6;
 
 fn buttonSize(ctx: *const Context, b: ButtonData) Size {
     const px = ctx.theme.typography.body.size;
@@ -1461,6 +1144,11 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             .width = @floatFromInt(im.image.width),
             .height = @floatFromInt(im.image.height),
         }) },
+        .icon => |ic| return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = ic.size, .height = ic.size }) },
+        .icon_button => |ib| {
+            const s = ib.size + 2 * icon_button_pad;
+            return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = s, .height = s }) };
+        },
         .label => |l| {
             const px = resolvedFontSize(ctx, v);
             const tw = shape.measureLineWidth(ctx.cache.face, l.title, px);
@@ -1554,6 +1242,8 @@ pub fn render(ctx: *const Context, v: View, rect: Rect, canvas: *Canvas) !void {
             try drawOverlay(ctx, req, rect, canvas);
         }
     }
+    // The text-field context menu sits above everything, including app overlays.
+    try drawContextMenu(ctx, rect, canvas);
 }
 
 /// Render `v` for a HiDPI display: lay out and paint in logical *points* (so all
@@ -1645,11 +1335,14 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
         .popover => anchoredRect(root, req.anchor, size),
     };
 
-    // 4. Panel background + hairline border, then the content on top.
+    // 4. Panel frame (theme-drawn), then the content on top, clipped to the
+    //    panel so rigid children (e.g. an unwrappable Text) can't paint past
+    //    the rounded edge.
     const radius = ctx.theme.metrics.corner_radius;
-    try canvas.fillRoundedRect(target, radius, ctx.theme.colors.control_background);
-    try canvas.strokeRoundedRect(target, radius, ctx.theme.metrics.hairline, ctx.theme.colors.separator);
+    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius);
+    try canvas.pushClip(target, radius);
     try renderInto(ctx, req.content, target, canvas);
+    try canvas.popClip();
 }
 
 fn centerRect(root: Rect, size: Size) Rect {
@@ -1693,7 +1386,18 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     const op = child_ctx.opacity;
 
     // Background fill (behind content, spanning the padded frame).
-    if (v.mods.background) |fill| try paintFill(canvas, outer, v.mods.corner_radius, fill, op);
+    if (v.mods.background) |fill| try paintFill(canvas, outer, v.mods.corner_radius, fill, op, &child_ctx.theme.colors);
+
+    // Hover highlight: painted over the background while the cursor is inside
+    // this view (and it isn't disabled). Cheap point-in-rect test per frame.
+    if (v.mods.hover_fill) |hc| {
+        if (!child_ctx.disabled) {
+            if (ctx.hover_point) |hp| {
+                if (outer.contains(hp))
+                    try paintFill(canvas, outer, v.mods.corner_radius, .{ .color = hc }, op, &child_ctx.theme.colors);
+            }
+        }
+    }
 
     // Descend through the layout wrappers introduced by padding/frame.
     var clr = lr;
@@ -1711,10 +1415,11 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     }
 
     // A presented overlay is not drawn inline — it is enqueued for the drain
-    // pass in `render`, anchored to this view's frame.
-    if (v.mods.overlay) |ov| {
-        if (ov.presented.get()) {
-            if (ctx.overlays) |overlays| {
+    // pass in `render`, anchored to this view's frame. A view can carry several
+    // (e.g. both `.sheet` and `.alert`); each is enqueued when its binding is on.
+    if (ctx.overlays) |overlays| {
+        for (v.mods.overlay) |ov| {
+            if (ov.presented.get()) {
                 try overlays.append(ctx.arena, .{
                     .content = ov.content.*,
                     .style = ov.style,
@@ -1754,7 +1459,7 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
             paintWrappedText(ctx, v, wt, rect, canvas) catch {};
             try emitA11y(ctx, v, rect, .static_text, wt.string, "");
         },
-        .shape => |sh| try paintShape(canvas, sh, rect, op),
+        .shape => |sh| try paintShape(ctx, sh, rect, op, canvas),
         .button => |b| {
             try paintButton(ctx, b, rect, canvas);
             try emitA11y(ctx, v, rect, .button, b.label, "");
@@ -1773,6 +1478,14 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
         .image => |im| {
             try canvas.drawImage(rect, im.image);
             try emitA11y(ctx, v, rect, .image, "", "");
+        },
+        .icon => |ic| {
+            try paintIcon(ctx, ic, rect, canvas);
+            try emitA11y(ctx, v, rect, .image, "", "");
+        },
+        .icon_button => |ib| {
+            try paintIconButton(ctx, ib, rect, canvas);
+            try emitA11y(ctx, v, rect, .button, "", "");
         },
         .label => |l| {
             try paintLabel(ctx, l, v, rect, canvas);
@@ -1804,7 +1517,7 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
     }
 }
 
-fn paintFill(canvas: *Canvas, rect: Rect, radius: f32, fill: Fill, op: f32) !void {
+fn paintFill(canvas: *Canvas, rect: Rect, radius: f32, fill: Fill, op: f32, palette: *const theme_mod.Palette) !void {
     switch (fill) {
         .color => |c| try canvas.fillRoundedRect(rect, radius, c.multiplyAlpha(op)),
         .linear_gradient => |g| {
@@ -1822,33 +1535,37 @@ fn paintFill(canvas: *Canvas, rect: Rect, radius: f32, fill: Fill, op: f32) !voi
         },
         .material => |m| {
             const s = m.spec();
-            try canvas.blurRect(rect, radius, s.sigma, s.tint.multiplyAlpha(op));
+            // The frost tint comes from the active theme's (scheme-correct) glass
+            // role, scaled per material level.
+            const tint = palette.glass.multiplyAlpha(s.alpha_scale);
+            try canvas.blurRect(rect, radius, s.sigma, tint.multiplyAlpha(op));
         },
     }
 }
 
-fn paintShape(canvas: *Canvas, sh: ShapeData, rect: Rect, op: f32) !void {
+fn paintShape(ctx: *const Context, sh: ShapeData, rect: Rect, op: f32, canvas: *Canvas) !void {
+    const palette = &ctx.theme.colors;
     switch (sh.shape) {
-        .rect => try paintFill(canvas, rect, 0, sh.fill, op),
-        .rounded_rect => try paintFill(canvas, rect, sh.corner_radius, sh.fill, op),
-        .capsule => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op),
-        .ellipse => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op),
+        .rect => try paintFill(canvas, rect, 0, sh.fill, op, palette),
+        .rounded_rect => try paintFill(canvas, rect, sh.corner_radius, sh.fill, op, palette),
+        .capsule => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op, palette),
+        .ellipse => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op, palette),
         .circle => {
             const r = @min(rect.width, rect.height) / 2;
             const sq = Rect{ .x = rect.midX() - r, .y = rect.midY() - r, .width = 2 * r, .height = 2 * r };
-            try paintFill(canvas, sq, r, sh.fill, op);
+            try paintFill(canvas, sq, r, sh.fill, op, palette);
         },
     }
 }
 
 fn paintButton(ctx: *const Context, b: ButtonData, rect: Rect, canvas: *Canvas) !void {
-    const m = ctx.theme.metrics;
     const dim: f32 = if (ctx.disabled) 0.4 else 1.0;
-    if (b.role != .plain) {
-        const bg = if (b.role == .destructive) ctx.theme.colors.destructive else ctx.theme.colors.accent;
-        try canvas.fillRoundedRect(rect, m.control_corner_radius, bg.multiplyAlpha(ctx.opacity * dim));
-    }
-    const label_color = if (b.role == .plain) ctx.theme.colors.accent else ctx.theme.colors.on_accent;
+    // The theme's painter draws the button chrome and tells us the label color.
+    const hovered = if (ctx.hover_point) |hp| rect.contains(hp) else false;
+    const label_color = try ctx.theme.painter.button(ctx.surface(canvas), rect, b.role, .{
+        .disabled = ctx.disabled,
+        .hovered = hovered and !ctx.disabled,
+    });
     const px = ctx.theme.typography.body.size;
     const lw = shape.measureLineWidth(ctx.cache.face, b.label, px);
     const lh = shape.lineHeight(ctx.cache.face, px);
@@ -1886,29 +1603,31 @@ fn paintToggle(ctx: *const Context, t: ToggleData, rect: Rect, canvas: *Canvas) 
     // switch on the trailing edge
     const sw = Rect{ .x = rect.maxX() - switch_w, .y = vcenter(rect, switch_h), .width = switch_w, .height = switch_h };
     const on = t.value.get();
-    const track = if (on) ctx.theme.colors.accent else ctx.theme.colors.separator.over(ctx.theme.colors.control_background);
-    try canvas.fillRoundedRect(sw, switch_h / 2, track.multiplyAlpha(op));
+    // The view layer owns the knob *geometry*; the theme draws both the track
+    // and the sliding thumb so the whole control matches the family.
+    const s = ctx.surface(canvas);
+    try ctx.theme.painter.switchTrack(s, sw, on);
     const knob_r = switch_h / 2 - 2;
     const knob_cx = if (on) sw.maxX() - knob_r - 2 else sw.x + knob_r + 2;
-    try canvas.fillCircle(.{ .x = knob_cx, .y = sw.midY() }, knob_r, Color.white.multiplyAlpha(op));
+    const knob_rect = Rect{ .x = knob_cx - knob_r, .y = sw.midY() - knob_r, .width = 2 * knob_r, .height = 2 * knob_r };
+    try ctx.theme.painter.switchKnob(s, knob_rect, on);
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .toggle = t.value }, .disabled = ctx.disabled });
 }
 
 fn paintSlider(ctx: *const Context, s: SliderData, rect: Rect, canvas: *Canvas) !void {
-    const op = ctx.opacity;
     const r = slider_knob_r;
     const track = Rect{ .x = rect.x + r, .y = rect.midY() - slider_track_h / 2, .width = rect.width - 2 * r, .height = slider_track_h };
     const denom = if (s.max - s.min == 0) 1 else s.max - s.min;
     const frac = std.math.clamp((s.value.get() - s.min) / denom, 0, 1);
-    // unfilled track
-    try canvas.fillRoundedRect(track, slider_track_h / 2, ctx.theme.colors.separator.over(ctx.theme.colors.control_background).multiplyAlpha(op));
-    // filled portion
-    const filled = Rect{ .x = track.x, .y = track.y, .width = track.width * frac, .height = track.height };
-    try canvas.fillRoundedRect(filled, slider_track_h / 2, ctx.theme.colors.accent.multiplyAlpha(op));
-    // knob
+    // The view layer owns the geometry (track + knob square); the theme draws
+    // the groove, fill, and handle in its own style.
     const knob_cx = track.x + track.width * frac;
-    try canvas.fillCircle(.{ .x = knob_cx, .y = rect.midY() }, r, Color.white.multiplyAlpha(op));
-    try canvas.strokeRoundedRect(.{ .x = knob_cx - r, .y = rect.midY() - r, .width = 2 * r, .height = 2 * r }, r, 1, ctx.theme.colors.separator.multiplyAlpha(op));
+    const knob_rect = Rect{ .x = knob_cx - r, .y = rect.midY() - r, .width = 2 * r, .height = 2 * r };
+    const hovered = if (ctx.hover_point) |hp| rect.contains(hp) else false;
+    try ctx.theme.painter.slider(ctx.surface(canvas), track, frac, knob_rect, .{
+        .disabled = ctx.disabled,
+        .hovered = hovered and !ctx.disabled,
+    });
     try ctx.hit_regions.append(ctx.arena, .{
         .rect = rect,
         .action = .{ .slider = .{ .binding = s.value, .min = s.min, .max = s.max, .track = track } },
@@ -1925,8 +1644,12 @@ fn paintStepper(ctx: *const Context, s: StepperData, rect: Rect, canvas: *Canvas
         drawTextC(ctx, canvas, s.label, px, ctx.foreground.multiplyAlpha(op), .{ .x = rect.x, .y = vcenter(rect, lh) }) catch {};
     }
     const ctrl = Rect{ .x = rect.maxX() - stepper_w, .y = rect.y, .width = stepper_w, .height = rect.height };
-    try canvas.fillRoundedRect(ctrl, m.control_corner_radius, ctx.theme.colors.control_background.multiplyAlpha(op));
-    try canvas.strokeRoundedRect(ctrl, m.control_corner_radius, m.hairline, ctx.theme.colors.separator.multiplyAlpha(op));
+    const hovered = if (ctx.hover_point) |hp| ctrl.contains(hp) else false;
+    // The theme draws the box chrome; the divider and +/- glyphs stay here.
+    try ctx.theme.painter.stepperBox(ctx.surface(canvas), ctrl, .{
+        .disabled = ctx.disabled,
+        .hovered = hovered and !ctx.disabled,
+    });
     const half = ctrl.width / 2;
     const minus = Rect{ .x = ctrl.x, .y = ctrl.y, .width = half, .height = ctrl.height };
     const plus = Rect{ .x = ctrl.x + half, .y = ctrl.y, .width = half, .height = ctrl.height };
@@ -1941,11 +1664,8 @@ fn paintStepper(ctx: *const Context, s: StepperData, rect: Rect, canvas: *Canvas
 }
 
 fn paintProgress(ctx: *const Context, pr: ProgressData, rect: Rect, canvas: *Canvas) !void {
-    const op = ctx.opacity;
     const bar = Rect{ .x = rect.x, .y = rect.midY() - progress_h / 2, .width = rect.width, .height = progress_h };
-    try canvas.fillRoundedRect(bar, progress_h / 2, ctx.theme.colors.separator.over(ctx.theme.colors.control_background).multiplyAlpha(op));
-    const filled = Rect{ .x = bar.x, .y = bar.y, .width = bar.width * std.math.clamp(pr.value, 0, 1), .height = bar.height };
-    try canvas.fillRoundedRect(filled, progress_h / 2, ctx.theme.colors.accent.multiplyAlpha(op));
+    try ctx.theme.painter.progress(ctx.surface(canvas), bar, pr.value);
 }
 
 fn paintLabel(ctx: *const Context, l: LabelData, v: View, rect: Rect, canvas: *Canvas) !void {
@@ -1955,6 +1675,22 @@ fn paintLabel(ctx: *const Context, l: LabelData, v: View, rect: Rect, canvas: *C
     try canvas.fillRoundedRect(icon, 3, l.symbol_color.multiplyAlpha(op));
     const lh = shape.lineHeight(ctx.cache.face, px);
     drawTextC(ctx, canvas, l.title, px, ctx.foreground.multiplyAlpha(op), .{ .x = rect.x + label_icon + label_gap, .y = vcenter(rect, lh) }) catch {};
+}
+
+fn paintIcon(ctx: *const Context, ic: IconData, rect: Rect, canvas: *Canvas) !void {
+    const cache = ctx.icon_cache orelse return; // no icon font wired -> draw nothing
+    const color = (ic.color orelse ctx.foreground).multiplyAlpha(ctx.opacity);
+    // The glyph is centered in its laid-out square (`rect`); `drawIcon` sizes it
+    // to the smaller side and handles the HiDPI coverage trick.
+    font_mod.drawIcon(canvas, cache, ic.icon.codepoint(), rect, ctx.scale, color) catch {};
+}
+
+fn paintIconButton(ctx: *const Context, ib: IconButtonData, rect: Rect, canvas: *Canvas) !void {
+    const dim: f32 = if (ctx.disabled) 0.4 else 1;
+    const color = ctx.foreground.multiplyAlpha(ctx.opacity * dim);
+    const box = rect.insetBy(icon_button_pad, icon_button_pad);
+    font_mod.drawIcon(canvas, ctx.icon_cache orelse return, ib.icon.codepoint(), box, ctx.scale, color) catch {};
+    try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .callback = ib.action }, .disabled = ctx.disabled });
 }
 
 /// Paint wrapped text: re-wrap to the laid-out rect width and draw each line,
@@ -1978,13 +1714,12 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     // Honor an explicit `.cornerRadius(...)` so fields can be pill-shaped; fall
     // back to the theme's control radius.
     const radius = if (v.mods.corner_radius > 0) v.mods.corner_radius else m.control_corner_radius;
-    try canvas.fillRoundedRect(rect, radius, ctx.theme.colors.control_background.multiplyAlpha(op));
     const focused = tf.state.focused;
     // Keep the focused field's submit callback current so `submitFocused` (fired
     // from the event loop on Enter) can reach it without the view tree.
     if (focused) tf.state.on_submit = v.mods.on_submit;
-    const border = if (focused) ctx.theme.colors.accent else ctx.theme.colors.separator;
-    try canvas.strokeRoundedRect(rect, radius, if (focused) 2 else m.hairline, border.multiplyAlpha(op));
+    // The theme draws the input surface (background + border).
+    try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
 
     const px = ctx.theme.typography.body.size;
     const lh = shape.lineHeight(ctx.cache.face, px);
@@ -1992,6 +1727,16 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     const pad: f32 = @max(8, @min(radius, 14));
     const ty = vcenter(rect, lh);
     const content = tf.state.text();
+
+    // Selection highlight, drawn behind the text so the glyphs stay readable.
+    if (focused) {
+        if (tf.state.selectionRange()) |s| {
+            const hx0 = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..s.start], px);
+            const hx1 = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..s.end], px);
+            try canvas.fillRect(.{ .x = hx0, .y = ty, .width = @max(1, hx1 - hx0), .height = lh }, ctx.theme.colors.selection.multiplyAlpha(op));
+        }
+    }
+
     if (content.len == 0 and tf.placeholder.len > 0) {
         drawTextC(ctx, canvas, tf.placeholder, px, ctx.theme.colors.tertiary_label.multiplyAlpha(op), .{ .x = rect.x + pad, .y = ty }) catch {};
     } else {
@@ -2002,7 +1747,21 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
         const caret_x = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..tf.state.caret], px);
         try canvas.line(.{ .x = caret_x, .y = ty + 2 }, .{ .x = caret_x, .y = ty + lh - 2 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
     }
-    try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .focus = tf.state }, .disabled = ctx.disabled });
+    // A `text_click` region (not a bare `.focus`) so a single-line field also
+    // supports click-to-place-caret, drag-selection, and double-click word
+    // selection — its one line starts at the text origin with no scroll.
+    try ctx.hit_regions.append(ctx.arena, .{
+        .rect = rect,
+        .action = .{ .text_click = .{
+            .state = tf.state,
+            .face = ctx.cache.face,
+            .px = px,
+            .origin = .{ .x = rect.x + pad, .y = ty },
+            .scroll_y = 0,
+            .line_height = lh,
+        } },
+        .disabled = ctx.disabled,
+    });
 }
 
 /// Width of the line-number gutter: enough for `nlines`' digits plus padding.
@@ -2032,12 +1791,11 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
     const focused = st.focused;
 
     const radius = if (v.mods.corner_radius > 0) v.mods.corner_radius else m.control_corner_radius;
-    try canvas.fillRoundedRect(rect, radius, ctx.theme.colors.control_background.multiplyAlpha(op));
-    const border_c = if (focused) ctx.theme.colors.accent else ctx.theme.colors.separator;
-    try canvas.strokeRoundedRect(rect, radius, if (focused) 1.5 else m.hairline, border_c.multiplyAlpha(op));
+    // The theme draws the editor surface (background + border).
+    try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
 
     const text = st.text();
-    const nlines = countLines(text);
+    const nlines = text_buffer.countLines(text);
 
     const pad: f32 = 8;
     const gutter_w: f32 = if (ed.line_numbers) gutterWidth(face, px, nlines, pad) else pad;
@@ -2048,7 +1806,7 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
     // Scroll geometry, then auto-follow the caret only when it actually moved.
     ed.scroll.content_h = @as(f32, @floatFromInt(nlines)) * lh;
     ed.scroll.viewport_h = view_h;
-    const caret_line = lineIndexOf(text, st.caret);
+    const caret_line = text_buffer.lineIndexOf(text, st.caret);
     if (st.caret != st.last_caret) {
         const cy = @as(f32, @floatFromInt(caret_line)) * lh;
         if (cy < ed.scroll.offset) {
@@ -2079,7 +1837,7 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
     var pos: usize = 0;
     while (line_no < nlines) : (line_no += 1) {
         const lstart = pos;
-        const lend = lineEndIndex(text, lstart);
+        const lend = text_buffer.lineEndIndex(text, lstart);
         pos = lend + 1; // advance past the '\n' (or one past the end for the last line)
         const y = top - off + @as(f32, @floatFromInt(line_no)) * lh;
         if (y + lh < top or y > top + view_h) continue; // fully offscreen
@@ -2089,8 +1847,8 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
             if (s.start <= lend and s.end >= lstart) {
                 const a = @max(s.start, lstart);
                 const b = @min(s.end, lend);
-                const hx0 = text_x + editorPrefixWidth(face, px, text[lstart..a]);
-                var hx1 = text_x + editorPrefixWidth(face, px, text[lstart..b]);
+                const hx0 = text_x + text_buffer.editorPrefixWidth(face, px, text[lstart..a]);
+                var hx1 = text_x + text_buffer.editorPrefixWidth(face, px, text[lstart..b]);
                 if (s.end > lend) hx1 += space_w; // a selected line-break reads as a trailing sliver
                 try canvas.fillRect(.{ .x = hx0, .y = y, .width = @max(1, hx1 - hx0), .height = lh }, sel_c);
             }
@@ -2106,7 +1864,7 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
         if (lend > lstart) drawEditorLine(ctx, canvas, text[lstart..lend], px, fg, .{ .x = text_x, .y = y });
 
         if (focused and line_no == caret_line) {
-            const cx = text_x + editorPrefixWidth(face, px, text[lstart..st.caret]);
+            const cx = text_x + text_buffer.editorPrefixWidth(face, px, text[lstart..st.caret]);
             try canvas.line(.{ .x = cx, .y = y + 1 }, .{ .x = cx, .y = y + lh - 1 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
         }
     }
@@ -2130,23 +1888,26 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
 
 fn paintPicker(ctx: *const Context, pk: PickerData, rect: Rect, canvas: *Canvas) !void {
     const op = ctx.opacity;
-    const m = ctx.theme.metrics;
     const n = pk.options.len;
     if (n == 0) return;
-    // segmented-control background
-    try canvas.fillRoundedRect(rect, m.control_corner_radius, ctx.theme.colors.separator.over(ctx.theme.colors.window_background).multiplyAlpha(op));
+    const s = ctx.surface(canvas);
+    // The theme draws the segmented track and the selected-segment chip.
+    try ctx.theme.painter.segmentedTrack(s, rect);
     const seg_w = rect.width / @as(f32, @floatFromInt(n));
     const px = ctx.theme.typography.body.size;
     const lh = shape.lineHeight(ctx.cache.face, px);
     const selected = pk.selection.get();
     for (pk.options, 0..) |opt, i| {
         const seg = Rect{ .x = rect.x + @as(f32, @floatFromInt(i)) * seg_w, .y = rect.y, .width = seg_w, .height = rect.height };
-        if (@as(i64, @intCast(i)) == selected) {
-            const inner = seg.insetBy(2, 2);
-            try canvas.fillRoundedRect(inner, m.control_corner_radius - 1, ctx.theme.colors.control_background.multiplyAlpha(op));
-        }
+        const is_sel = @as(i64, @intCast(i)) == selected;
+        // The theme draws the selection chip and dictates its label color (an
+        // accent-filled chip needs `on_accent` text, a pale chip keeps `label`).
+        const seg_text = if (is_sel)
+            try ctx.theme.painter.segmentedSelection(s, seg)
+        else
+            ctx.theme.colors.secondary_label;
         const tw = shape.measureLineWidth(ctx.cache.face, opt, px);
-        drawTextC(ctx, canvas, opt, px, ctx.foreground.multiplyAlpha(op), .{
+        drawTextC(ctx, canvas, opt, px, seg_text.multiplyAlpha(op), .{
             .x = seg.x + (seg.width - tw) / 2,
             .y = vcenter(seg, lh),
         }) catch {};
@@ -2192,6 +1953,40 @@ fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas
     if (ctx.scroll_regions) |regions| {
         try regions.append(ctx.arena, .{ .rect = rect, .state = sd.state });
     }
+    try paintScrollbar(ctx, sd.state, rect, canvas);
+}
+
+/// Draw a slim, rounded scroll indicator on the right edge of `rect` when the
+/// content overflows. The thumb's length and position track the visible
+/// fraction, like a native overlay scrollbar. No-op when everything fits.
+fn paintScrollbar(ctx: *const Context, ss: *const ScrollState, rect: Rect, canvas: *Canvas) Allocator.Error!void {
+    const max = ss.maxOffset();
+    if (max <= 0.5 or rect.height <= 0) return; // fits → nothing to show
+
+    // Auto-hide: only visible briefly after the last scroll, then fade out.
+    if (ss.last_active_ms == 0 or g_frame_time_ms == 0) return; // never scrolled / headless
+    const since = g_frame_time_ms -| ss.last_active_ms;
+    if (since >= scrollbar_visible_ms) return; // fully hidden
+    const fade: f32 = if (since <= scrollbar_hold_ms)
+        1
+    else
+        1 - @as(f32, @floatFromInt(since - scrollbar_hold_ms)) / @as(f32, @floatFromInt(scrollbar_fade_ms));
+
+    const track_inset: f32 = 2;
+    const width: f32 = 4;
+    const track_h = rect.height - track_inset * 2;
+    if (track_h <= 0) return;
+
+    const visible_frac = std.math.clamp(rect.height / ss.content_h, 0.06, 1);
+    const thumb_h = @max(24, track_h * visible_frac);
+    const scroll_frac = std.math.clamp(ss.offset / max, 0, 1);
+    const thumb_y = rect.y + track_inset + (track_h - thumb_h) * scroll_frac;
+    const thumb_x = rect.x + rect.width - width - track_inset;
+
+    const thumb = Rect{ .x = thumb_x, .y = thumb_y, .width = width, .height = thumb_h };
+    // A muted thumb that reads on both light and dark surfaces.
+    const col = ctx.theme.colors.secondary_label.withAlpha(0.45 * ctx.opacity * fade);
+    try canvas.fillRoundedRect(thumb, width / 2, col);
 }
 
 // ---------------------------------------------------------------------------
@@ -2203,27 +1998,36 @@ fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas
 /// the current frame's hit regions on each motion event (so scrolling mid-drag
 /// stays correct). Managed by the app/event loop.
 threadlocal var g_drag: ?*TextFieldState = null;
+/// The `Binding.ctx` of a slider being dragged (mouse held after a knob/track
+/// press). Identifies the slider's hit region across rebuilds, the way `g_drag`
+/// uses the `*TextFieldState` pointer for a text drag.
+threadlocal var g_slider_drag: ?*anyopaque = null;
 
 /// End an in-progress mouse drag-selection (the app calls this on mouse-up).
 pub fn endDrag() void {
     g_drag = null;
+    g_slider_drag = null;
 }
 
-/// Continue a drag-selection started by a mouse-down on a `TextEditor`: extend
-/// the dragging field's caret to `p` (leaving its anchor put, so the selection
-/// grows). The field's `text_click` region is re-emitted every frame, so this
-/// re-reads the current origin/scroll. No-op when no drag is active.
+/// Continue a drag started by a mouse-down on a `TextEditor` (extend the
+/// caret) or a `Slider` (set its value from `p.x`). The dragged control's hit
+/// region is re-emitted every frame, so this re-reads the current geometry.
+/// No-op when no drag is active.
 pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
-    const target = g_drag orelse return;
+    if (g_drag == null and g_slider_drag == null) return;
     var i = regions.len;
     while (i > 0) {
         i -= 1;
         const r = regions[i];
         if (r.disabled) continue;
         switch (r.action) {
-            .text_click => |tc| if (tc.state == target) {
+            .text_click => |tc| if (tc.state == g_drag) {
                 tc.state.caret = caretIndexAt(tc, p);
                 tc.state.pref_col = null;
+                return;
+            },
+            .slider => |s| if (s.binding.ctx == g_slider_drag) {
+                s.binding.set(sliderValueForX(s.track, s.min, s.max, p.x));
                 return;
             },
             else => {},
@@ -2246,6 +2050,49 @@ pub fn dispatchTap(regions: []const HitRegion, p: Point) bool {
     return false;
 }
 
+/// Handle a double-click at `p`: if the top-most region under it is an editable
+/// text field, select the word there and return true. Otherwise returns false so
+/// the caller can fall back to a normal tap.
+pub fn dispatchDoubleClick(regions: []const HitRegion, p: Point) bool {
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or !r.rect.contains(p)) continue;
+        switch (r.action) {
+            .text_click => |tc| {
+                setFocus(tc.state);
+                tc.state.selectWordAt(caretIndexAt(tc, p));
+                g_drag = null; // a double-click selects a word; it does not arm a drag
+                return true;
+            },
+            else => return false, // a non-text control is on top — let the caller tap it
+        }
+    }
+    return false;
+}
+
+/// Handle a triple-click at `p`: if the top-most region under it is an editable
+/// text field, select all of its text and return true. Otherwise returns false.
+pub fn dispatchTripleClick(regions: []const HitRegion, p: Point) bool {
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or !r.rect.contains(p)) continue;
+        switch (r.action) {
+            .text_click => |tc| {
+                setFocus(tc.state);
+                tc.state.selectAll();
+                g_drag = null;
+                return true;
+            },
+            else => return false,
+        }
+    }
+    return false;
+}
+
 /// Points scrolled per unit of wheel delta. Negative so a wheel-up (positive
 /// `dy` in SDL) moves the content toward the top (decreasing offset), matching
 /// platform convention.
@@ -2260,17 +2107,51 @@ pub fn dispatchScroll(regions: []const ScrollRegion, p: Point, dy: f32) bool {
         const r = regions[i];
         if (r.rect.contains(p)) {
             r.state.scrollBy(dy * scroll_speed);
+            // Surface the overlay scrollbar and keep the loop awake long enough
+            // for it to fade back out (see scrollbarsAnimating / paintScrollbar).
+            r.state.last_active_ms = g_frame_time_ms;
+            g_scrollbar_until_ms = g_frame_time_ms + scrollbar_visible_ms;
             return true;
         }
     }
     return false;
 }
 
+// --- Auto-hiding overlay scrollbars -----------------------------------------
+// The bar appears on scroll, holds for `scrollbar_hold_ms`, then fades over
+// `scrollbar_fade_ms` and disappears. `scrollbar_visible_ms` is the full window.
+
+const scrollbar_hold_ms: u64 = 1600;
+const scrollbar_fade_ms: u64 = 400;
+const scrollbar_visible_ms: u64 = scrollbar_hold_ms + scrollbar_fade_ms;
+
+/// Wall-clock time (ms) of the current frame, set by the app via `setFrameTime`.
+/// 0 in headless/tests, which keeps scrollbars hidden there.
+var g_frame_time_ms: u64 = 0;
+/// Time (ms) until which at least one scrollbar is still visible or fading.
+var g_scrollbar_until_ms: u64 = 0;
+
+/// The app calls this once per frame with its millisecond clock so scrollbars
+/// can time their auto-hide.
+pub fn setFrameTime(ms: u64) void {
+    g_frame_time_ms = ms;
+}
+
+/// True while a recently-scrolled viewport's overlay scrollbar is still on
+/// screen (or fading). The app's loop wakes at ~60fps while this holds so the
+/// bar fades out instead of freezing on screen.
+pub fn scrollbarsAnimating(now_ms: u64) bool {
+    return now_ms < g_scrollbar_until_ms;
+}
+
 fn performAction(a: HitAction, p: Point) void {
     switch (a) {
         .callback => |cb| cb.call(),
         .toggle => |b| b.set(!b.get()),
-        .slider => |s| s.binding.set(sliderValueForX(s.track, s.min, s.max, p.x)),
+        .slider => |s| {
+            s.binding.set(sliderValueForX(s.track, s.min, s.max, p.x));
+            g_slider_drag = s.binding.ctx; // arm a drag so mouse-move tracks the knob
+        },
         .step => |s| {
             const next = std.math.clamp(s.binding.get() + s.delta, s.min, s.max);
             s.binding.set(next);
@@ -2310,6 +2191,175 @@ pub fn clearFocus() void {
     g_focused = null;
 }
 
+// ---------------------------------------------------------------------------
+// Text-field context menu (right-click → Cut / Copy / Paste / Select All).
+// Drawn by zigui (not a native OS menu) as a top-level popup in `render`, so it
+// works for every app and reuses the existing hit-region/dispatch machinery.
+// Cut/Copy/Paste need the clipboard, which lives in the SDL layer (`app.zig`);
+// the app registers function pointers via `setClipboardOps` so this core code
+// stays platform-free.
+// ---------------------------------------------------------------------------
+
+/// Clipboard operations the app injects so the context menu can copy/paste.
+pub const ClipboardOps = struct {
+    /// Put the field's current selection on the system clipboard.
+    copy: *const fn (*TextFieldState) void,
+    /// Insert the clipboard's text at the field's caret (replacing any selection).
+    paste: *const fn (*TextFieldState) void,
+};
+var g_clipboard: ?ClipboardOps = null;
+pub fn setClipboardOps(ops: ClipboardOps) void {
+    g_clipboard = ops;
+}
+
+const TextMenuState = struct { field: *TextFieldState, pos: Point, hover: ?MenuAction = null };
+threadlocal var g_ctxmenu: ?TextMenuState = null;
+
+pub fn contextMenuOpen() bool {
+    return g_ctxmenu != null;
+}
+pub fn closeContextMenu() void {
+    g_ctxmenu = null;
+}
+
+/// The top-most editable field whose hit region contains `p`, or null. The app's
+/// right-click handler calls this to decide whether to pop the text menu.
+pub fn fieldAt(regions: []const HitRegion, p: Point) ?*TextFieldState {
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or !r.rect.contains(p)) continue;
+        switch (r.action) {
+            .focus => |fs| return fs, // single-line TextField
+            .text_click => |tc| return tc.state, // multi-line TextEditor
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Open the text context menu for `field` at layout point `p`. Focuses the field
+/// so the menu's actions (and a follow-up paste) target it.
+pub fn openContextMenu(field: *TextFieldState, p: Point) void {
+    setFocus(field);
+    g_ctxmenu = .{ .field = field, .pos = p };
+}
+
+/// Update which menu item the cursor is over (for the hover highlight). The app
+/// calls this on mouse motion while the menu is open; `regions` are the current
+/// frame's hit regions (which include the menu's item rows). A no-op if closed.
+pub fn hoverContextMenu(regions: []const HitRegion, p: Point) void {
+    if (g_ctxmenu == null) return;
+    var found: ?MenuAction = null;
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or !r.rect.contains(p)) continue;
+        // The first (top-most) region under the cursor decides: a menu item row
+        // sets the hover; anything else (e.g. the dismiss region) clears it.
+        switch (r.action) {
+            .callback => |cb| if (cb.func == &menuPerform) {
+                const it: *MenuItem = @ptrCast(@alignCast(cb.ctx.?));
+                found = it.action;
+            },
+            else => {},
+        }
+        break;
+    }
+    if (g_ctxmenu) |*cm| cm.hover = found;
+}
+
+fn eqAction(h: ?MenuAction, a: MenuAction) bool {
+    return if (h) |x| x == a else false;
+}
+
+const MenuAction = enum { cut, copy, paste, select_all };
+const MenuItem = struct { field: *TextFieldState, action: MenuAction };
+
+fn menuPerform(p: ?*anyopaque) void {
+    const it: *MenuItem = @ptrCast(@alignCast(p.?));
+    const f = it.field;
+    switch (it.action) {
+        .cut => {
+            if (g_clipboard) |ops| ops.copy(f);
+            _ = f.deleteSelection();
+        },
+        .copy => if (g_clipboard) |ops| ops.copy(f),
+        .paste => if (g_clipboard) |ops| ops.paste(f),
+        .select_all => f.selectAll(),
+    }
+    closeContextMenu();
+}
+
+fn menuDismiss(_: ?*anyopaque) void {
+    closeContextMenu();
+}
+
+fn menuRow(ctx: *const Context, field: *TextFieldState, label: []const u8, shortcut: []const u8, act: MenuAction, enabled: bool, hovered: bool) View {
+    // A hovered (always enabled) row paints an accent highlight with inverted text;
+    // disabled rows stay dimmed and un-highlighted.
+    const label_fg = if (hovered) ctx.theme.colors.on_accent else if (enabled) ctx.theme.colors.label else ctx.theme.colors.tertiary_label;
+    const short_fg = if (hovered) ctx.theme.colors.on_accent else ctx.theme.colors.tertiary_label;
+    var row = HStack(.{
+        Text(label).foreground(label_fg),
+        Spacer(),
+        Text(shortcut).font(.caption).foreground(short_fg),
+    }).spacing(20).paddingInsets(.{ .top = 5, .leading = 10, .bottom = 5, .trailing = 10 }).frameMaxWidth();
+    if (hovered) row = row.background(ctx.theme.colors.accent).cornerRadius(5);
+    if (enabled) {
+        const cx = ctx.arena.create(MenuItem) catch return row;
+        cx.* = .{ .field = field, .action = act };
+        row = row.onTap(.{ .ctx = cx, .func = menuPerform });
+    }
+    return row;
+}
+
+fn buildContextMenu(ctx: *const Context, field: *TextFieldState) View {
+    const has_sel = field.hasSelection();
+    const hov: ?MenuAction = if (g_ctxmenu) |cm| cm.hover else null;
+    const rows = ctx.arena.alloc(View, 5) catch return Text("");
+    rows[0] = menuRow(ctx, field, "Cut", "⌘X", .cut, has_sel, eqAction(hov, .cut));
+    rows[1] = menuRow(ctx, field, "Copy", "⌘C", .copy, has_sel, eqAction(hov, .copy));
+    rows[2] = menuRow(ctx, field, "Paste", "⌘V", .paste, true, eqAction(hov, .paste));
+    rows[3] = Divider();
+    rows[4] = menuRow(ctx, field, "Select All", "⌘A", .select_all, field.text().len > 0, eqAction(hov, .select_all));
+    return VStack(rows).spacing(2).paddingInsets(.{ .top = 5, .leading = 6, .bottom = 5, .trailing = 6 }).frameMaxWidth();
+}
+
+/// Draw the open context menu (if any) as a top-level popup: a full-frame
+/// dismiss region, then a positioned panel of items. Called by `render` after
+/// the app's overlays so it sits on top and wins tap dispatch.
+fn drawContextMenu(ctx: *const Context, root: Rect, canvas: *Canvas) Allocator.Error!void {
+    const cm = g_ctxmenu orelse return;
+    // Dismiss region beneath the menu: a tap anywhere not on an item closes it.
+    // Appended before the items (added by renderInto below), so back-to-front
+    // dispatch gives the items priority.
+    try ctx.hit_regions.append(ctx.arena, .{ .rect = root, .action = .{ .callback = .{ .func = menuDismiss } }, .disabled = false });
+
+    // The framework calls `render` after `endBuild`, so the build arena is closed.
+    // Re-open it (saving/restoring) just long enough to construct the menu's views.
+    const saved_arena = current_arena;
+    current_arena = ctx.arena;
+    defer current_arena = saved_arena;
+
+    const menu = buildContextMenu(ctx, cm.field);
+    const menu_w: f32 = 210;
+    const size = measure(ctx, menu, .{ .width = menu_w, .height = null }) catch return;
+    var x = cm.pos.x;
+    if (x + size.width > root.maxX()) x = root.maxX() - size.width;
+    if (x < root.x) x = root.x;
+    var y = cm.pos.y;
+    if (y + size.height > root.maxY()) y = root.maxY() - size.height;
+    if (y < root.y) y = root.y;
+    const target = Rect{ .x = x, .y = y, .width = size.width, .height = size.height };
+
+    const radius = ctx.theme.metrics.corner_radius;
+    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius);
+    try renderInto(ctx, menu, target, canvas);
+}
+
 /// Submit the focused text field: fire its `.onSubmit` callback if it has one.
 /// A no-op when nothing is focused or no callback was set. The app calls this on
 /// Enter.
@@ -2328,28 +2378,36 @@ const raster = @import("../render/raster.zig");
 
 const TestEnv = struct {
     font: font_mod.Font,
+    icon_font: font_mod.Font,
     cache: atlas.GlyphCache,
+    icon_cache: atlas.GlyphCache,
     hits: std.ArrayList(HitRegion),
     arena_state: std.heap.ArenaAllocator,
 
     fn init() TestEnv {
         return .{
             .font = font_mod.Font.default(),
+            .icon_font = font_mod.Font.icons(),
             .cache = undefined,
+            .icon_cache = undefined,
             .hits = .empty,
             .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
         };
     }
     fn setup(self: *TestEnv) void {
         self.cache = atlas.GlyphCache.init(testing.allocator, &self.font.face);
+        self.icon_cache = atlas.GlyphCache.init(testing.allocator, &self.icon_font.face);
         beginBuild(self.arena_state.allocator());
     }
     fn ctx(self: *TestEnv) Context {
-        return Context.init(@import("../theme/macos.zig").light, &self.cache, self.arena_state.allocator(), &self.hits);
+        var c = Context.init(@import("../theme/macos.zig").light, &self.cache, self.arena_state.allocator(), &self.hits);
+        c.icon_cache = &self.icon_cache;
+        return c;
     }
     fn deinit(self: *TestEnv) void {
         endBuild();
         self.cache.deinit();
+        self.icon_cache.deinit();
         // hit regions are appended via the arena, freed by arena_state.deinit()
         self.arena_state.deinit();
     }
@@ -2575,6 +2633,82 @@ test "view: Slider sets value from tap position" {
     // tap near the left -> value near min
     try testing.expect(dispatchTap(env.hits.items, .{ .x = 5, .y = 10 }));
     try testing.expect(s.get() < 0.2);
+}
+
+test "view: Slider follows mouse drag after press" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var s = state.State(f32).init(testing.allocator, 0);
+    defer s.deinit();
+    var fb = try renderToFb(&env, &c, Slider(s.binding(), 0, 1), .{ .x = 0, .y = 0, .width = 100, .height = 20 }, 100, 20);
+    defer fb.deinit();
+
+    // Press near the left arms a drag.
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 5, .y = 10 }));
+    try testing.expect(s.get() < 0.2);
+    // Dragging the mouse right (button held) tracks the knob.
+    dispatchDrag(env.hits.items, .{ .x = 95, .y = 10 });
+    try testing.expect(s.get() > 0.8);
+    // Dragging past the right edge clamps to max, not beyond.
+    dispatchDrag(env.hits.items, .{ .x = 500, .y = 10 });
+    try testing.expectApproxEqAbs(@as(f32, 1.0), s.get(), 0.001);
+    // After release, a stray move no longer changes the value.
+    endDrag();
+    dispatchDrag(env.hits.items, .{ .x = 5, .y = 10 });
+    try testing.expectApproxEqAbs(@as(f32, 1.0), s.get(), 0.001);
+}
+
+test "view: Icon paints a glyph from the bundled set" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var fb = try renderToFb(&env, &c, Icon(.heart, 24, Color.red), .{ .x = 0, .y = 0, .width = 24, .height = 24 }, 24, 24);
+    defer fb.deinit();
+    // Some red pixels were inked somewhere in the box.
+    var inked: usize = 0;
+    var y: u32 = 0;
+    while (y < 24) : (y += 1) {
+        var x: u32 = 0;
+        while (x < 24) : (x += 1) {
+            if (fb.at(x, y).r > 0.3) inked += 1;
+        }
+    }
+    try testing.expect(inked > 0);
+}
+
+test "view: IconButton fires its callback on tap" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const Ctr = struct {
+        var hits: u32 = 0;
+        fn tap(_: ?*anyopaque) void {
+            hits += 1;
+        }
+    };
+    Ctr.hits = 0;
+    const cb = Callback{ .func = Ctr.tap };
+    var fb = try renderToFb(&env, &c, IconButton(.trash, 20, cb), .{ .x = 0, .y = 0, .width = 32, .height = 32 }, 32, 32);
+    defer fb.deinit();
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 16, .y = 16 }));
+    try testing.expectEqual(@as(u32, 1), Ctr.hits);
+}
+
+test "view: Icon paints nothing when no icon cache is wired" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    c.icon_cache = null; // simulate an app that didn't wire the icon font
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, Icon(.heart, 24, Color.red), .{ .x = 0, .y = 0, .width = 24, .height = 24 }, &canvas);
+    // No glyph command emitted for the icon.
+    for (canvas.commands.items) |cmd| try testing.expect(cmd != .glyph);
 }
 
 test "view: Stepper increments and clamps" {
@@ -2895,12 +3029,12 @@ test "view: editorPrefixWidth snaps tabs to tab stops" {
     defer env.deinit();
     const face = &env.font.face;
     const px: f32 = 14;
-    const tab_w = editorTabMetrics(face, px).tab;
+    const tab_w = text_buffer.editorTabMetrics(face, px).tab;
     // A leading tab advances exactly one tab stop.
-    try testing.expectApproxEqAbs(tab_w, editorPrefixWidth(face, px, "\t"), 0.01);
+    try testing.expectApproxEqAbs(tab_w, text_buffer.editorPrefixWidth(face, px, "\t"), 0.01);
     // Text then a tab snaps forward to the *next* stop (never less than the text).
     const w_ab = shape.measureLineWidth(face, "ab", px);
-    const after = editorPrefixWidth(face, px, "ab\t");
+    const after = text_buffer.editorPrefixWidth(face, px, "ab\t");
     try testing.expect(after > w_ab);
     try testing.expectApproxEqAbs(@as(f32, 0), @mod(after, tab_w), 0.01);
 }
@@ -2927,7 +3061,7 @@ test "view: TextEditor paints line numbers and places the caret on click" {
     const lh = shape.lineHeight(&env.font.face, c.theme.typography.body.size);
     try testing.expect(dispatchTap(env.hits.items, .{ .x = 200, .y = 8 + lh + 2 }));
     try testing.expect(ed.focused);
-    try testing.expectEqual(@as(usize, 1), lineIndexOf(ed.text(), ed.caret));
+    try testing.expectEqual(@as(usize, 1), text_buffer.lineIndexOf(ed.text(), ed.caret));
 }
 
 test "view: TextEditor mouse drag selects a range" {
@@ -3030,6 +3164,80 @@ test "view: Picker selects a segment on tap" {
     // tap the third segment (x ~ 250)
     try testing.expect(dispatchTap(env.hits.items, .{ .x = 250, .y = 14 }));
     try testing.expectEqual(@as(i64, 2), sel.get());
+}
+
+test "view: RadioGroup selects an option on tap" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, 0);
+    defer sel.deinit();
+    const opts = [_][]const u8{ "One", "Two", "Three" };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, RadioGroup(sel.binding(), &opts), .{ .x = 0, .y = 0, .width = 200, .height = 120 }, &canvas);
+    try testing.expectEqual(@as(usize, 3), env.hits.items.len); // one tap target per option
+    // tapping the second row sets the binding to index 1
+    try testing.expect(dispatchTap(env.hits.items, env.hits.items[1].rect.center()));
+    try testing.expectEqual(@as(i64, 1), sel.get());
+}
+
+test "view: Sidebar selects a row on tap and highlights the selection" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, 0);
+    defer sel.deinit();
+    const items = [_]SidebarItem{
+        .{ .label = "Inbox", .icon = .mail },
+        .{ .label = "Sent" },
+        .{ .label = "Drafts" },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, Sidebar(&items, sel.binding()), .{ .x = 0, .y = 0, .width = 220, .height = 300 }, &canvas);
+    try testing.expectEqual(@as(usize, 3), env.hits.items.len);
+    // the selected (row 0) draws an accent highlight behind it
+    var has_accent = false;
+    for (canvas.commands.items) |cmd| {
+        if (cmd == .fill_rrect and cmd.fill_rrect.color.approxEql(c.theme.colors.accent, 0.05)) has_accent = true;
+    }
+    try testing.expect(has_accent);
+    // tapping the third row selects it
+    try testing.expect(dispatchTap(env.hits.items, env.hits.items[2].rect.center()));
+    try testing.expectEqual(@as(i64, 2), sel.get());
+}
+
+test "view: Table shows a header + rows and selects a row on tap" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, -1);
+    defer sel.deinit();
+    const cols = [_]TableColumn{ .{ .title = "Name" }, .{ .title = "Age", .width = 60 } };
+    const rows = [_][]const []const u8{
+        &.{ "Ada", "36" },
+        &.{ "Alan", "41" },
+        &.{ "Grace", "45" },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, Table(&cols, &rows, sel.binding()), .{ .x = 0, .y = 0, .width = 300, .height = 200 }, &canvas);
+    // selection enabled -> one callback tap target per data row (header has none)
+    var row_hits: usize = 0;
+    var second: ?Rect = null;
+    for (env.hits.items) |hr| {
+        if (hr.action == .callback) {
+            if (row_hits == 1) second = hr.rect;
+            row_hits += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), row_hits);
+    try testing.expect(dispatchTap(env.hits.items, second.?.center()));
+    try testing.expectEqual(@as(i64, 1), sel.get());
 }
 
 fn gridCell(cell_color: Color) View {
@@ -3389,6 +3597,41 @@ test "view: sheet enqueues an overlay, draws a scrim over content, dismisses on 
     try testing.expect(fb.at(100, 20).luminance() < 0.95);
 }
 
+test "view: chaining .sheet and .alert keeps both overlays (neither clobbers)" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var sheet_on = state.State(bool).init(testing.allocator, true);
+    defer sheet_on.deinit();
+    var alert_on = state.State(bool).init(testing.allocator, false);
+    defer alert_on.deinit();
+
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 200, .height = 200 };
+    const base = Text("Base")
+        .sheet(sheet_on.binding(), Rectangle(Color.red).frame(80, 40))
+        .alert(alert_on.binding(), Rectangle(Color.blue).frame(80, 40));
+
+    // Only the sheet is presented → exactly one overlay, and it's the sheet.
+    try render(&c, base, root, &canvas);
+    try testing.expectEqual(@as(usize, 1), ovs.items.len);
+    try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
+
+    // Turn the alert on too → both present (the .alert did not overwrite .sheet).
+    ovs.clearRetainingCapacity();
+    env.hits.clearRetainingCapacity();
+    canvas.clearCommands();
+    alert_on.set(true);
+    try render(&c, base, root, &canvas);
+    try testing.expectEqual(@as(usize, 2), ovs.items.len);
+    try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
+    try testing.expectEqual(OverlayStyle.alert, ovs.items[1].style);
+}
+
 test "view: popover content is positioned near its (top) anchor" {
     var env = TestEnv.init();
     env.setup();
@@ -3453,6 +3696,155 @@ test "view: nested overlays drain once each without recursion" {
     try testing.expectEqual(OverlayStyle.alert, ovs.items[1].style);
 }
 
+test "view: double-click selects the word; TextField exposes text_click" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+
+    var field = TextFieldState.init(testing.allocator);
+    defer field.deinit();
+    try field.setText("foo barbaz qux");
+
+    // selectWordAt expands to the word boundaries around an index.
+    field.selectWordAt(5); // inside "barbaz"
+    const r = field.selectionRange().?;
+    try testing.expectEqualStrings("barbaz", field.text()[r.start..r.end]);
+
+    // A run of whitespace selects together (not a word).
+    field.selectWordAt(3); // the space after "foo"
+    const rs = field.selectionRange().?;
+    try testing.expectEqualStrings(" ", field.text()[rs.start..rs.end]);
+
+    // The single-line field now registers a `text_click`, so a double-click
+    // dispatch near the left edge selects the first word.
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, TextField("ph", &field), .{ .x = 0, .y = 0, .width = 200, .height = 40 }, &canvas);
+    try testing.expectEqual(@as(usize, 1), env.hits.items.len);
+    try testing.expect(env.hits.items[0].action == .text_click);
+    try testing.expect(dispatchDoubleClick(env.hits.items, .{ .x = 12, .y = 20 }));
+    const r2 = field.selectionRange().?;
+    try testing.expectEqualStrings("foo", field.text()[r2.start..r2.end]);
+
+    // Triple-click selects the whole field.
+    try testing.expect(dispatchTripleClick(env.hits.items, .{ .x = 12, .y = 20 }));
+    const r3 = field.selectionRange().?;
+    try testing.expectEqual(@as(usize, 0), r3.start);
+    try testing.expectEqual(field.text().len, r3.end);
+}
+
+test "view: TextField selection highlight is visible" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+
+    var field = TextFieldState.init(testing.allocator);
+    defer field.deinit();
+    try field.setText("hello");
+    setFocus(&field);
+    defer clearFocus();
+
+    const rect = Rect{ .x = 0, .y = 0, .width = 140, .height = 36 };
+
+    // The focus border is also blue, so diff a no-selection render against a
+    // fully-selected one — the difference is the highlight block.
+    field.sel_anchor = null; // just a caret
+    var fb0 = try renderToFb(&env, &c, TextField("ph", &field), rect, 140, 36);
+    defer fb0.deinit();
+    const before = countBlue(&fb0);
+
+    env.hits.clearRetainingCapacity();
+    field.selectAll();
+    var fb1 = try renderToFb(&env, &c, TextField("ph", &field), rect, 140, 36);
+    defer fb1.deinit();
+    const after = countBlue(&fb1);
+
+    try testing.expect(after > before + 50); // the selection adds a solid blue block
+}
+
+test "view: text context menu — fieldAt, render, actions, clipboard hook" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+
+    var field = TextFieldState.init(testing.allocator);
+    defer field.deinit();
+    try field.setText("hello world");
+
+    // Record clipboard calls routed through the injected ops.
+    const Rec = struct {
+        var copied: bool = false;
+        var pasted: bool = false;
+        fn copy(f: *TextFieldState) void {
+            _ = f;
+            copied = true;
+        }
+        fn paste(f: *TextFieldState) void {
+            _ = f;
+            pasted = true;
+        }
+    };
+    Rec.copied = false;
+    Rec.pasted = false;
+    setClipboardOps(.{ .copy = Rec.copy, .paste = Rec.paste });
+    defer g_clipboard = null;
+    defer closeContextMenu(); // never leak menu state into later tests, even on failure
+
+    // fieldAt finds the single-line TextField under a point (it registers a
+    // `text_click` region).
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, TextField("ph", &field), .{ .x = 0, .y = 0, .width = 400, .height = 300 }, &canvas);
+    try testing.expect(fieldAt(env.hits.items, .{ .x = 20, .y = 15 }) == &field);
+
+    // Open the menu and re-render. Crucially, build the arg view, then `endBuild`
+    // BEFORE render — exactly as the framework does — so this guards the bug where
+    // the menu's own views were constructed after the build arena had closed.
+    env.hits.clearRetainingCapacity();
+    field.selectAll(); // a selection enables Cut/Copy so they register hit regions
+    openContextMenu(&field, .{ .x = 10, .y = 10 });
+    try testing.expect(contextMenuOpen());
+    const menu_arg = TextField("ph", &field);
+    endBuild();
+    defer beginBuild(env.arena_state.allocator()); // restore for env.deinit()'s endBuild()
+    try render(&c, menu_arg, .{ .x = 0, .y = 0, .width = 400, .height = 300 }, &canvas);
+    try testing.expect(env.hits.items.len >= 4); // field + dismiss + enabled items
+
+    // Hover: pointing at the Copy item's region sets the menu's hovered action.
+    var copy_rect: ?Rect = null;
+    for (env.hits.items) |r| switch (r.action) {
+        .callback => |cb| if (cb.func == &menuPerform) {
+            const it: *MenuItem = @ptrCast(@alignCast(cb.ctx.?));
+            if (it.action == .copy) copy_rect = r.rect;
+        },
+        else => {},
+    };
+    try testing.expect(copy_rect != null);
+    hoverContextMenu(env.hits.items, .{ .x = copy_rect.?.x + 5, .y = copy_rect.?.y + 5 });
+    try testing.expect(eqAction(g_ctxmenu.?.hover, .copy));
+    // Pointing at empty space (the dismiss region) clears the hover.
+    hoverContextMenu(env.hits.items, .{ .x = 380, .y = 280 });
+    try testing.expect(g_ctxmenu.?.hover == null);
+
+    // Copy fires the hook (no mutation) and closes the menu.
+    var copy_item = MenuItem{ .field = &field, .action = .copy };
+    menuPerform(&copy_item);
+    try testing.expect(Rec.copied);
+    try testing.expect(!contextMenuOpen());
+    try testing.expectEqualStrings("hello world", field.text());
+
+    // Select All then Cut copies and clears the buffer.
+    field.selectAll();
+    try testing.expect(field.hasSelection());
+    var cut_item = MenuItem{ .field = &field, .action = .cut };
+    menuPerform(&cut_item);
+    try testing.expect(Rec.copied);
+    try testing.expectEqual(@as(usize, 0), field.text().len);
+}
+
 test "view: Menu toggles a popover of items" {
     var env = TestEnv.init();
     env.setup();
@@ -3491,11 +3883,13 @@ test "view: TabView shows the selected tab and switches on tab-bar tap" {
         .{ .label = "One", .content = Rectangle(Color.red).frame(80, 40) },
         .{ .label = "Two", .content = Rectangle(Color.blue).frame(80, 40) },
     };
-    // tab 0 selected -> red content shows
+    // tab 0 selected -> red content shows. (The tab bar's selected segment is
+    // an accent chip, so some blue is always present; the blue *content* is
+    // asserted as a large relative jump after switching tabs.)
     var fb0 = try renderToFb(&env, &c, TabView(sel.binding(), &tabs), .{ .x = 0, .y = 0, .width = 200, .height = 100 }, 200, 100);
     defer fb0.deinit();
     try testing.expect(countRed(&fb0) > 100);
-    try testing.expect(countBlue(&fb0) < 20);
+    const blue_with_red_tab = countBlue(&fb0);
 
     // tap the second tab-bar segment (a .select hit region targeting value 1)
     var tapped = false;
@@ -3509,11 +3903,12 @@ test "view: TabView shows the selected tab and switches on tab-bar tap" {
     try testing.expect(tapped);
     try testing.expectEqual(@as(i64, 1), sel.get());
 
-    // re-render -> tab 1 (blue) content now shows
+    // re-render -> tab 1 (blue) content now shows, red is gone
     env.hits.clearRetainingCapacity();
     var fb1 = try renderToFb(&env, &c, TabView(sel.binding(), &tabs), .{ .x = 0, .y = 0, .width = 200, .height = 100 }, 200, 100);
     defer fb1.deinit();
-    try testing.expect(countBlue(&fb1) > 100);
+    try testing.expect(countBlue(&fb1) > blue_with_red_tab + 100);
+    try testing.expect(countRed(&fb1) < 100);
 }
 
 test "view: List wraps rows in a scroll + divider-separated stack" {
@@ -3526,4 +3921,102 @@ test "view: List wraps rows in a scroll + divider-separated stack" {
     try testing.expect(inner.kind == .stack);
     // 2 rows + 1 divider between them
     try testing.expectEqual(@as(usize, 3), inner.kind.stack.children.len);
+}
+
+// ── Painter seam ────────────────────────────────────────────────────────────
+
+test "painter: macOS draws glass where Win2000 chisels a bevel" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    const macos = @import("../theme/macos.zig");
+    const win2000 = @import("../theme/win2000.zig");
+    const tree = Button("OK", action(Counter.inc));
+
+    // macOS button: a blue glass gradient.
+    var mc = env.ctx();
+    mc.theme = macos.light;
+    const ms = try measure(&mc, tree, .unspecified);
+    const mw: u32 = @intFromFloat(@ceil(ms.width));
+    const mh: u32 = @intFromFloat(@ceil(ms.height));
+    env.hits.clearRetainingCapacity();
+    var mfb = try renderToFb(&env, &mc, tree, Rect.fromOriginSize(.{}, ms), mw, mh);
+    defer mfb.deinit();
+
+    // Win2000 button: a silver face with a dark-shadow bottom bevel.
+    var wc = env.ctx();
+    wc.theme = win2000.light;
+    const ws = try measure(&wc, tree, .unspecified);
+    const ww: u32 = @intFromFloat(@ceil(ws.width));
+    const wh: u32 = @intFromFloat(@ceil(ws.height));
+    env.hits.clearRetainingCapacity();
+    var wfb = try renderToFb(&env, &wc, tree, Rect.fromOriginSize(.{}, ws), ww, wh);
+    defer wfb.deinit();
+
+    // Win2000's outer bottom edge is the dark-shadow grey; macOS's body is blue.
+    const w_bottom = wfb.at(ww / 2, wh - 1);
+    try testing.expect(w_bottom.approxEql(win2000.light.colors.control_dark_shadow, 0.2));
+    const m_mid = mfb.at(mw / 2, mh / 2);
+    try testing.expect(m_mid.b > m_mid.r); // glass gradient is blue, not grey
+    // ...and that same spot in Win2000 is the neutral silver face, not blue.
+    const w_mid = wfb.at(ww / 2, wh / 2);
+    try testing.expect(!(w_mid.b > w_mid.r + 0.1));
+}
+
+test "painter: Material tint follows the color scheme" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    const macos = @import("../theme/macos.zig");
+    // A frosted panel over a known (white) backdrop: the glass tint comes from
+    // the theme's scheme-correct `Palette.glass`, so light vs dark differ.
+    const tree = Empty().frame(40, 40).backgroundMaterial(.regular);
+    const rect = Rect{ .x = 0, .y = 0, .width = 40, .height = 40 };
+
+    var lc = env.ctx();
+    lc.theme = macos.light;
+    var lfb = try renderToFb(&env, &lc, tree, rect, 40, 40);
+    defer lfb.deinit();
+
+    var dc = env.ctx();
+    dc.theme = macos.dark;
+    var dfb = try renderToFb(&env, &dc, tree, rect, 40, 40);
+    defer dfb.deinit();
+
+    // Light glass keeps the white backdrop bright; dark glass darkens it.
+    try testing.expect(lfb.at(20, 20).luminance() > dfb.at(20, 20).luminance() + 0.2);
+}
+
+test "painter: every family paints all controls without error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const families = [_]Theme{
+        @import("../theme/macos.zig").light,
+        @import("../theme/macos.zig").dark,
+        @import("../theme/win2000.zig").light,
+        @import("../theme/windows10.zig").light,
+        @import("../theme/windows10.zig").dark,
+        @import("../theme/kde.zig").light,
+        @import("../theme/kde.zig").dark,
+        @import("../theme/mui.zig").light,
+        @import("../theme/mui.zig").dark,
+    };
+    const r = Rect{ .x = 0, .y = 0, .width = 60, .height = 24 };
+    const knob = Rect{ .x = 0, .y = 0, .width = 18, .height = 18 };
+    for (families) |th| {
+        var canvas = Canvas.init(arena.allocator());
+        const s = theme_mod.Surface{ .canvas = &canvas, .palette = &th.colors, .metrics = &th.metrics, .scheme = th.scheme };
+        const p = th.painter;
+        _ = try p.button(s, r, .normal, .{});
+        try p.field(s, r, 4, .{});
+        try p.segmentedTrack(s, r);
+        _ = try p.segmentedSelection(s, r);
+        try p.switchTrack(s, r, true);
+        try p.switchKnob(s, knob, true);
+        try p.slider(s, r, 0.5, knob, .{});
+        try p.stepperBox(s, r, .{});
+        try p.progress(s, r, 0.5);
+        try p.panel(s, r, 8);
+        try testing.expect(canvas.commands.items.len > 0);
+    }
 }

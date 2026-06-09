@@ -1,4 +1,8 @@
 const std = @import("std");
+// The package manifest is the single source of truth for the version. Read it
+// here and inject it into the module (below) as `build_options.version`, so
+// `zigui.version` always matches `build.zig.zon` and the `zig fetch` tag.
+const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,10 +16,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Inject the manifest version so `zigui.version` derives from build.zig.zon.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", manifest.version);
+    mod.addImport("build_options", options.createModule());
     // Bundle the default font (Inter, OFL) as an embeddable blob, importable as
     // `@embedFile("inter_font")` from anywhere in the module.
     mod.addAnonymousImport("inter_font", .{
         .root_source_file = b.path("assets/fonts/Inter.ttf"),
+    });
+    // Bundle the icon font (a subset of Lucide, ISC) the same way, importable as
+    // `@embedFile("icon_font")`. See `src/icons.zig` and `assets/fonts/NOTICE.md`.
+    mod.addAnonymousImport("icon_font", .{
+        .root_source_file = b.path("assets/fonts/icons.ttf"),
+    });
+    // Bundle the monochrome emoji fallback font (Noto Emoji, OFL), importable as
+    // `@embedFile("emoji_font")`. Wired as a fallback face for glyphs Inter
+    // lacks; see `assets/fonts/NOTICE.md`.
+    mod.addAnonymousImport("emoji_font", .{
+        .root_source_file = b.path("assets/fonts/NotoEmoji.ttf"),
     });
 
     // ---- tests ------------------------------------------------------------
@@ -36,33 +55,11 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&install_docs.step);
 
     // ---- examples (link SDL3; not part of `zig build test`) ---------------
-    addExample(b, mod, target, optimize, "hello", "examples/hello/main.zig");
-    addExample(b, mod, target, optimize, "settings", "examples/settings/main.zig");
+    // `showcase` is the kitchen-sink gallery (every component + light/dark and
+    // accent switchers); `edit` is the multi-line text editor. Both support a
+    // headless `--screenshot <out.bmp>` flag for windowless rendering.
     addExample(b, mod, target, optimize, "showcase", "examples/showcase/main.zig");
-    addExample(b, mod, target, optimize, "llm-chat", "examples/llm-chat/main.zig");
     addExample(b, mod, target, optimize, "edit", "examples/edit/main.zig");
-
-    // A headless screenshot tool: renders a UI to a BMP using *only* the pure
-    // `zigui` module + libc (no SDL), so CI can produce a per-OS screenshot on
-    // every platform. Not an `addExample` (those link SDL3).
-    const screenshot = b.addExecutable(.{
-        .name = "screenshot",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/screenshot/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true, // for the libc BMP writer (std.fs needs std.Io in 0.16)
-            .imports = &.{.{ .name = "zigui", .module = mod }},
-        }),
-    });
-    const screenshot_install = b.addInstallArtifact(screenshot, .{});
-    b.step("screenshot", "Build the headless screenshot tool")
-        .dependOn(&screenshot_install.step);
-    const screenshot_run = b.addRunArtifact(screenshot);
-    screenshot_run.step.dependOn(&screenshot_install.step);
-    if (b.args) |args| screenshot_run.addArgs(args);
-    b.step("run-screenshot", "Render a UI screenshot to a BMP (pass the path: -- out.bmp)")
-        .dependOn(&screenshot_run.step);
 }
 
 /// Build a runnable example that links the SDL3-backed runtime (`src/app.zig`).

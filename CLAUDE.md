@@ -144,6 +144,24 @@ exercises nav + tabs + sheet + material + a11y together; `examples/showcase`
 demos them in a real window. Notes below record *how* each is wired and the
 deliberate deviations from the original plan, so you can extend safely.
 
+### Icons — `Icon` / `IconButton` (bundled icon font, reuses the glyph path)
+A second embedded font (`assets/fonts/icons.ttf`, a ~50-glyph subset of **Lucide**,
+ISC) is wired as the `icon_font` anonymous import alongside Inter, exposed as
+`Font.icons()` and `ttf.icon_ttf`. The catalog is `src/icons.zig`: `Icon` (re-
+exported as `zigui.IconName`) is an `enum(u21)` whose **value is each glyph's PUA
+codepoint**, so rendering is just `glyphIndex(codepoint)` through the ordinary text
+path — icons are tintable and HiDPI-crisp for free, with **no new `DrawCommand`**.
+`font.drawIcon` rasterizes the glyph centered in a square box (same device-res
+coverage trick as `drawTextScaled`). `Context` gained a defaulted-null
+`icon_cache: ?*GlyphCache` (the app wires it next to `cache`; `TestEnv` sets it;
+when null, icons paint nothing — the safe fast path). View constructors:
+`Icon(.heart, 18, color_or_null)` (a `size`×`size` leaf; `null` color inherits
+`.foreground`) and `IconButton(.trash, 18, callback)` (a padded square tap target
+reusing `.callback`). Call sites rely on enum-literal inference, so the `IconName`
+type name is rarely spelled out. Subset/regenerate via `pyftsubset` + the codepoints
+in `icons.zig`; attribution in `assets/fonts/NOTICE.md`. (Tests: `view: Icon …`,
+`view: IconButton …`; `drawIcon: …` in `font.zig`.)
+
 ### Grids — `LazyVGrid` / `LazyHGrid` (composition, no new primitive)
 `LazyVGrid(columns, spacing, items, mapFn)` maps `items`→cells, chunks them into
 rows, and returns a `VStack` of `HStack`s; `LazyHGrid` is the transpose. Cells get

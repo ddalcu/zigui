@@ -10,19 +10,24 @@ const Allocator = std.mem.Allocator;
 
 pub const PositionedGlyph = struct {
     glyph: u16,
+    /// Face the glyph belongs to (the primary face or one of its fallbacks).
+    /// Glyph indices are per-face, so rasterize from this, not the line's face.
+    face: *const ttf.Font,
     /// Pen x at the glyph's origin (before its left-side bearing), in pixels.
     x: f32,
     advance: f32,
 };
 
-/// Measure the advance width (pixels) of a single line of text.
+/// Measure the advance width (pixels) of a single line of text. Each codepoint
+/// is resolved through the face's fallback chain, using the resolving face's own
+/// units-per-em scale (fonts differ), so fallback glyphs advance correctly.
 pub fn measureLineWidth(face: *const ttf.Font, text: []const u8, pixel_size: f32) f32 {
-    const scale = face.scaleForPixelSize(pixel_size);
     var width: f32 = 0;
     var it = codepoints(text);
     while (it.next()) |cp| {
-        const g = face.glyphIndex(cp);
-        width += @as(f32, @floatFromInt(face.advanceWidth(g))) * scale;
+        const r = face.resolve(cp);
+        const scale = r.face.scaleForPixelSize(pixel_size);
+        width += @as(f32, @floatFromInt(r.face.advanceWidth(r.glyph))) * scale;
     }
     return width;
 }
@@ -44,15 +49,15 @@ pub fn ascentPixels(face: *const ttf.Font, pixel_size: f32) f32 {
 /// Lay out a single line into positioned glyphs starting at pen x = `start_x`.
 /// Caller owns the returned slice.
 pub fn layoutLine(allocator: Allocator, face: *const ttf.Font, text: []const u8, pixel_size: f32, start_x: f32) ![]PositionedGlyph {
-    const scale = face.scaleForPixelSize(pixel_size);
     var out: std.ArrayList(PositionedGlyph) = .empty;
     errdefer out.deinit(allocator);
     var pen = start_x;
     var it = codepoints(text);
     while (it.next()) |cp| {
-        const g = face.glyphIndex(cp);
-        const adv = @as(f32, @floatFromInt(face.advanceWidth(g))) * scale;
-        try out.append(allocator, .{ .glyph = g, .x = pen, .advance = adv });
+        const r = face.resolve(cp);
+        const scale = r.face.scaleForPixelSize(pixel_size);
+        const adv = @as(f32, @floatFromInt(r.face.advanceWidth(r.glyph))) * scale;
+        try out.append(allocator, .{ .glyph = r.glyph, .face = r.face, .x = pen, .advance = adv });
         pen += adv;
     }
     return out.toOwnedSlice(allocator);

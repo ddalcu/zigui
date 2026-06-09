@@ -66,6 +66,11 @@ pub const Font = struct {
     ascent: i16,
     descent: i16,
     line_gap: i16,
+    /// Optional fallback face, consulted by `resolve` for codepoints this font
+    /// lacks (e.g. a monochrome emoji font behind a Latin UI font). The pointee
+    /// must outlive this font. Glyph indices are per-face, so callers must
+    /// rasterize each glyph from the face `resolve` returns — not this one.
+    fallback: ?*const Font = null,
 
     pub fn parse(data: []const u8) ParseError!Font {
         if (data.len < 12) return error.InvalidFont;
@@ -147,6 +152,23 @@ pub const Font = struct {
             if (format == 4 and best == null) best = .{ .off = sub_off, .format = 4 };
         }
         return best orelse error.UnsupportedFormat;
+    }
+
+    /// A codepoint resolved to the face that actually carries its glyph.
+    pub const Resolved = struct { face: *const Font, glyph: u16 };
+
+    /// Resolve a codepoint to a (face, glyph) pair: this font if it has the
+    /// glyph, else the `fallback` chain. Returns this font's .notdef (glyph 0)
+    /// when nothing has it. Since glyph indices are per-face, render the glyph
+    /// from the returned `face`, not necessarily `self`.
+    pub fn resolve(self: *const Font, codepoint: u21) Resolved {
+        const g = self.glyphIndex(codepoint);
+        if (g != 0) return .{ .face = self, .glyph = g };
+        if (self.fallback) |fb| {
+            const fg = fb.glyphIndex(codepoint);
+            if (fg != 0) return .{ .face = fb, .glyph = fg };
+        }
+        return .{ .face = self, .glyph = g };
     }
 
     /// Map a Unicode codepoint to a glyph index (0 = .notdef / missing).
@@ -582,6 +604,8 @@ fn windingInside(edges: []const Edge, sx: f32, sy: f32) bool {
 
 const testing = std.testing;
 pub const inter_ttf = @embedFile("inter_font");
+pub const icon_ttf = @embedFile("icon_font");
+pub const emoji_ttf = @embedFile("emoji_font");
 
 fn coverageSum(g: RasterGlyph) u64 {
     var s: u64 = 0;
@@ -594,6 +618,31 @@ test "ttf: parse Inter header" {
     try testing.expect(font.units_per_em >= 1000);
     try testing.expect(font.num_glyphs > 100);
     try testing.expect(font.ascent > 0);
+}
+
+test "ttf: emoji font parses and resolves via fallback chain" {
+    const inter = try Font.parse(inter_ttf);
+    var emoji = try Font.parse(emoji_ttf);
+    // The bundled emoji font carries a real glyph for U+1F600 (😀)…
+    try testing.expect(emoji.glyphIndex(0x1F600) != 0);
+    // …which Inter lacks, so resolve falls through to it.
+    try testing.expect(inter.glyphIndex(0x1F600) == 0);
+
+    var primary = inter;
+    primary.fallback = &emoji;
+    const r = primary.resolve(0x1F600);
+    try testing.expect(r.face == &emoji);
+    try testing.expect(r.glyph == emoji.glyphIndex(0x1F600));
+    // ASCII still resolves to the primary face.
+    const a = primary.resolve('A');
+    try testing.expect(a.face == &primary);
+    try testing.expect(a.glyph == inter.glyphIndex('A'));
+    // A rasterized emoji glyph actually inks pixels.
+    const scale = emoji.scaleForPixelSize(48);
+    const g = try emoji.rasterizeGlyph(testing.allocator, r.glyph, scale);
+    defer g.deinit(testing.allocator);
+    try testing.expect(g.width > 5 and g.height > 5);
+    try testing.expect(coverageSum(g) > 0);
 }
 
 test "ttf: cmap maps ASCII letters to nonzero glyphs" {

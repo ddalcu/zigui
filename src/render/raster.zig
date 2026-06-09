@@ -22,13 +22,32 @@ pub const Framebuffer = struct {
     pixels: []Color,
     allocator: Allocator,
 
+    /// A zero-size framebuffer holding no allocation. Pair with `ensureSize` to
+    /// grow it lazily and reuse the buffer across frames.
+    pub const empty: Framebuffer = .{ .width = 0, .height = 0, .pixels = &.{}, .allocator = undefined };
+
     pub fn init(allocator: Allocator, width: u32, height: u32) !Framebuffer {
         const px = try allocator.alloc(Color, width * height);
         @memset(px, Color.transparent);
         return .{ .width = width, .height = height, .pixels = px, .allocator = allocator };
     }
     pub fn deinit(self: *Framebuffer) void {
-        self.allocator.free(self.pixels);
+        if (self.pixels.len > 0) self.allocator.free(self.pixels);
+        self.* = .empty;
+    }
+
+    /// Resize for reuse: reallocates the pixel buffer only when the pixel count
+    /// actually changes, so steady-state frames (same window size) allocate
+    /// nothing. The contents are left undefined — call `clear` afterward.
+    pub fn ensureSize(self: *Framebuffer, allocator: Allocator, width: u32, height: u32) !void {
+        const need = @as(usize, width) * @as(usize, height);
+        if (need != self.pixels.len) {
+            if (self.pixels.len > 0) allocator.free(self.pixels);
+            self.pixels = try allocator.alloc(Color, need);
+        }
+        self.width = width;
+        self.height = height;
+        self.allocator = allocator;
     }
     pub fn clear(self: *Framebuffer, color: Color) void {
         @memset(self.pixels, color);
@@ -46,9 +65,10 @@ pub const Framebuffer = struct {
         self.pixels[i] = s.over(self.pixels[i]);
     }
 
-    /// Export to a tightly-packed RGBA8 buffer (caller owns the memory).
-    pub fn toRgba8Alloc(self: *const Framebuffer, allocator: Allocator) ![]u8 {
-        const out = try allocator.alloc(u8, self.width * self.height * 4);
+    /// Convert into a caller-provided tightly-packed RGBA8 buffer (reused across
+    /// frames). `out.len` must be `width * height * 4`.
+    pub fn toRgba8(self: *const Framebuffer, out: []u8) void {
+        std.debug.assert(out.len == self.width * self.height * 4);
         for (self.pixels, 0..) |c, i| {
             const p = c.toRgba8();
             out[i * 4 + 0] = p.r;
@@ -56,6 +76,12 @@ pub const Framebuffer = struct {
             out[i * 4 + 2] = p.b;
             out[i * 4 + 3] = p.a;
         }
+    }
+
+    /// Export to a freshly-allocated RGBA8 buffer (caller owns the memory).
+    pub fn toRgba8Alloc(self: *const Framebuffer, allocator: Allocator) ![]u8 {
+        const out = try allocator.alloc(u8, self.width * self.height * 4);
+        self.toRgba8(out);
         return out;
     }
 };

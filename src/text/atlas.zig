@@ -9,9 +9,12 @@ const ttf = @import("ttf.zig");
 const Allocator = std.mem.Allocator;
 
 pub const GlyphCache = struct {
-    const Key = struct { glyph: u16, size_milli: u32 };
+    // Glyph indices are per-face, so the face is part of the key: one cache can
+    // hold glyphs from the primary face and any fallback (emoji) faces.
+    const Key = struct { face: usize, glyph: u16, size_milli: u32 };
     const Map = std.AutoHashMapUnmanaged(Key, ttf.RasterGlyph);
 
+    /// Primary face — the default for `get` and what metrics callers read.
     face: *const ttf.Font,
     map: Map = .empty,
     allocator: Allocator,
@@ -26,15 +29,25 @@ pub const GlyphCache = struct {
         self.map.deinit(self.allocator);
     }
 
-    /// Get (rasterizing & caching on miss) the coverage bitmap for a glyph at a
-    /// pixel size. The returned pointer is valid until the cache is mutated for
-    /// the same size class or deinited.
+    /// Get (rasterizing & caching on miss) the coverage bitmap for a glyph of
+    /// the primary face at a pixel size. The returned pointer is valid until the
+    /// cache is mutated for the same size class or deinited.
     pub fn get(self: *GlyphCache, glyph: u16, pixel_size: f32) !*const ttf.RasterGlyph {
-        const key = Key{ .glyph = glyph, .size_milli = @intFromFloat(@round(pixel_size * 1000)) };
+        return self.getFace(self.face, glyph, pixel_size);
+    }
+
+    /// Like `get`, but for a glyph of an arbitrary `face` (e.g. a fallback emoji
+    /// face returned by `ttf.Font.resolve`). Rasterizes at that face's own scale.
+    pub fn getFace(self: *GlyphCache, face: *const ttf.Font, glyph: u16, pixel_size: f32) !*const ttf.RasterGlyph {
+        const key = Key{
+            .face = @intFromPtr(face),
+            .glyph = glyph,
+            .size_milli = @intFromFloat(@round(pixel_size * 1000)),
+        };
         const gop = try self.map.getOrPut(self.allocator, key);
         if (!gop.found_existing) {
-            const scale = self.face.scaleForPixelSize(pixel_size);
-            gop.value_ptr.* = try self.face.rasterizeGlyph(self.allocator, glyph, scale);
+            const scale = face.scaleForPixelSize(pixel_size);
+            gop.value_ptr.* = try face.rasterizeGlyph(self.allocator, glyph, scale);
         }
         return gop.value_ptr;
     }

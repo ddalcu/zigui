@@ -7,7 +7,10 @@
 
 const std = @import("std");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 0, .patch = 0 };
+/// The library version. `build.zig` reads it from `build.zig.zon` (the package
+/// manifest) and injects it here, so the manifest is the single source of truth
+/// — `zigui.version`, the `zig fetch` tag, and the manifest can never drift.
+pub const version = std.SemanticVersion.parse(@import("build_options").version) catch unreachable;
 
 // Foundation modules are re-exported here as they are implemented (TDD: a
 // module is referenced for test discovery only once it exists).
@@ -51,6 +54,7 @@ pub const ttf = @import("text/ttf.zig");
 pub const atlas = @import("text/atlas.zig");
 pub const shape = @import("text/shape.zig");
 pub const font = @import("text/font.zig");
+pub const icons = @import("icons.zig");
 pub const Font = font.Font;
 pub const GlyphCache = atlas.GlyphCache;
 pub const drawText = font.drawText;
@@ -72,9 +76,13 @@ pub const action = view.action;
 pub const actionCtx = view.actionCtx;
 pub const HitRegion = view.HitRegion;
 pub const dispatchTap = view.dispatchTap;
+pub const dispatchDoubleClick = view.dispatchDoubleClick;
+pub const dispatchTripleClick = view.dispatchTripleClick;
 pub const ScrollState = view.ScrollState;
 pub const ScrollRegion = view.ScrollRegion;
 pub const dispatchScroll = view.dispatchScroll;
+pub const setFrameTime = view.setFrameTime;
+pub const scrollbarsAnimating = view.scrollbarsAnimating;
 pub const dispatchDrag = view.dispatchDrag;
 pub const endDrag = view.endDrag;
 pub const render = view.render;
@@ -91,6 +99,15 @@ pub const focusedField = view.focusedField;
 pub const setFocus = view.setFocus;
 pub const clearFocus = view.clearFocus;
 pub const submitFocused = view.submitFocused;
+
+// Text-field context menu (right-click Cut/Copy/Paste/Select All).
+pub const ClipboardOps = view.ClipboardOps;
+pub const setClipboardOps = view.setClipboardOps;
+pub const fieldAt = view.fieldAt;
+pub const openContextMenu = view.openContextMenu;
+pub const closeContextMenu = view.closeContextMenu;
+pub const contextMenuOpen = view.contextMenuOpen;
+pub const hoverContextMenu = view.hoverContextMenu;
 
 // Public component constructors (also available via `zigui.components.*`).
 pub const components = @import("components.zig");
@@ -113,6 +130,9 @@ pub const TextFieldState = view.TextFieldState;
 pub const TextEditor = view.TextEditor;
 pub const Label = view.Label;
 pub const Image = view.Image;
+pub const Icon = view.Icon;
+pub const IconButton = view.IconButton;
+pub const IconName = view.IconName;
 pub const ScrollView = view.ScrollView;
 pub const ScrollViewState = view.ScrollViewState;
 pub const List = view.List;
@@ -138,4 +158,10 @@ pub const Material = view.Material;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("integration_test.zig");
+}
+
+test "version is parsed from the package manifest" {
+    // Derived from build.zig.zon via build_options; a malformed manifest version
+    // would have already failed the comptime parse. Guard against a 0.0.0 stub.
+    try std.testing.expect(version.major != 0 or version.minor != 0 or version.patch != 0);
 }

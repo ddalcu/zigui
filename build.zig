@@ -1,4 +1,8 @@
 const std = @import("std");
+// The package manifest is the single source of truth for the version. Read it
+// here and inject it into the module (below) as `build_options.version`, so
+// `zigui.version` always matches `build.zig.zon` and the `zig fetch` tag.
+const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -12,10 +16,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Inject the manifest version so `zigui.version` derives from build.zig.zon.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", manifest.version);
+    mod.addImport("build_options", options.createModule());
     // Bundle the default font (Inter, OFL) as an embeddable blob, importable as
     // `@embedFile("inter_font")` from anywhere in the module.
     mod.addAnonymousImport("inter_font", .{
         .root_source_file = b.path("assets/fonts/Inter.ttf"),
+    });
+    // Bundle the icon font (a subset of Lucide, ISC) the same way, importable as
+    // `@embedFile("icon_font")`. See `src/icons.zig` and `assets/fonts/NOTICE.md`.
+    mod.addAnonymousImport("icon_font", .{
+        .root_source_file = b.path("assets/fonts/icons.ttf"),
+    });
+    // Bundle the monochrome emoji fallback font (Noto Emoji, OFL), importable as
+    // `@embedFile("emoji_font")`. Wired as a fallback face for glyphs Inter
+    // lacks; see `assets/fonts/NOTICE.md`.
+    mod.addAnonymousImport("emoji_font", .{
+        .root_source_file = b.path("assets/fonts/NotoEmoji.ttf"),
     });
 
     // ---- tests ------------------------------------------------------------

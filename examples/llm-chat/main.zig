@@ -647,11 +647,11 @@ fn setupTray(gpa: std.mem.Allocator, st: *AppState) void {
     g_tray = created;
     g_tray_status = st.status;
     const m = g_tray.?.menu();
-    m.addItem("Open", zigui.action(app.showWindow));
-    m.addItem("New Chat", zigui.actionCtx(AppState, st, AppState.newChat));
-    m.addItem("Settings", zigui.actionCtx(AppState, st, openSettingsFromTray));
+    _ = m.addItem("Open", zigui.action(app.showWindow));
+    _ = m.addItem("New Chat", zigui.actionCtx(AppState, st, AppState.newChat));
+    _ = m.addItem("Settings", zigui.actionCtx(AppState, st, openSettingsFromTray));
     m.addSeparator();
-    m.addItem("Quit", zigui.action(app.quit));
+    _ = m.addItem("Quit", zigui.action(app.quit));
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

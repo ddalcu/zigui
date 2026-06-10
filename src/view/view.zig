@@ -728,7 +728,6 @@ pub fn ScrollViewState(scroll_state: *ScrollState, content: View) View {
 // List, LazyVGrid/LazyHGrid, TabView, Sidebar/RadioGroup/Table moved to
 // `components/{list,grid,tabs,collections}.zig` (re-exported via the facade).
 
-
 pub fn VStack(children: anytype) View {
     return makeStack(.vertical, 8, .center, children);
 }

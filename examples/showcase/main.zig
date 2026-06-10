@@ -166,12 +166,12 @@ const swatches = [_]zigui.Color{
 };
 
 const icon_gallery = [_]zigui.IconName{
-    .home, .search,       .settings,    .user, .users,    .heart,
-    .star, .bell,         .mail,        .calendar, .clock, .folder,
-    .file, .image,        .download,    .upload, .trash,  .edit,
-    .copy, .share,        .lock,        .unlock, .eye,    .eye_off,
-    .play, .pause,        .sun,         .moon,  .sparkles, .zap,
-    .cpu,  .shield_check, .badge_check, .info,  .check,    .send,
+    .home, .search,       .settings,    .user,     .users,    .heart,
+    .star, .bell,         .mail,        .calendar, .clock,    .folder,
+    .file, .image,        .download,    .upload,   .trash,    .edit,
+    .copy, .share,        .lock,        .unlock,   .eye,      .eye_off,
+    .play, .pause,        .sun,         .moon,     .sparkles, .zap,
+    .cpu,  .shield_check, .badge_check, .info,     .check,    .send,
 };
 
 // A 64×64 RGBA gradient built at comptime so the `Image` component has something
@@ -580,9 +580,7 @@ fn body(st: *AppState) zigui.View {
 
 // ── Headless screenshot (no window) ───────────────────────────────────────────
 
-fn writeBmp(path: [:0]const u8, fb: *const zigui.Framebuffer) void {
-    const w = fb.width;
-    const h = fb.height;
+fn writeBmpRgba(path: [:0]const u8, rgba: []const u8, w: u32, h: u32) void {
     const stride = w * 3 + (4 - (w * 3) % 4) % 4;
     const img_size = stride * h;
     const f = cstdio.fopen(path.ptr, "wb") orelse return;
@@ -607,16 +605,22 @@ fn writeBmp(path: [:0]const u8, fb: *const zigui.Framebuffer) void {
         y -= 1; // BMP rows are bottom-up
         var x: u32 = 0;
         while (x < w) : (x += 1) {
-            const px = fb.at(x, y).toRgba8();
-            scanline[x * 3 + 0] = px.b;
-            scanline[x * 3 + 1] = px.g;
-            scanline[x * 3 + 2] = px.r;
+            const px = rgba[(y * w + x) * 4 ..];
+            scanline[x * 3 + 0] = px[2];
+            scanline[x * 3 + 1] = px[1];
+            scanline[x * 3 + 2] = px[0];
         }
         _ = cstdio.fwrite(scanline.ptr, 1, stride, f);
     }
 }
 
-fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8, bench: usize) !void {
+fn writeBmp(path: [:0]const u8, fb: *const zigui.Framebuffer) void {
+    const rgba = fb.toRgba8Alloc(std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(rgba);
+    writeBmpRgba(path, rgba, fb.width, fb.height);
+}
+
+fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8, bench: usize, use_gpu: bool) !void {
     const w: u32 = 900;
     const h: u32 = 640;
     const theme = themeProvider();
@@ -643,6 +647,38 @@ fn screenshot(gpa: std.mem.Allocator, st: *AppState, out: [:0]const u8, bench: u
     const full = zigui.Rect{ .x = 0, .y = 0, .width = @floatFromInt(w), .height = @floatFromInt(h) };
     try canvas.fillRect(full, theme.colors.window_background);
     try zigui.render(&ctx, root, full, &canvas);
+
+    // `--gpu`: render the same command list through the real SDL_GPU pipeline
+    // (offscreen, no window) instead of the software rasterizer — the visual
+    // verification path for the GPU backend.
+    if (use_gpu) {
+        _ = app.c.SDL_Init(app.c.SDL_INIT_VIDEO);
+        var g = app.gpu.Gpu.init(gpa, null) orelse return error.NoGpuBackend;
+        defer g.deinit();
+        const rgba = g.renderToRgba(
+            arena.allocator(),
+            canvas.commands.items,
+            theme.colors.window_background,
+            w,
+            h,
+        ) orelse return error.GpuRenderFailed;
+        defer gpa.free(rgba);
+        writeBmpRgba(out, rgba, w, h);
+        std.debug.print("wrote {s} ({d}x{d}, gpu: {s})\n", .{ out, w, h, g.driverName() });
+        // `--bench N` on the GPU path: each iteration waits for the GPU and
+        // reads the pixels back, so this is a pessimistic full-sync number.
+        if (bench > 0) {
+            const t0 = cstdio.clock();
+            var i: usize = 0;
+            while (i < bench) : (i += 1) {
+                const px = g.renderToRgba(arena.allocator(), canvas.commands.items, theme.colors.window_background, w, h) orelse return error.GpuRenderFailed;
+                gpa.free(px);
+            }
+            const elapsed: f64 = @as(f64, @floatFromInt(cstdio.clock() - t0)) / @as(f64, @floatFromInt(cstdio.CLOCKS_PER_SEC));
+            std.debug.print("gpu: {d:.2} ms/frame over {d} frames ({d} commands)\n", .{ elapsed * 1000.0 / @as(f64, @floatFromInt(bench)), bench, canvas.commands.items.len });
+        }
+        return;
+    }
 
     var fb = try zigui.Framebuffer.init(gpa, w, h);
     defer fb.deinit();
@@ -742,6 +778,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var shot: ?[:0]const u8 = null;
     var section: i64 = 0;
     var bench: usize = 0;
+    var use_gpu = false;
     var it = try std.process.Args.iterateAllocator(init.args, alloc);
     defer it.deinit();
     _ = it.next(); // argv[0]
@@ -756,6 +793,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (it.next()) |n| st.accent.set(std.fmt.parseInt(i64, n, 10) catch 0);
         } else if (std.mem.eql(u8, a, "--bench")) {
             if (it.next()) |n| bench = std.fmt.parseInt(usize, n, 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--gpu")) {
+            use_gpu = true;
         } else if (std.mem.eql(u8, a, "--sheet")) {
             st.show_sheet.set(true);
         } else if (std.mem.eql(u8, a, "--alert")) {
@@ -769,7 +808,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Headless: honor the explicit --dark/--theme flags instead of probing
         // the OS (SDL isn't initialized on the screenshot path).
         st.os_synced = true;
-        return screenshot(alloc, &st, out, bench);
+        return screenshot(alloc, &st, out, bench, use_gpu);
     }
 
     try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660 }, body);

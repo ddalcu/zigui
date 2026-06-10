@@ -9,11 +9,15 @@ implemented. User-facing docs live in [README.md](README.md); design rationale i
 ## TL;DR
 
 `zigui` is a SwiftUI-like UI library in **pure Zig 0.16**. The core (geometry,
-color, state, layout, theme, text, canvas, software rasterizer, view layer,
-components) has **no C dependencies** and is fully unit-tested headlessly. SDL3
-links only into example executables (`src/app.zig`). The on-screen renderer is a
-**CPU software rasterizer presented via SDL3** (wgpu is the planned upgrade —
-see PRD §0/§9; the `Canvas` command list is the seam).
+color, state, layout, theme, text, canvas, software rasterizer, GPU scene
+translation, view layer, components) has **no C dependencies** and is fully
+unit-tested headlessly. SDL3 links only into example executables (`src/app.zig`
++ `src/gpu/gpu.zig`). On screen, rendering is **GPU-accelerated via SDL_GPU**
+(Metal on macOS, Vulkan on Linux/Windows) with an automatic fallback to the
+**CPU software rasterizer** presented through an SDL streaming texture — both
+backends consume the same `Canvas` command list and produce output identical to
+within 1 LSB, so tests/CI stay on the software path. See
+[GPU backend](#gpu-backend--sdl_gpu-metalvulkan-with-software-fallback).
 
 The post-v0 feature set — grids, tabs, navigation, modals/overlays, animation,
 materials/blur, accessibility, and HiDPI — is **implemented**; see
@@ -34,6 +38,10 @@ docker build -t zigui-test .                 # run the full suite on Linux
 # sips -s format png /tmp/sc.bmp --out /tmp/sc.png   # to view on macOS
 # --bench N re-rasterizes the frame N times and prints ms/frame (build with
 # -Doptimize=ReleaseFast) — use it when touching src/render/raster.zig.
+# --gpu (showcase only) renders the frame through the real SDL_GPU pipeline
+# offscreen (works headlessly on macOS/Metal) — THE verification loop when
+# touching src/gpu/ or src/render/gpu_scene.zig; diff the BMP against the
+# software output. Combine with --bench N for a full-sync GPU ms/frame.
 ```
 
 There are exactly **two examples**: `examples/showcase` (the kitchen-sink gallery
@@ -81,9 +89,10 @@ View (value tree)               src/view/view.zig
        └─ engine.arrange → LayoutResult (frames)   src/layout/engine.zig (+ stack.zig)
             └─ paint co-walks View + LayoutResult, emitting DrawCommands
                  → Canvas (command list)           src/render/canvas.zig
-                      └─ raster.render → Framebuffer (RGBA)  src/render/raster.zig  [tests/headless]
-                      └─ (future) wgpu backend                                       [on-screen GPU]
-app.zig (SDL3): build → render → upload framebuffer to texture → present → events
+                      └─ raster.render → Framebuffer (RGBA)  src/render/raster.zig  [tests/headless + sw fallback]
+                      └─ gpu_scene.translate → Scene (instances/atlas/steps)  src/render/gpu_scene.zig  [pure, tested]
+                           └─ gpu.Gpu.frame → SDL_GPU passes → swapchain      src/gpu/gpu.zig  [on-screen GPU]
+app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → present → events
 ```
 
 | File | Responsibility |
@@ -94,12 +103,14 @@ app.zig (SDL3): build → render → upload framebuffer to texture → present �
 | `src/layout/stack.zig` | `distribute()` — the stack space-allocation math. Pure. |
 | `src/render/canvas.zig` | `DrawCommand` union + `Canvas` builder. The renderer-agnostic seam. |
 | `src/render/raster.zig` | `Framebuffer` + software rasterizer (SDF AA). Where new draw primitives get pixels. |
+| `src/render/gpu_scene.zig` | Pure GPU scene translation: `DrawCommand`s → packed `Instance` array + shelf-packed glyph/image `Atlas` + `Step` list (draw runs split at blurs). Headless-tested; no C. |
+| `src/gpu/gpu.zig` | The SDL_GPU shell (app layer, links C like `app.zig`): device/pipelines/textures, replays a translated `Scene`, offscreen `renderToRgba` for verification. Shaders in `src/gpu/shaders/` (GLSL→committed SPIR-V via `compile.sh`, plus runtime-compiled MSL twins). |
 | `src/text/*` | `ttf` (parser+rasterizer), `atlas` (`GlyphCache`), `shape` (measure/wrap), `font` (`drawText`). |
 | `src/theme/theme.zig` | `Theme`, `Palette`, `Metrics`, `Typography`, and the **`Painter`** vtable + `Surface`/`ControlState`/`Role`. The color-scheme/painter vocabulary. |
 | `src/theme/{macos,win2000,windows10,kde}.zig` | The four built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (glass / bevels / flat / Breeze). |
 | `src/theme/registry.zig` | `Family` enum + `forScheme(family, scheme)` — picks a `Theme` for the OS appearance (light-only families ignore dark). |
 | `src/state/*` | `State(T)`, `Binding(T)`, `Observer`. |
-| `src/app.zig` | SDL3 window/event loop. **Only file that links C.** Where overlays, animation ticking, HiDPI scale, key routing, and `systemTheme()`/`colorScheme()` (OS dark/light) get wired. |
+| `src/app.zig` | SDL3 window/event loop. Links C (the only other C file is `src/gpu/gpu.zig`, which it owns). Where overlays, animation ticking, HiDPI scale, key routing, GPU-vs-software backend selection, and `systemTheme()`/`colorScheme()` (OS dark/light) get wired. |
 | `src/components.zig`, `src/zigui.zig` | Public re-exports. |
 
 ### Key invariants
@@ -152,6 +163,67 @@ All of these ship, are headless-tested, and are re-exported from `zigui.zig` /
 exercises nav + tabs + sheet + material + a11y together; `examples/showcase`
 demos them in a real window. Notes below record *how* each is wired and the
 deliberate deviations from the original plan, so you can extend safely.
+
+### GPU backend — SDL_GPU (Metal/Vulkan) with software fallback
+On-screen rendering now goes through **SDL3's GPU API** (Metal on macOS, Vulkan
+on Linux/Windows; D3D12 needs DXIL blobs, a follow-up — Windows uses its Vulkan
+driver meanwhile), replacing the framebuffer-upload present path while keeping
+it as the automatic fallback (`Config.gpu = false` or `ZIGUI_SOFTWARE=1` forces
+it; device/swapchain failure falls back silently). No new dependencies: the C
+surface is `src/gpu/gpu.zig`, owned by `app.zig`, sharing its `@cImport`.
+
+The split keeps the repo's testing philosophy intact:
+- **`src/render/gpu_scene.zig` (core, pure, tested)** — `translate(arena,
+  commands, atlas, w, h)` turns the command list into (a) a flat `Instance`
+  array (one 144-byte extern struct per draw command: padded quad, shape rect,
+  colors, gradient/line endpoints, atlas UVs, resolved clip, kind/params), (b)
+  a shelf-packed RGBA8 `Atlas` keyed by stable coverage/pixel pointers (the
+  `GlyphCache` owns glyph bitmaps app-lifetime, so pointer = content), with
+  pending-upload staging and grow/reset recovery (`error.AtlasFull` → caller
+  grows ×2 up to 8192 and re-translates), and (c) a `Step` list — draw runs
+  split wherever a `blur_rect` must sample what's already rendered. The clip
+  stack is folded per instance into the axis-aligned intersection of all clip
+  rects + the innermost *rounded* clip (matches the rasterizer except nested
+  rounded clips, which components never emit).
+- **`src/gpu/gpu.zig` (app layer, C)** — device + 3 pipelines + replay. One
+  *unified* instanced pipeline draws every primitive kind as a 4-vertex
+  triangle-strip quad; the fragment shader evaluates the **same SDFs as
+  `raster.zig`** (`clamp(0.5 - sd, 0, 1)` AA, centered strokes, round-capped
+  segments, clamped gradient lerp) and samples the atlas for glyphs (coverage
+  in alpha, tinted) and images — so one draw call per `Step.draw`. Blend state
+  is straight-alpha `over` (dst stays opaque from the clear, matching CPU
+  compositing exactly). `Step.blur` = H box-blur pass (scene→scratch) + V-blur
+  + `tint.over` composite masked by the rounded rect and clip (mirrors
+  `boxAverage` incl. region-clamped windows). Frames render into an offscreen
+  scene texture, then `SDL_BlitGPUTexture` to the swapchain.
+- **Shaders** in `src/gpu/shaders/`: GLSL sources compiled to **committed
+  SPIR-V blobs** by `compile.sh` (needs `glslc`; only when shaders change) and
+  hand-written **MSL twins** compiled by Metal at runtime — keep both in sync.
+  SDL_GPU binding conventions: SPIR-V vertex uniforms `set=1`, fragment
+  textures `set=2`, fragment uniforms `set=3`; MSL uses `[[stage_in]]` +
+  `[[buffer(0)]]`/`[[texture(0)]]`. NDC is +Y-up on **all** backends (SDL
+  converts for Vulkan), so both sources share the same `-ndc.y` flip.
+
+Output parity: verified pixel-identical to the rasterizer (max 1 LSB/channel)
+across every showcase section, dark mode, all theme families, sheets/alerts,
+and materials via `showcase --screenshot --gpu` diffs. Known benign exception:
+GPU rasterizers snap edges to a ~1/256-px subpixel grid, so a glyph whose
+origin lies within ~1/512 px of a pixel-center boundary may round to the
+neighboring column (<0.01% of pixels, still crisp). Perf at Retina 1960×1320:
+~1.3 ms/frame vs ~8.9 ms software (the GPU number is mostly CPU-side
+build/layout/translate). Steady-state allocations: instance/transfer buffers
+and atlas persist; per-frame data lives in the frame arena.
+
+Gotchas for future work here:
+- `Atlas.pendingUploads()` slices arena memory — consume + `clearPending()`
+  within the frame; never hold across frames.
+- `translate` retries must happen *before* `upload` (a grow resets packing).
+- Don't sample a texture that's the current render-pass target: blur ends the
+  scene pass before H reads the scene texture (the pass-break exists for this).
+- A frame whose *first* command is a blur still needs the scene cleared first
+  (`Encoder.ensureCleared`).
+- The `--gpu` screenshot path works headlessly on macOS (Metal needs no
+  window/server) — Linux CI without Vulkan falls back, so don't gate CI on it.
 
 ### Icons — `Icon` / `IconButton` (bundled icon font, reuses the glyph path)
 A second embedded font (`assets/fonts/icons.ttf`, a ~50-glyph subset of **Lucide**,
@@ -310,7 +382,9 @@ respects the clip stack. `Material{ultra_thin, thin, regular, thick}` → `{tint
 sigma}` via `Material.spec()`; `Fill.material` + `.backgroundMaterial(m)` emit the
 blur. Because the rasterizer runs commands in order, a material background frosts
 whatever was drawn beneath it (earlier siblings / parent bg), not its own children.
-Keep `blur_rect` backend-neutral: a future wgpu backend samples the framebuffer.
+`blur_rect` is backend-neutral: the GPU backend implements it as an H box-blur
+pass into a scratch texture + a V-blur-and-tint composite pass (see the GPU
+section below).
 
 ### Animation — `src/animation.zig` (dt-injected)
 `Easing{linear, ease_in, ease_out, ease_in_out}` + `apply(t)`, `Tween`, and
@@ -438,7 +512,9 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
 - Readability over cleverness (it's an open-source teaching codebase). Match the
   surrounding comment density and naming. Avoid heavy comptime.
 - Colors always go through `multiplyAlpha(ctx.opacity)` when painting.
-- New shapes/effects: add a `DrawCommand` and handle it in **both** the software
-  rasterizer now and (eventually) the wgpu backend — keep command semantics
-  backend-neutral.
+- New shapes/effects: add a `DrawCommand` and handle it in **both** backends —
+  the software rasterizer (`render/raster.zig`) and the GPU path
+  (`render/gpu_scene.zig` + the shaders in `src/gpu/shaders/`, GLSL **and** MSL,
+  then re-run `compile.sh`) — keeping command semantics backend-neutral. Verify
+  with `showcase --screenshot --gpu` diffed against the software BMP.
 - Run `zig build test` after every change; keep it green.

@@ -1,12 +1,13 @@
 //! The zigui runtime: opens an OS window via SDL3, drives an event loop, and
-//! presents frames. Rendering goes through the pure-Zig software rasterizer
-//! (the `Canvas` command list is uploaded to an SDL streaming texture). This is
-//! the v0 backend; because drawing is expressed as a command list, the GPU
-//! (wgpu) backend can be slotted in later without touching components.
+//! presents frames. Rendering prefers the SDL_GPU backend (`src/gpu/gpu.zig`:
+//! Metal on macOS, Vulkan on Linux/Windows) and falls back to the pure-Zig
+//! software rasterizer (the `Canvas` command list rasterized on the CPU and
+//! uploaded to an SDL streaming texture) when no GPU is available — same
+//! command list, same output, so apps never notice which backend ran.
 //!
-//! This file is the *only* part of zigui that links SDL/C. It is compiled into
-//! application executables, never into the core library or its test suite — so
-//! `zig build test` stays headless and works in Docker.
+//! This file and `gpu/gpu.zig` are the only parts of zigui that link SDL/C.
+//! They are compiled into application executables, never into the core library
+//! or its test suite — so `zig build test` stays headless and works in Docker.
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -14,6 +15,8 @@ const zigui = @import("zigui");
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
 });
+
+pub const gpu = @import("gpu/gpu.zig");
 
 pub const Config = struct {
     title: [:0]const u8 = "zigui",
@@ -24,6 +27,11 @@ pub const Config = struct {
     /// alive in the tray) instead of quitting. Use with a `Tray` that offers a
     /// way back (e.g. an "Open" entry) and a "Quit". ⌘Q still quits.
     hide_on_close: bool = false,
+    /// Render via the SDL_GPU backend (Metal/Vulkan) when available, falling
+    /// back to the software rasterizer when it isn't. Set false to force the
+    /// software path; the `ZIGUI_SOFTWARE` environment variable does the same
+    /// at runtime.
+    gpu: bool = true,
 };
 
 pub const Error = error{ SdlInit, TrayInit };
@@ -208,6 +216,88 @@ fn clipboardPaste(f: *zigui.TextFieldState) void {
 }
 
 // ---------------------------------------------------------------------------
+// File dialog (SDL3's native open-file dialog: NSOpenPanel / IFileDialog /
+// XDG portal). Asynchronous: the OS panel runs alongside our loop and SDL
+// invokes the callback later — possibly on another thread — so the callback
+// only copies the path into a static buffer and pushes a user event to wake
+// `SDL_WaitEvent`; the app polls `takeFileDialogResult` from its per-frame
+// hook/body. One dialog at a time.
+// ---------------------------------------------------------------------------
+
+/// A dialog file filter, e.g. `.{ .name = "WAV audio", .pattern = "wav" }`.
+/// `pattern` is a semicolon-separated extension list without dots ("wav;mp3").
+pub const FileFilter = c.SDL_DialogFileFilter;
+
+pub const FileDialogResult = union(enum) {
+    /// No dialog finished since the last take (still open, or none shown).
+    none,
+    /// The user canceled (or the dialog failed).
+    canceled,
+    /// The user picked a file; caller owns the path.
+    picked: []u8,
+};
+
+var g_dialog_open: bool = false; // main thread only: a dialog is showing
+var g_dialog_done: std.atomic.Value(bool) = .init(false);
+var g_dialog_path_len: usize = 0; // 0 = canceled; guarded by g_dialog_done
+var g_dialog_path_buf: [4096]u8 = undefined;
+
+fn fileDialogThunk(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, filter: c_int) callconv(.c) void {
+    _ = userdata;
+    _ = filter;
+    g_dialog_path_len = 0;
+    if (filelist != null and filelist[0] != null) {
+        const path = std.mem.span(filelist[0]);
+        const n = @min(path.len, g_dialog_path_buf.len);
+        @memcpy(g_dialog_path_buf[0..n], path[0..n]);
+        g_dialog_path_len = n;
+    }
+    g_dialog_done.store(true, .release);
+    // Wake the (possibly blocked) event loop so the app polls the result.
+    var ev = std.mem.zeroes(c.SDL_Event);
+    ev.type = c.SDL_EVENT_USER;
+    _ = c.SDL_PushEvent(&ev);
+}
+
+/// Show the native "Open File" dialog (single file). Returns false if one is
+/// already open. `filters` must point at memory that outlives the dialog (a
+/// global/comptime slice is the easy way) — SDL holds the pointer until the
+/// user dismisses the panel. Poll `takeFileDialogResult` each frame for the
+/// outcome. Call from the main thread.
+pub fn openFileDialog(filters: []const FileFilter, default_location: ?[*:0]const u8) bool {
+    if (g_dialog_open) return false;
+    g_dialog_open = true;
+    g_dialog_done.store(false, .release);
+    c.SDL_ShowOpenFileDialog(
+        fileDialogThunk,
+        null,
+        g_window,
+        if (filters.len > 0) filters.ptr else null,
+        @intCast(filters.len),
+        default_location orelse null,
+        false, // allow_many
+    );
+    return true;
+}
+
+/// Whether an open-file dialog is currently showing (result not yet taken).
+pub fn fileDialogOpen() bool {
+    return g_dialog_open;
+}
+
+/// Collect the finished dialog's outcome, once. Returns `.none` while the
+/// dialog is still up (or when none was shown); `.picked` hands the caller an
+/// allocator-owned copy of the chosen path. Call from the main thread.
+pub fn takeFileDialogResult(allocator: std.mem.Allocator) FileDialogResult {
+    if (!g_dialog_open) return .none;
+    if (!g_dialog_done.load(.acquire)) return .none;
+    g_dialog_open = false;
+    if (g_dialog_path_len == 0) return .canceled;
+    const copy = allocator.dupe(u8, g_dialog_path_buf[0..g_dialog_path_len]) catch return .canceled;
+    return .{ .picked = copy };
+}
+
+// ---------------------------------------------------------------------------
 // System tray / menu bar (cross-platform via SDL3's native tray API:
 // NSStatusItem on macOS, Shell_NotifyIcon on Windows, StatusNotifierItem on
 // Linux). The icon is an `SDL_Surface` — so it can be drawn with zigui's own
@@ -384,11 +474,19 @@ pub fn run(
     };
     defer c.SDL_DestroyWindow(window);
 
-    const renderer = c.SDL_CreateRenderer(window, null) orelse {
+    // Prefer the GPU backend; when device/swapchain creation fails (no Vulkan
+    // driver, headless CI, ZIGUI_SOFTWARE set) fall back to the software
+    // rasterizer presented through an SDL streaming texture.
+    const want_gpu = cfg.gpu and c.SDL_getenv("ZIGUI_SOFTWARE") == null;
+    var gpu_backend: ?gpu.Gpu = if (want_gpu) gpu.Gpu.init(gpa, window) else null;
+    defer if (gpu_backend) |*g| g.deinit();
+    if (gpu_backend) |*g| std.log.info("zigui: rendering via SDL_GPU ({s})", .{g.driverName()});
+
+    const renderer: ?*c.SDL_Renderer = if (gpu_backend != null) null else c.SDL_CreateRenderer(window, null) orelse {
         std.log.err("SDL_CreateRenderer failed: {s}", .{c.SDL_GetError()});
         return Error.SdlInit;
     };
-    defer c.SDL_DestroyRenderer(renderer);
+    defer if (renderer) |r| c.SDL_DestroyRenderer(r);
 
     _ = c.SDL_StartTextInput(window);
 
@@ -459,7 +557,8 @@ pub fn run(
     const Frame = struct {
         gpa: std.mem.Allocator,
         window: *c.SDL_Window,
-        renderer: *c.SDL_Renderer,
+        renderer: ?*c.SDL_Renderer,
+        gpu_backend: ?*gpu.Gpu,
         cache: *zigui.GlyphCache,
         icon_cache: *zigui.GlyphCache,
         cfg: Config,
@@ -536,28 +635,35 @@ pub fn run(
             // fill_rrect would just re-rasterize every pixel through the SDF path.
             zigui.renderScaled(&ctx, root, .{ .x = 0, .y = 0, .width = @floatFromInt(lw), .height = @floatFromInt(lh) }, scale, &canvas) catch {};
 
-            // Persistent framebuffer + RGBA buffer: reallocated only when the pixel
-            // size changes, so a steady-state frame does zero pixel-buffer allocation.
-            fr.fb.ensureSize(fr.gpa, uw, uh) catch return false;
-            fr.fb.clear(theme.colors.window_background);
-            zigui.raster.render(arena, fr.fb, canvas.commands.items) catch return false;
-            const need: usize = @as(usize, uw) * @as(usize, uh) * 4;
-            if (fr.rgba.*.len != need) {
-                if (fr.rgba.*.len > 0) fr.gpa.free(fr.rgba.*);
-                fr.rgba.* = fr.gpa.alloc(u8, need) catch return false;
-            }
-            fr.fb.toRgba8(fr.rgba.*);
+            if (fr.gpu_backend) |g| {
+                // GPU backend: translate + replay the command list on the GPU.
+                if (!g.frame(arena, canvas.commands.items, theme.colors.window_background)) return false;
+            } else {
+                // Software backend. Persistent framebuffer + RGBA buffer:
+                // reallocated only when the pixel size changes, so a
+                // steady-state frame does zero pixel-buffer allocation.
+                const rend = fr.renderer.?;
+                fr.fb.ensureSize(fr.gpa, uw, uh) catch return false;
+                fr.fb.clear(theme.colors.window_background);
+                zigui.raster.render(arena, fr.fb, canvas.commands.items) catch return false;
+                const need: usize = @as(usize, uw) * @as(usize, uh) * 4;
+                if (fr.rgba.*.len != need) {
+                    if (fr.rgba.*.len > 0) fr.gpa.free(fr.rgba.*);
+                    fr.rgba.* = fr.gpa.alloc(u8, need) catch return false;
+                }
+                fr.fb.toRgba8(fr.rgba.*);
 
-            if (fr.texture.* == null or fr.tex_w.* != pw or fr.tex_h.* != ph) {
-                if (fr.texture.*) |t| c.SDL_DestroyTexture(t);
-                fr.texture.* = c.SDL_CreateTexture(fr.renderer, c.SDL_PIXELFORMAT_ABGR8888, c.SDL_TEXTUREACCESS_STREAMING, pw, ph);
-                fr.tex_w.* = pw;
-                fr.tex_h.* = ph;
+                if (fr.texture.* == null or fr.tex_w.* != pw or fr.tex_h.* != ph) {
+                    if (fr.texture.*) |t| c.SDL_DestroyTexture(t);
+                    fr.texture.* = c.SDL_CreateTexture(rend, c.SDL_PIXELFORMAT_ABGR8888, c.SDL_TEXTUREACCESS_STREAMING, pw, ph);
+                    fr.tex_w.* = pw;
+                    fr.tex_h.* = ph;
+                }
+                _ = c.SDL_UpdateTexture(fr.texture.*, null, fr.rgba.*.ptr, @intCast(uw * 4));
+                _ = c.SDL_RenderClear(rend);
+                _ = c.SDL_RenderTexture(rend, fr.texture.*, null, null);
+                _ = c.SDL_RenderPresent(rend);
             }
-            _ = c.SDL_UpdateTexture(fr.texture.*, null, fr.rgba.*.ptr, @intCast(uw * 4));
-            _ = c.SDL_RenderClear(fr.renderer);
-            _ = c.SDL_RenderTexture(fr.renderer, fr.texture.*, null, null);
-            _ = c.SDL_RenderPresent(fr.renderer);
 
             if (g_frame_log) {
                 const t1 = c.SDL_GetPerformanceCounter();
@@ -588,6 +694,7 @@ pub fn run(
         .gpa = gpa,
         .window = window,
         .renderer = renderer,
+        .gpu_backend = if (gpu_backend) |*g| g else null,
         .cache = &cache,
         .icon_cache = &icon_cache,
         .cfg = cfg,

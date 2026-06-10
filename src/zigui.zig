@@ -31,6 +31,7 @@ pub const Canvas = canvas.Canvas;
 pub const DrawCommand = canvas.DrawCommand;
 pub const raster = @import("render/raster.zig");
 pub const Framebuffer = raster.Framebuffer;
+pub const gpu_scene = @import("render/gpu_scene.zig");
 
 pub const observe = @import("state/observe.zig");
 pub const Observer = observe.Observer;

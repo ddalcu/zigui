@@ -44,12 +44,39 @@ jobs:
       - name: Render UI screenshot (headless, no window)
         continue-on-error: true
         run: ./zig-out/bin/showcase --screenshot "zigui-showcase.bmp"
-      - name: Upload screenshot
+      # Render the same frame through the real SDL_GPU pipeline (the macOS
+      # arm64 runners expose a paravirtualized Metal device) and require it to
+      # match the software rasterizer. Tolerance: GPU rasterizers snap edges to
+      # a ~1/256px subpixel grid, so a stray glyph row may round differently —
+      # allow <0.1% of channels off by more than 2/255, fail otherwise.
+      # continue-on-error because the runner's virtual GPU is outside our control.
+      - name: Render GPU screenshot + diff vs software
+        continue-on-error: true
+        run: |
+          ./zig-out/bin/showcase --screenshot "zigui-showcase-gpu.bmp" --gpu
+          python3 - <<'EOF'
+          import struct, sys
+          def readbmp(p):
+              d = open(p, 'rb').read()
+              off = struct.unpack('<I', d[10:14])[0]
+              w = struct.unpack('<i', d[18:22])[0]
+              h = struct.unpack('<i', d[22:26])[0]
+              return d[off:], w, h
+          a, w, h = readbmp('zigui-showcase.bmp')
+          b, _, _ = readbmp('zigui-showcase-gpu.bmp')
+          stride = (w * 3 + 3) // 4 * 4
+          bad = sum(1 for y in range(h) for i in range(w * 3)
+                    if abs(a[y*stride+i] - b[y*stride+i]) > 2)
+          pct = 100 * bad / (w * h * 3)
+          print(f"GPU vs software: {bad} channels off by >2 ({pct:.4f}%)")
+          sys.exit(0 if pct < 0.1 else 1)
+          EOF
+      - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: showcase-screenshot
-          path: "zigui-showcase.bmp"
+          path: "zigui-showcase*.bmp"
           if-no-files-found: warn
 
   # Reproduce the Linux test run inside Docker (mirrors local `docker build`).

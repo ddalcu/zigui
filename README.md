@@ -101,18 +101,21 @@ To author your own look, implement the `Painter` methods (`button`, `field`,
 | Theme | five families (macOS, Windows 10, Windows 2000, KDE Plasma, Material), light/dark, fully tokenized |
 | 2D drawing | retained `Canvas` command list |
 | Renderer (tests / headless) | **pure-Zig software rasterizer** (SDF anti-aliasing) |
-| Renderer (on-screen) | software rasterizer presented via **SDL3** |
+| Renderer (on-screen) | **GPU via SDL_GPU** — Metal on macOS, Vulkan on Linux/Windows — with automatic software fallback |
 | Windowing / input | **SDL3** |
 
 The **core** (geometry, color, state, layout, theme, view tree, text, canvas,
-software rasterizer, components) is pure Zig with **no C dependencies** — the
-entire test suite runs headless on macOS, Linux, and Windows.
+software rasterizer, GPU scene translation, components) is pure Zig with **no C
+dependencies** — the entire test suite runs headless on macOS, Linux, and
+Windows.
 
-> **Renderer note.** zigui rasterizes on the CPU and presents the framebuffer
-> through SDL3 — a real, working, identical-everywhere renderer. A wgpu GPU
-> backend is **not currently planned** (the SDL3 path works well); because all
-> drawing is expressed as a `Canvas` command list, one could still be slotted in
-> later behind the same interface without touching any component.
+> **Renderer note.** All drawing is expressed as a retained `Canvas` command
+> list consumed by two backends that produce identical output: a pure-Zig
+> software rasterizer (tests, headless, CI, machines without GPU drivers) and
+> a GPU backend built on SDL3's GPU API (one unified instanced SDF pipeline +
+> a glyph/image atlas + blur passes; Metal/Vulkan, no extra dependencies).
+> Apps don't choose — the runtime picks the GPU when available and falls back
+> silently (`ZIGUI_SOFTWARE=1` forces the software path).
 
 ## Use zigui in your project
 
@@ -120,7 +123,7 @@ zigui is distributed through Zig's built-in package manager — there's no centr
 registry, just a URL fetched and content-hashed into your `build.zig.zon`:
 
 ```sh
-zig fetch --save git+https://github.com/ddalcu/zigui#v0.1.0
+zig fetch --save git+https://github.com/ddalcu/zigui#v0.2.0
 ```
 
 Then wire the module in your `build.zig`:
@@ -152,12 +155,13 @@ zig build run-showcase               # the kitchen-sink gallery: every component
 zig build run-edit                   # a multi-line text editor (TextEdit/gedit-like)
 zig build showcase edit              # build the examples without running them
 
-# Render one frame to a BMP without a window (great for screenshots / CI):
-./zig-out/bin/showcase --screenshot out.bmp [section] [--dark] [--accent N]
+# Render one frame to a BMP without a window (great for screenshots / CI);
+# add --gpu to render it through the real GPU pipeline instead:
+./zig-out/bin/showcase --screenshot out.bmp [section] [--dark] [--accent N] [--gpu]
 ```
 
-> Run with `-Doptimize=ReleaseFast` for smooth UI — the CPU software rasterizer
-> is much slower in the default Debug build.
+> If the software fallback is in use, run with `-Doptimize=ReleaseFast` for
+> smooth UI — the CPU rasterizer is much slower in the default Debug build.
 
 ### Validate on Linux via Docker
 

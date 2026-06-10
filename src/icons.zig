@@ -95,6 +95,8 @@ pub const Icon = enum(u21) {
     menu = 0xE115,
     /// lucide `message-circle`
     message_circle = 0xE116,
+    /// lucide `mic`
+    mic = 0xE118,
     /// lucide `minus`
     minus = 0xE11C,
     /// lucide `moon`
@@ -125,6 +127,8 @@ pub const Icon = enum(u21) {
     shield_check = 0xE1FF,
     /// lucide `sparkles`
     sparkles = 0xE412,
+    /// lucide `square`
+    square = 0xE167,
     /// lucide `star`
     star = 0xE176,
     /// lucide `sun`

@@ -76,8 +76,14 @@ fn bevel(s: Surface, rect: Rect, raised: bool) Err!void {
 
 fn button(s: Surface, rect: Rect, role: Role, st: ControlState) Err!Color {
     if (role == .plain) return s.palette.accent;
-    try s.fill(rect, 0, s.palette.control_face);
-    try bevel(s, rect, !st.pressed);
+    var r = rect;
+    if (role == .prominent) {
+        // The classic default-button treatment: a black ring around the bevel.
+        try s.fill(r, 0, Color.black);
+        r = r.insetBy(1, 1);
+    }
+    try s.fill(r, 0, s.palette.control_face);
+    try bevel(s, r, !st.pressed);
     return s.palette.on_control;
 }
 
@@ -146,7 +152,8 @@ fn progress(s: Surface, rect: Rect, frac: f32) Err!void {
     try s.fill(filled, 0, s.palette.accent);
 }
 
-fn panel(s: Surface, rect: Rect, radius: f32) Err!void {
+fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
+    _ = kind; // one panel style fits all in this family
     _ = radius; // always square
     try s.fill(rect, 0, s.palette.control_face);
     try bevel(s, rect, true); // a raised window/panel

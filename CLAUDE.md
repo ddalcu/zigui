@@ -107,7 +107,7 @@ app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → prese
 | `src/gpu/gpu.zig` | The SDL_GPU shell (app layer, links C like `app.zig`): device/pipelines/textures, replays a translated `Scene`, offscreen `renderToRgba` for verification. Shaders in `src/gpu/shaders/` (GLSL→committed SPIR-V via `compile.sh`, plus runtime-compiled MSL twins). |
 | `src/text/*` | `ttf` (parser+rasterizer), `atlas` (`GlyphCache`), `shape` (measure/wrap), `font` (`drawText`). |
 | `src/theme/theme.zig` | `Theme`, `Palette`, `Metrics`, `Typography`, and the **`Painter`** vtable + `Surface`/`ControlState`/`Role`. The color-scheme/painter vocabulary. |
-| `src/theme/{macos,win2000,windows10,kde}.zig` | The four built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (glass / bevels / flat / Breeze). |
+| `src/theme/{macos,win2000,windows10,kde,mui}.zig` | The five built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (liquid glass / bevels / flat / Breeze / Material). |
 | `src/theme/registry.zig` | `Family` enum + `forScheme(family, scheme)` — picks a `Theme` for the OS appearance (light-only families ignore dark). |
 | `src/state/*` | `State(T)`, `Binding(T)`, `Observer`. |
 | `src/app.zig` | SDL3 window/event loop. Links C (the only other C file is `src/gpu/gpu.zig`, which it owns). Where overlays, animation ticking, HiDPI scale, key routing, GPU-vs-software backend selection, and `systemTheme()`/`colorScheme()` (OS dark/light) get wired. |
@@ -269,11 +269,66 @@ even *returns* the label color so a theme controls both at once. To add a glassy
 vs. bevelled vs. flat control, implement the painter method per family — don't
 hard-code a look in `view.zig`.
 
-The four families live in `src/theme/{macos,win2000,windows10,kde}.zig`:
-macОС = vertical gradient sheen + white rim (the original look, reproduced
-exactly so the pixel tests still pass); Win2000 = 2-ring raised/sunken bevels +
-silver `control_face`, **light-only**; Windows 10 = flat fills + 1px borders;
-KDE/Breeze = subtle gradients + thin borders + 3px corners.
+The five families live in `src/theme/{macos,win2000,windows10,kde,mui}.zig`:
+macOS = **real Liquid Glass, pixel-matched to macOS 26** (see the parity
+workflow below) — every raised surface starts with a `Surface.backdropBlur`
+(a `blur_rect`, so controls genuinely frost what's beneath them; over a flat
+background the blur is a no-op and the flat translucent fill + rim + soft
+fake drop shadow carry the look), built from two shared treatments in
+`macos.zig` (`clearGlass` neutral — near-white in light, a *lightening* white
+wash in dark; `tintedGlass` flat accent/destructive with a 1px top specular);
+Win2000 = 2-ring raised/sunken bevels + silver `control_face`, **light-only**;
+Windows 10 = flat fills + 1px borders; KDE/Breeze = subtle gradients + thin
+borders + 3px corners; Material = flat primary fills + state overlays.
+
+`Role` (button semantics) is `normal | prominent | destructive | plain`,
+matching macOS 26: a plain `Button` is *neutral* glass with a `label`-colored
+title, `.plain` renders with `secondary_label` (native borderless), disabled
+glass is an outline ghost, and only `ButtonRoled(…, .prominent, …)` (the
+default action) carries the accent tint. The other painters map `.prominent`
+to their own emphasis (Win2000 draws the classic black default-button ring;
+Win10/KDE use an accent fill; Material treats it as `.normal`).
+
+macOS-26 specifics baked into the macOS theme (all pixel-sampled from native):
+- **Two blues**: `accent` #017AFE (prominent buttons) vs `selection` #3478F6
+  (AppKit controlAccentColor — switches, segmented chips, slider/progress
+  fills, selected table rows, radio dots). Don't mix them up.
+- **Grouped surfaces**: light = white window + #F7F7F7 rows; dark = #1B1B1B +
+  #222222 (rows *lighter* than the window in dark, darker in light).
+- New `Palette` roles: `scrim` (modal dim wash) and `quaternary_fill` (the
+  *neutral grey* sidebar selection — macOS settings sidebars are not accent).
+- `Painter.panel` takes a `PanelKind`: `.modal` (sheets/alerts — **opaque**
+  elevated panels, white / #161616) vs `.popover` (frosted material). Sheets
+  are *centered* window modals on macOS, not bottom-anchored.
+- `Painter.glassSurface` (optional, defaulted null) backs the `.glassEffect()`
+  view modifier — freestanding glass for toolbar pills / inset sidebar panels
+  (capsule by default, or the view's `.cornerRadius`). Non-glass themes fall
+  back to a `control_track` fill + `control_border` ring.
+- **Buttons are NOT capsules**: in-content buttons round at ~5.5pt
+  (`metrics.control_corner_radius`); only *toolbar pills* are capsules
+  (`ButtonIcon` routes through `Painter.glassSurface` for that). Steppers are
+  a single 22×24 chevron column (up/down), not +/- boxes; the switch is 36×16
+  with a 13pt knob; segmented chips are full-track-height rounded rects
+  (radius ~5.5), not inset capsules. Sidebars get `Palette.sidebar_background`
+  (#FAFAFA / #1A1B1B; null in other themes = `secondary_background`) with
+  32pt rows.
+
+Composed-component additions: `ButtonIcon`/`ButtonIconRoled` (leading glyph +
+label pill buttons), `SidebarStyled(items, sel, .neutral|.prominent)`
+(prominent = vivid accent selection + optional two-line `SidebarItem.detail`
+subtitle rows, the chat-list style), and `NavigationSplitViewInset` (the
+floating rounded glass sidebar panel of macOS 26 chat/notes apps).
+
+### Native-parity workflow — `tools/parity/`
+`RefGallery.swift` is a **real SwiftUI app** (built with `xcrun swiftc`)
+mirroring the showcase Controls page with native macOS 26 controls
+(`.glass`/`.glassProminent` buttons, grouped `Form`, switches, segmented
+pickers, sheets/alerts/popovers). `capture.sh <out.png> [--dark|--sheet|…]`
+launches it and screenshots its window via `screencapture -l` (needs Screen
+Recording permission for the terminal; in-process captures render glass blank).
+The macOS theme's colors/metrics were extracted by pixel-sampling those
+captures with PIL — when touching the macOS look, re-capture and compare
+side-by-side against `showcase --screenshot` output rather than eyeballing.
 `theme/registry.zig` exposes `Family` + `forScheme(family, scheme)` (light-only
 families ignore a dark request). `app.systemTheme()`/`app.colorScheme()` read the
 OS preference (SDL3) so an app/theme-provider follows dark/light live; the

@@ -75,9 +75,13 @@ fn themeProvider() zigui.Theme {
     const scheme: zigui.ColorScheme = if (st.dark.get()) .dark else .light;
     var th = zigui.themeForScheme(families[fi], scheme);
     // The accent switcher recolors the tint/selection across every theme.
+    // Index 0 ("Blue") means the system default — keep the theme's own values
+    // (macOS uses two distinct blues for accent vs selection).
     const ai: usize = @intCast(std.math.clamp(st.accent.get(), 0, accents.len - 1));
-    th.colors.accent = accents[ai].color;
-    th.colors.selection = accents[ai].color;
+    if (ai != 0) {
+        th.colors.accent = accents[ai].color;
+        th.colors.selection = accents[ai].color;
+    }
     g_theme = th;
     return th;
 }
@@ -99,6 +103,8 @@ const AppState = struct {
     /// Set once the appearance has been seeded from the OS preference.
     os_synced: bool,
     nav: zigui.NavState,
+    /// Selection for the inset (chat-style) split-view demo.
+    chat_sel: zigui.State(i64),
 
     // Controls
     toggle_a: zigui.State(bool),
@@ -218,19 +224,20 @@ fn header(title: []const u8) zigui.View {
     return zigui.HStack(.{ zigui.Text(title).font(.large_title), zigui.Spacer() }).frameMaxWidth();
 }
 
-/// A titled, rounded "liquid glass" card.
+/// A grouped-form section, macOS 26 style: a semibold header above a rounded
+/// block slightly darker than the window (no border).
 fn card(title: []const u8, content: zigui.View) zigui.View {
     return zigui.VStack(.{
         zigui.HStack(.{
-            zigui.Text(title).font(.headline).foreground(t().colors.secondary_label),
+            zigui.Text(title).font(.headline),
             zigui.Spacer(),
         }).frameMaxWidth(),
-        content.frameMaxWidth(),
-    }).spacing(10)
-        .padding(14)
-        .background(t().colors.control_background)
-        .cornerRadius(t().metrics.corner_radius)
-        .border(t().colors.separator, t().metrics.hairline)
+        content.frameMaxWidth()
+            .padding(14)
+            .background(t().colors.secondary_background)
+            .cornerRadius(t().metrics.corner_radius)
+            .frameMaxWidth(),
+    }).spacing(8)
         .frameMaxWidth();
 }
 
@@ -250,7 +257,8 @@ fn controlsPanel(st: *AppState) zigui.View {
         header("Controls"),
         card("Buttons", zigui.VStack(.{
             zigui.HStack(.{
-                zigui.Button("Primary", zigui.actionCtx(AppState, st, AppState.animate)),
+                zigui.ButtonRoled("Primary", .prominent, zigui.actionCtx(AppState, st, AppState.animate)),
+                zigui.Button("Glass", zigui.actionCtx(AppState, st, AppState.noop)),
                 zigui.ButtonRoled("Delete", .destructive, zigui.actionCtx(AppState, st, AppState.noop)),
                 zigui.ButtonRoled("Plain", .plain, zigui.actionCtx(AppState, st, AppState.noop)),
                 zigui.Spacer(),
@@ -436,7 +444,7 @@ fn overlaysPanel(st: *AppState) zigui.View {
             zigui.Spacer(),
         }).spacing(10)),
         card("Menu", zigui.HStack(.{
-            zigui.Menu("Options ▾", &st.menu_open, .{
+            zigui.Menu("Options", &st.menu_open, .{
                 zigui.Button("Animate", zigui.actionCtx(AppState, st, AppState.animate)),
                 zigui.Button("Show sheet", zigui.actionCtx(AppState, st, AppState.openSheet)),
             }),
@@ -453,6 +461,22 @@ fn overlaysPanel(st: *AppState) zigui.View {
     }).spacing(16);
 }
 
+/// The macOS 26 toolbar pill cluster: glass icon buttons + icon-label pills
+/// inside one `.glassEffect()` capsule, floating over content that shows
+/// through the frost.
+fn glassToolbar(st: *AppState) zigui.View {
+    return zigui.HStack(.{
+        zigui.IconButton(.audio_lines, 15, zigui.actionCtx(AppState, st, AppState.noop)),
+        zigui.IconButton(.settings, 15, zigui.actionCtx(AppState, st, AppState.noop)),
+        zigui.ButtonIcon("Think", .sparkles, zigui.actionCtx(AppState, st, AppState.noop)),
+        zigui.ButtonIcon("Agent", .wand, zigui.actionCtx(AppState, st, AppState.noop)),
+        zigui.ButtonIcon("MCP", .boxes, zigui.actionCtx(AppState, st, AppState.noop)),
+        zigui.Circle(zigui.Color.fromRgb8(48, 209, 88)).frame(10, 10),
+    }).spacing(7)
+        .padding(7)
+        .glassEffect();
+}
+
 fn effectsPanel(st: *AppState) zigui.View {
     return zigui.VStack(.{
         header("Effects"),
@@ -463,6 +487,15 @@ fn effectsPanel(st: *AppState) zigui.View {
                 zigui.Spacer(),
             }),
         }).spacing(10)),
+        card("Liquid glass toolbar", zigui.ZStack(.{
+            zigui.LinearGradient(
+                zigui.Color.fromRgb8(88, 86, 214),
+                zigui.Color.fromRgb8(255, 45, 85),
+                .{ .x = 0, .y = 0 },
+                .{ .x = 1, .y = 1 },
+            ).frameMaxWidth().frameHeight(110).cornerRadius(12),
+            glassToolbar(st),
+        }).frameMaxWidth()),
         card("Opacity · border · corner radius", zigui.HStack(.{
             zigui.RoundedRectangle(swatches[0], 10).frame(64, 64).opacity(0.4),
             zigui.RoundedRectangle(swatches[2], 10).frame(64, 64).border(t().colors.label, 2),
@@ -493,9 +526,27 @@ fn navPanel(st: *AppState) zigui.View {
             zigui.NavigationLink("Archive", 2, &st.nav).frameMaxWidth(),
             zigui.NavigationLink("Trash", 3, &st.nav).frameMaxWidth(),
         }).spacing(6)),
+        card("Inset split view (chat style)", zigui.NavigationSplitViewInset(
+            zigui.VStack(.{
+                zigui.SidebarStyled(&chat_items, st.chat_sel.binding(), .prominent),
+                zigui.Spacer(),
+                zigui.ButtonIcon("New Chat", .plus, zigui.actionCtx(AppState, st, AppState.noop)).frameMaxWidth(),
+            }).spacing(8).padding(8).frameMaxHeight(),
+            zigui.VStack(.{
+                zigui.Spacer(),
+                zigui.Text("Select a chat").foreground(t().colors.secondary_label),
+                zigui.Spacer(),
+            }).frameMaxWidth().frameMaxHeight(),
+        ).frameMaxWidth().frameHeight(240)),
         zigui.Spacer(),
     }).spacing(16).frameMaxHeight();
 }
+
+const chat_items = [_]zigui.SidebarItem{
+    .{ .label = "New Chat", .detail = "just now" },
+    .{ .label = "what does this app do", .detail = "4h ago" },
+    .{ .label = "GPU renderer plan", .detail = "Yesterday" },
+};
 
 // ── Shell ─────────────────────────────────────────────────────────────────────
 
@@ -558,22 +609,26 @@ fn body(st: *AppState) zigui.View {
 
     const sheet_content = zigui.VStack(.{
         zigui.Text("Sheet").font(.title),
-        zigui.WrappedText("A bottom sheet drawn over a dimming scrim. Tap outside or Done to dismiss."),
+        zigui.WrappedText("A centered window-modal sheet over a dimming scrim. Tap outside or Done to dismiss."),
         zigui.HStack(.{
             zigui.Spacer(),
-            zigui.Button("Done", zigui.actionCtx(AppState, st, AppState.closeSheet)),
+            zigui.ButtonRoled("Done", .prominent, zigui.actionCtx(AppState, st, AppState.closeSheet)),
         }).frameMaxWidth(),
-    }).spacing(12).padding(20).frameWidth(340);
+    }).spacing(12).padding(20).frameWidth(380);
 
     const alert_content = zigui.VStack(.{
         zigui.Icon(.info, 28, t().colors.accent),
         zigui.Text("Heads up").font(.headline),
         zigui.WrappedText("A centered alert. Long unbreakable tokens wrap too: " ++
             "/Users/david/models/unsloth/FLUX.2-klein-4B-GGUF.safetensors"),
-        zigui.Button("OK", zigui.actionCtx(AppState, st, AppState.closeAlert)),
+        zigui.ButtonRoled("OK", .prominent, zigui.actionCtx(AppState, st, AppState.closeAlert)).frameMaxWidth(),
     }).spacing(12).padding(20).frameWidth(300);
 
-    return zigui.NavigationSplitView(sidebar(st), detailPanel(st), t().colors.secondary_background)
+    return zigui.NavigationSplitView(
+        sidebar(st),
+        detailPanel(st),
+        t().colors.sidebar_background orelse t().colors.secondary_background,
+    )
         .sheet(st.show_sheet.binding(), sheet_content)
         .alert(st.show_alert.binding(), alert_content);
 }
@@ -720,6 +775,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .theme_family = zigui.State(i64).init(alloc, 0),
         .os_synced = false,
         .nav = zigui.NavState.init(alloc),
+        .chat_sel = zigui.State(i64).init(alloc, 0),
         .toggle_a = zigui.State(bool).init(alloc, true),
         .toggle_b = zigui.State(bool).init(alloc, false),
         .slider = zigui.State(f32).init(alloc, 0.5),
@@ -746,6 +802,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         st.accent.deinit();
         st.theme_family.deinit();
         st.nav.deinit();
+        st.chat_sel.deinit();
         st.toggle_a.deinit();
         st.toggle_b.deinit();
         st.slider.deinit();
@@ -799,6 +856,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             st.show_sheet.set(true);
         } else if (std.mem.eql(u8, a, "--alert")) {
             st.show_alert.set(true);
+        } else if (std.mem.eql(u8, a, "--popover")) {
+            st.show_popover.set(true);
+        } else if (std.mem.eql(u8, a, "--menu")) {
+            st.menu_open.set(true);
         } else {
             section = std.fmt.parseInt(i64, a, 10) catch section;
         }

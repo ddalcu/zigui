@@ -14,9 +14,19 @@ const Binding = view.Binding;
 // Sidebar
 // ---------------------------------------------------------------------------
 
-/// One row of a `Sidebar`: a title and an optional leading icon. Mirrors
-/// SwiftUI's `Label(item, systemImage:)` rows in a `.sidebar`-styled `List`.
-pub const SidebarItem = struct { label: []const u8, icon: ?icons.Icon = null };
+/// One row of a `Sidebar`: a title, an optional leading icon, and an optional
+/// second `detail` line (a chat-list style subtitle). Mirrors SwiftUI's
+/// `Label(item, systemImage:)` rows in a `.sidebar`-styled `List`.
+pub const SidebarItem = struct {
+    label: []const u8,
+    icon: ?icons.Icon = null,
+    detail: ?[]const u8 = null,
+};
+
+/// How a `Sidebar` highlights its selection: `neutral` is the grey wash of
+/// macOS settings-style source lists; `prominent` is the vivid accent row of
+/// content lists (Mail, Notes, chat apps).
+pub const SidebarStyle = enum { neutral, prominent };
 
 /// A macOS 26 source-list sidebar: a vertical list of selectable rows with a
 /// rounded "liquid glass" selection highlight, a leading icon, and a live hover
@@ -24,32 +34,48 @@ pub const SidebarItem = struct { label: []const u8, icon: ?icons.Icon = null };
 /// that drives `selection`. Drop it inside a `NavigationSplitView`'s sidebar pane
 /// (ideally over a `Material`).
 pub fn Sidebar(items: []const SidebarItem, selection: Binding(i64)) View {
+    return SidebarStyled(items, selection, .neutral);
+}
+
+/// `Sidebar` with an explicit selection style (see `SidebarStyle`). Rows with a
+/// `detail` subtitle render as two lines (chat-list style).
+pub fn SidebarStyled(items: []const SidebarItem, selection: Binding(i64), style: SidebarStyle) View {
     const bt = view.buildTokens();
     const rows = view.buildAlloc().alloc(View, items.len) catch @panic("oom");
     for (items, 0..) |item, i| {
         const is_sel = selection.get() == @as(i64, @intCast(i));
-        const fg: ?Color = if (is_sel) bt.on_accent else null;
+        const prominent_sel = is_sel and style == .prominent;
         // Allocate the row's children in the build arena — `makeStackFromSlice`
         // keeps the slice, so a stack-local array would dangle after we return.
         const contents = view.buildAlloc().alloc(View, 3) catch @panic("oom");
         var k: usize = 0;
         if (item.icon) |ic| {
-            contents[k] = view.Icon(ic, 15, fg);
+            contents[k] = view.Icon(ic, 16, if (prominent_sel) bt.on_accent else null);
             k += 1;
         }
-        var label = view.Text(item.label);
-        if (fg) |c| label = label.foreground(c);
-        contents[k] = label;
+        var title = view.Text(item.label);
+        if (prominent_sel) title = title.foreground(bt.on_accent);
+        if (item.detail) |d| {
+            var sub = view.Text(d).font(.subheadline);
+            sub = sub.foreground(if (prominent_sel) bt.on_accent.withAlpha(0.75) else bt.secondary_label);
+            contents[k] = view.makeStack(.vertical, 2, .leading, .{ title, sub });
+        } else {
+            contents[k] = title;
+        }
         k += 1;
         contents[k] = view.Spacer();
         k += 1;
+        // Native sidebar rows are 32pt tall (16pt line + 8pt above/below).
+        const vpad: f32 = if (item.detail != null) 7 else 8;
         var rowv = view.makeStackFromSlice(.horizontal, 8, .center, contents[0..k])
-            .paddingInsets(.{ .top = 6, .leading = 10, .bottom = 6, .trailing = 8 })
+            .paddingInsets(.{ .top = vpad, .leading = 10, .bottom = vpad, .trailing = 8 })
             .frameMaxWidth()
-            .cornerRadius(8) // sidebar selection radius
+            .cornerRadius(if (style == .prominent) 10 else 6)
             .onTap(view.selectAction(selection, @intCast(i)));
         if (is_sel) {
-            rowv = rowv.background(bt.accent);
+            // Neutral grey wash (settings source lists) or vivid accent
+            // (content lists), per the style.
+            rowv = rowv.background(if (style == .prominent) bt.selection else bt.quaternary_fill);
         } else {
             rowv = rowv.hoverFill(bt.hover);
         }
@@ -88,14 +114,14 @@ fn radioIndicator(selected: bool) View {
     const bt = view.buildTokens();
     if (selected) {
         return view.ZStack(.{
-            view.Circle(bt.accent).frame(16, 16),
-            view.Circle(bt.on_accent).frame(6, 6),
-        }).frame(16, 16);
+            view.Circle(bt.selection).frame(14, 14),
+            view.Circle(bt.on_accent).frame(5, 5),
+        }).frame(14, 14);
     }
     return view.ZStack(.{
-        view.Circle(Color.black.withAlpha(0.25)).frame(16, 16),
-        view.Circle(Color.white).frame(13, 13),
-    }).frame(16, 16);
+        view.Circle(Color.black.withAlpha(0.22)).frame(14, 14),
+        view.Circle(Color.white).frame(12, 12),
+    }).frame(14, 14);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +165,7 @@ pub fn Table(columns: []const TableColumn, rows: []const []const []const u8, sel
         if (selection) |s| {
             rv = rv.onTap(view.selectAction(s, @intCast(r)));
             if (is_sel) {
-                rv = rv.background(bt.accent);
+                rv = rv.background(bt.selection);
             } else if (r % 2 == 1) {
                 // Subtle zebra striping like a macOS table.
                 rv = rv.background(bt.row_stripe);

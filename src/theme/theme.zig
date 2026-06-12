@@ -56,8 +56,10 @@ pub const TextStyle = struct {
 };
 
 /// The semantic appearance of a control, used by buttons (and reusable by other
-/// roled controls). `plain` is a borderless, label-only button.
-pub const Role = enum { normal, destructive, plain };
+/// roled controls). `normal` is the theme's everyday button; `prominent` is the
+/// emphasized/default action (accent-tinted on most themes); `plain` is a
+/// borderless, label-only button.
+pub const Role = enum { normal, prominent, destructive, plain };
 
 /// Semantic color roles, resolved for a single `ColorScheme`. The first block
 /// follows macOS's dynamic system colors; the bevel block at the end is only
@@ -94,6 +96,14 @@ pub const Palette = struct {
     glass: Color,
     /// Fill for an unselected segmented/glass control track.
     control_track: Color,
+    /// The dimming wash drawn across the window beneath a modal overlay.
+    scrim: Color = Color.black.withAlpha(0.2),
+    /// Neutral selected-row fill (macOS sidebar selection is grey, not accent).
+    quaternary_fill: Color = Color.black.withAlpha(0.10),
+    /// Sidebar pane background, when it differs from `secondary_background`
+    /// (macOS sidebars are #FAFAFA light / #1A1B1B dark). Null = fall back to
+    /// `secondary_background`.
+    sidebar_background: ?Color = null,
 
     // --- Chiseled bevel roles (Windows 2000 / 9x) -------------------------
     // The 3D edge colors of the classic raised/sunken look. Defaulted so flat
@@ -160,6 +170,10 @@ pub const Metrics = struct {
 // Painter: the per-theme drawing strategy
 // ---------------------------------------------------------------------------
 
+/// What a floating panel is for: native macOS draws modals (sheets/alerts) as
+/// opaque elevated panels but popovers/menus as frosted material.
+pub const PanelKind = enum { modal, popover };
+
 /// The interaction state of a control, passed to painter functions so a theme
 /// can render pressed/hovered/focused/disabled variants.
 pub const ControlState = struct {
@@ -202,6 +216,12 @@ pub const Surface = struct {
     pub fn fillCircle(s: Surface, center: Point, r: f32, c: Color) Allocator.Error!void {
         try s.canvas.fillCircle(center, r, c.multiplyAlpha(s.opacity));
     }
+    /// Frost the content already drawn beneath `rect` (a `blur_rect`), then lay
+    /// `tint` over the result — the backdrop-sampling half of a glass surface.
+    /// Pair with a translucent fill and a rim drawn on top.
+    pub fn backdropBlur(s: Surface, rect: Rect, radius: f32, sigma: f32, tint: Color) Allocator.Error!void {
+        try s.canvas.blurRect(rect, radius, sigma, tint.multiplyAlpha(s.opacity));
+    }
 };
 
 /// A vtable of chrome-drawing functions — the heart of a theme's identity. Each
@@ -236,9 +256,15 @@ pub const Painter = struct {
     /// Draw a determinate progress bar: the track, then the filled portion
     /// (`rect` scaled by `frac` in 0..1).
     progress: *const fn (s: Surface, rect: Rect, frac: f32) Allocator.Error!void,
-    /// Draw the frame (background + border/bevel) for a floating panel — sheets,
-    /// alerts, popovers, and menus — with the given corner `radius`.
-    panel: *const fn (s: Surface, rect: Rect, radius: f32) Allocator.Error!void,
+    /// Draw the frame (background + border/bevel) for a floating panel with the
+    /// given corner `radius`: `kind` distinguishes modals (sheets/alerts) from
+    /// popovers/menus so a theme can render them as different materials.
+    panel: *const fn (s: Surface, rect: Rect, radius: f32, kind: PanelKind) Allocator.Error!void,
+    /// Draw a freestanding glass surface behind arbitrary content (the
+    /// `.glassEffect()` modifier — toolbar pills, floating bars, inset
+    /// sidebars). Optional: themes without a glass identity fall back to a
+    /// translucent `control_track` fill with a `control_border` ring.
+    glassSurface: ?*const fn (s: Surface, rect: Rect, radius: f32) Allocator.Error!void = null,
 };
 
 // ---------------------------------------------------------------------------

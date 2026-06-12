@@ -132,7 +132,8 @@ fn progress(s: Surface, rect: Rect, frac: f32) Err!void {
     try s.fill(filled, r, s.palette.accent);
 }
 
-fn panel(s: Surface, rect: Rect, radius: f32) Err!void {
+fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
+    _ = kind; // one panel style fits all in this family
     // A raised surface (card/menu/dialog). No shadow primitive, so a thin border
     // grounds it against the background.
     try s.fill(rect, radius, s.palette.control_background);

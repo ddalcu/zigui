@@ -55,6 +55,12 @@ fn button(s: Surface, rect: Rect, role: Role, st: ControlState) Err!Color {
         try s.stroke(rect, r, 1, s.palette.destructive.darken(0.15));
         return s.palette.on_accent;
     }
+    if (role == .prominent) {
+        // The Breeze default action: the same gradient treatment in the accent.
+        try s.vGradient(rect, r, s.palette.accent.lighten(0.08), s.palette.accent.darken(0.06));
+        try s.stroke(rect, r, 1, s.palette.accent.darken(0.15));
+        return s.palette.on_accent;
+    }
     // Breeze buttons: a faint top-lit gradient over the control face with a thin
     // border; hover lifts toward the accent.
     const base = s.palette.control_track;
@@ -130,7 +136,8 @@ fn progress(s: Surface, rect: Rect, frac: f32) Err!void {
     try s.fill(filled, r, s.palette.accent);
 }
 
-fn panel(s: Surface, rect: Rect, radius: f32) Err!void {
+fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
+    _ = kind; // one panel style fits all in this family
     try s.fill(rect, radius, s.palette.window_background);
     try s.stroke(rect, radius, 1, s.palette.control_border);
 }

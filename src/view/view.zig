@@ -60,6 +60,7 @@ const inf = std.math.inf(f32);
 // implementations live in `components/`.
 pub const NavState = navigation.NavState;
 pub const NavigationSplitView = navigation.NavigationSplitView;
+pub const NavigationSplitViewInset = navigation.NavigationSplitViewInset;
 pub const NavigationLink = navigation.NavigationLink;
 pub const NavBackButton = navigation.NavBackButton;
 pub const Tab = tabs_mod.Tab;
@@ -70,6 +71,8 @@ pub const LazyVGrid = grid.LazyVGrid;
 pub const LazyHGrid = grid.LazyHGrid;
 pub const List = list_mod.List;
 pub const Sidebar = collections.Sidebar;
+pub const SidebarStyled = collections.SidebarStyled;
+pub const SidebarStyle = collections.SidebarStyle;
 pub const SidebarItem = collections.SidebarItem;
 pub const RadioGroup = collections.RadioGroup;
 pub const Table = collections.Table;
@@ -233,6 +236,10 @@ pub const Modifiers = struct {
     a11y_label: ?[]const u8 = null,
     /// Hides this view (and its subtree) from the accessibility tree.
     a11y_hidden: bool = false,
+    /// Draw the theme's freestanding Liquid Glass surface behind this view
+    /// (SwiftUI's `.glassEffect()`): a capsule by default, or the view's
+    /// `corner_radius` when one is set. See `Painter.glassSurface`.
+    glass_effect: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,7 +261,13 @@ pub const StackData = struct {
 /// The semantic appearance of a button. Defined by the theme layer (so painters
 /// can switch on it) and re-exported here for view-side call sites.
 pub const ButtonRole = theme_mod.Role;
-pub const ButtonData = struct { label: []const u8, action: Callback, role: ButtonRole = .normal };
+pub const ButtonData = struct {
+    label: []const u8,
+    action: Callback,
+    role: ButtonRole = .normal,
+    /// Optional leading glyph (the native `Label("…", systemImage:)` button).
+    icon: ?icons.Icon = null,
+};
 
 pub const ToggleData = struct { value: Binding(bool), label: []const u8 = "" };
 pub const SliderData = struct { value: Binding(f32), min: f32 = 0, max: f32 = 1 };
@@ -462,6 +475,15 @@ pub const View = struct {
         v.mods.corner_radius = r;
         return v;
     }
+    /// Draw the theme's freestanding Liquid Glass surface behind this view
+    /// (SwiftUI's `.glassEffect()`): frost + sheen + rim, as a capsule by
+    /// default or rounded to `.cornerRadius(r)` when one is set. Use it for
+    /// toolbar pill clusters, floating bars, and inset sidebar panels.
+    pub fn glassEffect(self: View) View {
+        var v = self;
+        v.mods.glass_effect = true;
+        return v;
+    }
     pub fn border(self: View, c: Color, width: f32) View {
         var v = self;
         v.mods.border_color = c;
@@ -564,6 +586,13 @@ threadlocal var current_arena: ?Allocator = null;
 pub const BuildTokens = struct {
     accent: Color = Color.fromRgb8(0, 122, 255),
     on_accent: Color = Color.white,
+    /// Selected-content tint (AppKit's controlAccentColor — selected table
+    /// rows, radio dots). Slightly muted vs `accent` on macOS.
+    selection: Color = Color.fromRgb8(52, 120, 246),
+    /// Neutral selected-row fill (macOS 26 sidebar selection is grey).
+    quaternary_fill: Color = Color.black.withAlpha(0.12),
+    /// Secondary text color, for subtitles in composed rows.
+    secondary_label: Color = Color.fromRgb8(122, 122, 122),
     /// Subtle fill behind a hovered row.
     hover: Color = Color.black.withAlpha(0.06),
     /// Alternating-row stripe in tables.
@@ -577,6 +606,9 @@ pub fn setThemeTokens(t: Theme) void {
     build_tokens = .{
         .accent = t.colors.accent,
         .on_accent = t.colors.on_accent,
+        .selection = t.colors.selection,
+        .quaternary_fill = t.colors.quaternary_fill,
+        .secondary_label = t.colors.secondary_label,
         .hover = t.colors.hover,
         .row_stripe = if (t.scheme == .dark) Color.white.withAlpha(0.04) else Color.black.withAlpha(0.03),
     };
@@ -644,6 +676,15 @@ pub fn Button(label: []const u8, on_tap: Callback) View {
 }
 pub fn ButtonRoled(label: []const u8, role: ButtonRole, on_tap: Callback) View {
     return .{ .kind = .{ .button = .{ .label = label, .action = on_tap, .role = role } } };
+}
+/// A button with a leading glyph before the label — the macOS toolbar-pill
+/// style (`Button { Label("Think", systemImage: …) }`). Neutral glass chrome;
+/// use `ButtonIconRoled` for a tinted role.
+pub fn ButtonIcon(label: []const u8, icon: icons.Icon, on_tap: Callback) View {
+    return .{ .kind = .{ .button = .{ .label = label, .action = on_tap, .icon = icon } } };
+}
+pub fn ButtonIconRoled(label: []const u8, icon: icons.Icon, role: ButtonRole, on_tap: Callback) View {
+    return .{ .kind = .{ .button = .{ .label = label, .action = on_tap, .role = role, .icon = icon } } };
 }
 
 pub fn Toggle(label: []const u8, value: Binding(bool)) View {
@@ -985,25 +1026,35 @@ fn fontStyle(t: Theme, tok: FontToken) theme_mod.TextStyle {
     };
 }
 
-const control_h_padding: f32 = 14;
-const switch_w: f32 = 38;
-const switch_h: f32 = 22;
+const control_h_padding: f32 = 11;
+// Switch/slider/stepper geometry sampled from native macOS 26 controls.
+const switch_w: f32 = 36;
+const switch_h: f32 = 16;
 const slider_h: f32 = 20;
-const slider_knob_r: f32 = 9;
-const slider_track_h: f32 = 4;
-const progress_h: f32 = 6;
-const stepper_w: f32 = 68;
+const slider_knob_r: f32 = 8;
+const slider_track_h: f32 = 5;
+const progress_h: f32 = 7;
+/// The native stepper is a single chevron column (up over down), not +/- boxes.
+const stepper_w: f32 = 22;
+const stepper_box_h: f32 = 24;
 const label_icon: f32 = 14;
 const label_gap: f32 = 6;
-/// Padding around the glyph in an `IconButton`, enlarging its tap target.
-const icon_button_pad: f32 = 6;
+/// Padding around the glyph in an `IconButton` (wider than tall, like the
+/// native glass icon-button capsule), enlarging its tap target.
+const icon_button_pad_x: f32 = 9;
+const icon_button_pad_y: f32 = 4;
+
+/// Leading-glyph size and gap inside an icon-label button.
+const button_icon_size: f32 = 14;
+const button_icon_gap: f32 = 5;
 
 fn buttonSize(ctx: *const Context, b: ButtonData) Size {
     const px = ctx.theme.typography.body.size;
     const lw = shape.measureLineWidth(ctx.cache.face, b.label, px);
     const lh = shape.lineHeight(ctx.cache.face, px);
+    const iw: f32 = if (b.icon != null) button_icon_size + button_icon_gap else 0;
     return .{
-        .width = lw + 2 * control_h_padding,
+        .width = iw + lw + 2 * control_h_padding,
         .height = @max(lh, ctx.theme.metrics.control_height),
     };
 }
@@ -1145,8 +1196,10 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
         }) },
         .icon => |ic| return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = ic.size, .height = ic.size }) },
         .icon_button => |ib| {
-            const s = ib.size + 2 * icon_button_pad;
-            return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = s, .height = s }) };
+            return .{ .leaf = engine.SizingHints.fixedSize(.{
+                .width = ib.size + 2 * icon_button_pad_x,
+                .height = ib.size + 2 * icon_button_pad_y,
+            }) };
         },
         .label => |l| {
             const px = resolvedFontSize(ctx, v);
@@ -1313,32 +1366,44 @@ fn scaleCommands(cmds: []canvas_mod.DrawCommand, s: f32) void {
 /// Draw one overlay request: a dimming scrim across `root`, a tap-to-dismiss
 /// region, a panel background, then the content positioned by style.
 fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas) Allocator.Error!void {
-    // 1. Dimming scrim over the whole frame.
-    try canvas.fillRect(root, Color.black.withAlpha(0.2));
+    // 1. Dimming scrim over the whole frame (theme-tinted; native macOS dims
+    //    by ~20% black under modals). Popovers are light-dismiss but do NOT
+    //    dim the window behind them.
+    if (req.style != .popover) {
+        try canvas.fillRect(root, ctx.theme.colors.scrim);
+    }
     // 2. Tap-to-dismiss region beneath the content (appended before content's
     //    own regions, so a tap on the content hits the content first).
     if (req.dismiss) |d| {
         try ctx.hit_regions.append(ctx.arena, .{ .rect = root, .action = .{ .toggle = d }, .disabled = false });
     }
 
-    // 3. Measure & position the content.
+    // 3. Measure & position the content. macOS sheets are *centered* window
+    //    modals (they don't hug the bottom edge like iOS).
     const prop: engine.Proposal = switch (req.style) {
-        .sheet => .{ .width = root.width, .height = null },
+        .sheet => .{ .width = @min(root.width - 160, 480), .height = null },
         .alert => .{ .width = @min(root.width - 80, 320), .height = null },
         .popover => .unspecified,
     };
     const size = measure(ctx, req.content, prop) catch Size{};
     const target = switch (req.style) {
-        .sheet => Rect{ .x = root.x, .y = root.maxY() - size.height, .width = root.width, .height = size.height },
-        .alert => centerRect(root, size),
+        .sheet, .alert => centerRect(root, size),
         .popover => anchoredRect(root, req.anchor, size),
     };
 
     // 4. Panel frame (theme-drawn), then the content on top, clipped to the
     //    panel so rigid children (e.g. an unwrappable Text) can't paint past
-    //    the rounded edge.
-    const radius = ctx.theme.metrics.corner_radius;
-    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius);
+    //    the rounded edge. Modals round more than popovers and use a different
+    //    material (opaque vs frosted) on macOS.
+    const kind: theme_mod.PanelKind = switch (req.style) {
+        .sheet, .alert => .modal,
+        .popover => .popover,
+    };
+    const radius = switch (kind) {
+        .modal => ctx.theme.metrics.panel_corner_radius,
+        .popover => ctx.theme.metrics.corner_radius,
+    };
+    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius, kind);
     try canvas.pushClip(target, radius);
     try renderInto(ctx, req.content, target, canvas);
     try canvas.popClip();
@@ -1383,6 +1448,20 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     if (v.mods.a11y_hidden) child_ctx.a11y = null;
 
     const op = child_ctx.opacity;
+
+    // Liquid Glass surface (behind any background fill): a capsule unless the
+    // view set an explicit corner radius. Themes without a glass identity fall
+    // back to a translucent track fill with a hairline ring.
+    if (v.mods.glass_effect) {
+        const gr = if (v.mods.corner_radius > 0) v.mods.corner_radius else outer.height / 2;
+        const s = child_ctx.surface(canvas);
+        if (child_ctx.theme.painter.glassSurface) |gs| {
+            try gs(s, outer, gr);
+        } else {
+            try s.fill(outer, gr, child_ctx.theme.colors.control_track);
+            try s.stroke(outer, gr, child_ctx.theme.metrics.hairline, child_ctx.theme.colors.control_border);
+        }
+    }
 
     // Background fill (behind content, spanning the padded frame).
     if (v.mods.background) |fill| try paintFill(canvas, outer, v.mods.corner_radius, fill, op, &child_ctx.theme.colors);
@@ -1561,18 +1640,44 @@ fn paintButton(ctx: *const Context, b: ButtonData, rect: Rect, canvas: *Canvas) 
     const dim: f32 = if (ctx.disabled) 0.4 else 1.0;
     // The theme's painter draws the button chrome and tells us the label color.
     const hovered = if (ctx.hover_point) |hp| rect.contains(hp) else false;
-    const label_color = try ctx.theme.painter.button(ctx.surface(canvas), rect, b.role, .{
-        .disabled = ctx.disabled,
-        .hovered = hovered and !ctx.disabled,
-    });
+    const surface = ctx.surface(canvas);
+    var label_color: Color = undefined;
+    if (b.icon != null and b.role == .normal and ctx.theme.painter.glassSurface != null) {
+        // Icon-label buttons are the macOS *toolbar pill* style: a freestanding
+        // glass capsule rather than the gently-rounded in-content button.
+        try ctx.theme.painter.glassSurface.?(surface, rect, rect.height / 2);
+        if (hovered and !ctx.disabled) {
+            try surface.fill(rect, rect.height / 2, ctx.theme.colors.hover);
+        }
+        label_color = if (ctx.disabled) ctx.theme.colors.tertiary_label else ctx.theme.colors.label;
+    } else {
+        label_color = try ctx.theme.painter.button(surface, rect, b.role, .{
+            .disabled = ctx.disabled,
+            .hovered = hovered and !ctx.disabled,
+        });
+    }
     const px = ctx.theme.typography.body.size;
     const lw = shape.measureLineWidth(ctx.cache.face, b.label, px);
     const lh = shape.lineHeight(ctx.cache.face, px);
+    const color = label_color.multiplyAlpha(ctx.opacity * dim);
+    const iw: f32 = if (b.icon != null) button_icon_size + button_icon_gap else 0;
+    const start_x = rect.x + (rect.width - (iw + lw)) / 2;
+    if (b.icon) |ic| {
+        if (ctx.icon_cache) |cache| {
+            const ibox = Rect{
+                .x = start_x,
+                .y = vcenter(rect, button_icon_size),
+                .width = button_icon_size,
+                .height = button_icon_size,
+            };
+            font_mod.drawIcon(canvas, cache, ic.codepoint(), ibox, ctx.scale, color) catch {};
+        }
+    }
     const origin = Point{
-        .x = rect.x + (rect.width - lw) / 2,
+        .x = start_x + iw,
         .y = rect.y + (rect.height - lh) / 2,
     };
-    drawTextC(ctx, canvas, b.label, px, label_color.multiplyAlpha(ctx.opacity * dim), origin) catch {};
+    drawTextC(ctx, canvas, b.label, px, color, origin) catch {};
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .callback = b.action }, .disabled = ctx.disabled });
 }
 
@@ -1606,8 +1711,8 @@ fn paintToggle(ctx: *const Context, t: ToggleData, rect: Rect, canvas: *Canvas) 
     // and the sliding thumb so the whole control matches the family.
     const s = ctx.surface(canvas);
     try ctx.theme.painter.switchTrack(s, sw, on);
-    const knob_r = switch_h / 2 - 2;
-    const knob_cx = if (on) sw.maxX() - knob_r - 2 else sw.x + knob_r + 2;
+    const knob_r = switch_h / 2 - 1.5;
+    const knob_cx = if (on) sw.maxX() - knob_r - 1.5 else sw.x + knob_r + 1.5;
     const knob_rect = Rect{ .x = knob_cx - knob_r, .y = sw.midY() - knob_r, .width = 2 * knob_r, .height = 2 * knob_r };
     try ctx.theme.painter.switchKnob(s, knob_rect, on);
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .toggle = t.value }, .disabled = ctx.disabled });
@@ -1642,24 +1747,32 @@ fn paintStepper(ctx: *const Context, s: StepperData, rect: Rect, canvas: *Canvas
         const lh = shape.lineHeight(ctx.cache.face, px);
         drawTextC(ctx, canvas, s.label, px, ctx.foreground.multiplyAlpha(op), .{ .x = rect.x, .y = vcenter(rect, lh) }) catch {};
     }
-    const ctrl = Rect{ .x = rect.maxX() - stepper_w, .y = rect.y, .width = stepper_w, .height = rect.height };
+    // The native macOS stepper: one small chevron column — up increments,
+    // down decrements, split by an inset horizontal divider.
+    const ctrl = Rect{
+        .x = rect.maxX() - stepper_w,
+        .y = vcenter(rect, stepper_box_h),
+        .width = stepper_w,
+        .height = stepper_box_h,
+    };
     const hovered = if (ctx.hover_point) |hp| ctrl.contains(hp) else false;
-    // The theme draws the box chrome; the divider and +/- glyphs stay here.
+    // The theme draws the box chrome; the divider and chevrons stay here.
     try ctx.theme.painter.stepperBox(ctx.surface(canvas), ctrl, .{
         .disabled = ctx.disabled,
         .hovered = hovered and !ctx.disabled,
     });
-    const half = ctrl.width / 2;
-    const minus = Rect{ .x = ctrl.x, .y = ctrl.y, .width = half, .height = ctrl.height };
-    const plus = Rect{ .x = ctrl.x + half, .y = ctrl.y, .width = half, .height = ctrl.height };
-    try canvas.line(.{ .x = ctrl.midX(), .y = ctrl.y + 4 }, .{ .x = ctrl.midX(), .y = ctrl.maxY() - 4 }, m.hairline, ctx.theme.colors.separator.multiplyAlpha(op));
-    // glyph-ish: minus and plus drawn as small lines
+    const half = ctrl.height / 2;
+    const up = Rect{ .x = ctrl.x, .y = ctrl.y, .width = ctrl.width, .height = half };
+    const down = Rect{ .x = ctrl.x, .y = ctrl.y + half, .width = ctrl.width, .height = half };
+    try canvas.line(.{ .x = ctrl.x + 4, .y = ctrl.midY() }, .{ .x = ctrl.maxX() - 4, .y = ctrl.midY() }, m.hairline, ctx.theme.colors.separator.multiplyAlpha(op));
     const mc = ctx.foreground.multiplyAlpha(op);
-    try canvas.line(.{ .x = minus.midX() - 4, .y = minus.midY() }, .{ .x = minus.midX() + 4, .y = minus.midY() }, 1.5, mc);
-    try canvas.line(.{ .x = plus.midX() - 4, .y = plus.midY() }, .{ .x = plus.midX() + 4, .y = plus.midY() }, 1.5, mc);
-    try canvas.line(.{ .x = plus.midX(), .y = plus.midY() - 4 }, .{ .x = plus.midX(), .y = plus.midY() + 4 }, 1.5, mc);
-    try ctx.hit_regions.append(ctx.arena, .{ .rect = minus, .action = .{ .step = .{ .binding = s.value, .delta = -s.step, .min = s.min, .max = s.max } }, .disabled = ctx.disabled });
-    try ctx.hit_regions.append(ctx.arena, .{ .rect = plus, .action = .{ .step = .{ .binding = s.value, .delta = s.step, .min = s.min, .max = s.max } }, .disabled = ctx.disabled });
+    const cw: f32 = 3.5; // chevron half-width
+    try canvas.line(.{ .x = up.midX() - cw, .y = up.midY() + 1.5 }, .{ .x = up.midX(), .y = up.midY() - 2 }, 1.5, mc);
+    try canvas.line(.{ .x = up.midX(), .y = up.midY() - 2 }, .{ .x = up.midX() + cw, .y = up.midY() + 1.5 }, 1.5, mc);
+    try canvas.line(.{ .x = down.midX() - cw, .y = down.midY() - 1.5 }, .{ .x = down.midX(), .y = down.midY() + 2 }, 1.5, mc);
+    try canvas.line(.{ .x = down.midX(), .y = down.midY() + 2 }, .{ .x = down.midX() + cw, .y = down.midY() - 1.5 }, 1.5, mc);
+    try ctx.hit_regions.append(ctx.arena, .{ .rect = up, .action = .{ .step = .{ .binding = s.value, .delta = s.step, .min = s.min, .max = s.max } }, .disabled = ctx.disabled });
+    try ctx.hit_regions.append(ctx.arena, .{ .rect = down, .action = .{ .step = .{ .binding = s.value, .delta = -s.step, .min = s.min, .max = s.max } }, .disabled = ctx.disabled });
 }
 
 fn paintProgress(ctx: *const Context, pr: ProgressData, rect: Rect, canvas: *Canvas) !void {
@@ -1685,9 +1798,16 @@ fn paintIcon(ctx: *const Context, ic: IconData, rect: Rect, canvas: *Canvas) !vo
 }
 
 fn paintIconButton(ctx: *const Context, ib: IconButtonData, rect: Rect, canvas: *Canvas) !void {
+    // Icon buttons get the same neutral chrome as ordinary buttons (native
+    // glass icon buttons are small capsules), with the glyph as the label.
+    const hovered = if (ctx.hover_point) |hp| rect.contains(hp) else false;
+    const label_color = try ctx.theme.painter.button(ctx.surface(canvas), rect, .normal, .{
+        .disabled = ctx.disabled,
+        .hovered = hovered and !ctx.disabled,
+    });
     const dim: f32 = if (ctx.disabled) 0.4 else 1;
-    const color = ctx.foreground.multiplyAlpha(ctx.opacity * dim);
-    const box = rect.insetBy(icon_button_pad, icon_button_pad);
+    const color = label_color.multiplyAlpha(ctx.opacity * dim);
+    const box = rect.insetBy(icon_button_pad_x, icon_button_pad_y);
     font_mod.drawIcon(canvas, ctx.icon_cache orelse return, ib.icon.codepoint(), box, ctx.scale, color) catch {};
     try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .callback = ib.action }, .disabled = ctx.disabled });
 }
@@ -1901,10 +2021,11 @@ fn paintPicker(ctx: *const Context, pk: PickerData, rect: Rect, canvas: *Canvas)
         const is_sel = @as(i64, @intCast(i)) == selected;
         // The theme draws the selection chip and dictates its label color (an
         // accent-filled chip needs `on_accent` text, a pale chip keeps `label`).
+        // Native unselected segment labels stay in the primary label color.
         const seg_text = if (is_sel)
             try ctx.theme.painter.segmentedSelection(s, seg)
         else
-            ctx.theme.colors.secondary_label;
+            ctx.theme.colors.label;
         const tw = shape.measureLineWidth(ctx.cache.face, opt, px);
         drawTextC(ctx, canvas, opt, px, seg_text.multiplyAlpha(op), .{
             .x = seg.x + (seg.width - tw) / 2,
@@ -2355,7 +2476,7 @@ fn drawContextMenu(ctx: *const Context, root: Rect, canvas: *Canvas) Allocator.E
     const target = Rect{ .x = x, .y = y, .width = size.width, .height = size.height };
 
     const radius = ctx.theme.metrics.corner_radius;
-    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius);
+    try ctx.theme.painter.panel(ctx.surface(canvas), target, radius, .popover);
     try renderInto(ctx, menu, target, canvas);
 }
 
@@ -2678,6 +2799,54 @@ test "view: Icon paints a glyph from the bundled set" {
     try testing.expect(inked > 0);
 }
 
+test "view: ButtonIcon reserves space for its leading glyph" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const plain = try measure(&c, Button("Think", action(Counter.inc)), .unspecified);
+    const iconed = try measure(&c, ButtonIcon("Think", .sparkles, action(Counter.inc)), .unspecified);
+    try testing.expectEqual(plain.height, iconed.height);
+    try testing.expectEqual(plain.width + button_icon_size + button_icon_gap, iconed.width);
+}
+
+test "view: glassEffect draws the theme's glass surface behind content" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    // The macOS painter's glass surface starts with a backdrop frost.
+    try render(&c, Empty().frame(80, 28).glassEffect(), .{ .x = 0, .y = 0, .width = 80, .height = 28 }, &canvas);
+    var saw_blur = false;
+    for (canvas.commands.items) |cmd| {
+        if (cmd == .blur_rect) saw_blur = true;
+    }
+    try testing.expect(saw_blur);
+}
+
+test "view: SidebarStyled prominent selection is the accent row" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sel = state.State(i64).init(testing.allocator, 0);
+    defer sel.deinit();
+    const items = [_]SidebarItem{
+        .{ .label = "New Chat", .detail = "just now" },
+        .{ .label = "Older", .detail = "4h ago" },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, SidebarStyled(&items, sel.binding(), .prominent), .{ .x = 0, .y = 0, .width = 220, .height = 200 }, &canvas);
+    var has_accent_row = false;
+    for (canvas.commands.items) |cmd| {
+        if (cmd == .fill_rrect and cmd.fill_rrect.color.approxEql(c.theme.colors.selection, 0.05)) has_accent_row = true;
+    }
+    try testing.expect(has_accent_row);
+}
+
 test "view: IconButton fires its callback on tap" {
     var env = TestEnv.init();
     env.setup();
@@ -2719,13 +2888,13 @@ test "view: Stepper increments and clamps" {
     defer s.deinit();
     var fb = try renderToFb(&env, &c, Stepper("Count", s.binding(), 0, 6, 1), .{ .x = 0, .y = 0, .width = 120, .height = 28 }, 120, 28);
     defer fb.deinit();
-    // plus button is the right quarter of the trailing control
-    try testing.expect(dispatchTap(env.hits.items, .{ .x = 103, .y = 14 }));
+    // the chevron column hugs the trailing edge: up = top half increments
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 110, .y = 6 }));
     try testing.expectEqual(@as(i64, 6), s.get());
-    try testing.expect(dispatchTap(env.hits.items, .{ .x = 103, .y = 14 })); // clamp at max
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 110, .y = 6 })); // clamp at max
     try testing.expectEqual(@as(i64, 6), s.get());
-    // minus button (left half of control)
-    try testing.expect(dispatchTap(env.hits.items, .{ .x = 69, .y = 14 }));
+    // down = bottom half decrements
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 110, .y = 22 }));
     try testing.expectEqual(@as(i64, 5), s.get());
 }
 
@@ -3198,12 +3367,12 @@ test "view: Sidebar selects a row on tap and highlights the selection" {
     defer canvas.deinit();
     try render(&c, Sidebar(&items, sel.binding()), .{ .x = 0, .y = 0, .width = 220, .height = 300 }, &canvas);
     try testing.expectEqual(@as(usize, 3), env.hits.items.len);
-    // the selected (row 0) draws an accent highlight behind it
-    var has_accent = false;
+    // the selected (row 0) draws the neutral selection wash behind it
+    var has_selection = false;
     for (canvas.commands.items) |cmd| {
-        if (cmd == .fill_rrect and cmd.fill_rrect.color.approxEql(c.theme.colors.accent, 0.05)) has_accent = true;
+        if (cmd == .fill_rrect and cmd.fill_rrect.color.approxEql(c.theme.colors.quaternary_fill, 0.05)) has_selection = true;
     }
-    try testing.expect(has_accent);
+    try testing.expect(has_selection);
     // tapping the third row selects it
     try testing.expect(dispatchTap(env.hits.items, env.hits.items[2].rect.center()));
     try testing.expectEqual(@as(i64, 2), sel.get());
@@ -3932,14 +4101,15 @@ test "painter: macOS draws glass where Win2000 chisels a bevel" {
     const win2000 = @import("../theme/win2000.zig");
     const tree = Button("OK", action(Counter.inc));
 
-    // macOS button: a blue glass gradient.
+    // macOS prominent button: a blue glass gradient.
+    const prominent = ButtonRoled("OK", .prominent, action(Counter.inc));
     var mc = env.ctx();
     mc.theme = macos.light;
-    const ms = try measure(&mc, tree, .unspecified);
+    const ms = try measure(&mc, prominent, .unspecified);
     const mw: u32 = @intFromFloat(@ceil(ms.width));
     const mh: u32 = @intFromFloat(@ceil(ms.height));
     env.hits.clearRetainingCapacity();
-    var mfb = try renderToFb(&env, &mc, tree, Rect.fromOriginSize(.{}, ms), mw, mh);
+    var mfb = try renderToFb(&env, &mc, prominent, Rect.fromOriginSize(.{}, ms), mw, mh);
     defer mfb.deinit();
 
     // Win2000 button: a silver face with a dark-shadow bottom bevel.
@@ -4015,7 +4185,8 @@ test "painter: every family paints all controls without error" {
         try p.slider(s, r, 0.5, knob, .{});
         try p.stepperBox(s, r, .{});
         try p.progress(s, r, 0.5);
-        try p.panel(s, r, 8);
+        try p.panel(s, r, 8, .modal);
+        try p.panel(s, r, 8, .popover);
         try testing.expect(canvas.commands.items.len > 0);
     }
 }

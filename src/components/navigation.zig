@@ -54,6 +54,24 @@ pub fn NavigationSplitView(sidebar: View, detail: View, sidebar_fill: Color) Vie
     });
 }
 
+/// The macOS 26 *inset* split view: the sidebar floats as a rounded Liquid
+/// Glass panel set in from the window edges (the style of chat/notes apps),
+/// with no divider — the detail pane runs over the same window background.
+/// Pair with `SidebarStyled(…, .prominent)` for accent-selected content rows.
+pub fn NavigationSplitViewInset(sidebar: View, detail: View) View {
+    const panel = sidebar
+        .frameWidth(220)
+        .frameMaxHeight()
+        .cornerRadius(14)
+        .glassEffect();
+    return view.makeStack(.horizontal, 0, .center, .{
+        view.makeStack(.vertical, 0, .center, .{panel})
+            .paddingInsets(.{ .top = 10, .leading = 10, .bottom = 10, .trailing = 4 })
+            .frameMaxHeight(),
+        detail.frameMaxWidth().frameMaxHeight(),
+    });
+}
+
 /// Closure context for a `NavigationLink` tap: a (NavState, route) pair bound at
 /// build time. Allocated in the per-frame build arena, which outlives the frame
 /// until the next rebuild, so the hit region's callback can safely read it.

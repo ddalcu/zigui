@@ -4,3 +4,4 @@ zig-out/
 *.o
 *.a
 .DS_Store
+tools/parity/refgallery

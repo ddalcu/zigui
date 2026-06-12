@@ -53,6 +53,13 @@ fn button(s: Surface, rect: Rect, role: Role, st: ControlState) Err!Color {
         try s.fill(rect, r, s.palette.destructive);
         return s.palette.on_accent;
     }
+    if (role == .prominent) {
+        // The Win10 default action is a flat accent fill.
+        var bg = s.palette.accent;
+        if (st.pressed) bg = bg.darken(0.08) else if (st.hovered) bg = bg.lighten(0.06);
+        try s.fill(rect, r, bg);
+        return s.palette.on_accent;
+    }
     // Default Win10 buttons are a neutral fill with a flat border; the accent is
     // reserved for the hover/focus border.
     try s.fill(rect, r, s.palette.control_track);
@@ -120,7 +127,8 @@ fn progress(s: Surface, rect: Rect, frac: f32) Err!void {
     try s.fill(filled, r, s.palette.accent);
 }
 
-fn panel(s: Surface, rect: Rect, radius: f32) Err!void {
+fn panel(s: Surface, rect: Rect, radius: f32, kind: theme.PanelKind) Err!void {
+    _ = kind; // one panel style fits all in this family
     _ = radius; // always square
     try s.fill(rect, 0, s.palette.control_background);
     try s.stroke(rect, 0, 1, s.palette.control_border);

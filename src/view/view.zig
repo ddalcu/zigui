@@ -77,6 +77,10 @@ pub const SidebarItem = collections.SidebarItem;
 pub const RadioGroup = collections.RadioGroup;
 pub const Table = collections.Table;
 pub const TableColumn = collections.TableColumn;
+pub const DataTable = collections.DataTable;
+pub const DataColumn = collections.DataColumn;
+pub const SortColumn = collections.SortColumn;
+pub const SortDir = collections.SortDir;
 pub const TextFieldState = text_buffer.TextFieldState;
 
 // ---------------------------------------------------------------------------
@@ -240,6 +244,14 @@ pub const Modifiers = struct {
     /// (SwiftUI's `.glassEffect()`): a capsule by default, or the view's
     /// `corner_radius` when one is set. See `Painter.glassSurface`.
     glass_effect: bool = false,
+    /// Single-line text that shrinks to its proposed width and is tail-truncated
+    /// with an ellipsis when it doesn't fit (SwiftUI `.lineLimit(1).truncationMode(.tail)`).
+    /// Only meaningful on a `Text`. See `.truncated()`.
+    truncate: bool = false,
+    /// An `Image` that scales to fit its frame, preserving aspect ratio and
+    /// centering (letterboxed) — instead of rendering at fixed native pixels.
+    /// See `.scaledToFit()`.
+    scaled_to_fit: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -443,6 +455,31 @@ pub const View = struct {
         v.mods.frame = f;
         return v;
     }
+    /// Place the child within its frame box at the given alignment (the frame
+    /// otherwise centers it). Pair with `frameWidth`/`frameMaxWidth` to leading-
+    /// or trailing-align a cell's content.
+    pub fn frameAlign(self: View, a: Alignment) View {
+        var v = self;
+        var f = v.mods.frame orelse FrameSpec{};
+        f.alignment = a;
+        v.mods.frame = f;
+        return v;
+    }
+    /// Keep a `Text` on one line, shrinking it to the width it's offered and
+    /// adding a trailing ellipsis when it overflows (SwiftUI `.lineLimit(1)`).
+    pub fn truncated(self: View) View {
+        var v = self;
+        v.mods.truncate = true;
+        return v;
+    }
+    /// Let an `Image` scale to fill the frame it's given (pair with
+    /// `frameMaxWidth`/`frameMaxHeight`), preserving aspect ratio and centering —
+    /// instead of rendering at fixed native pixels and overflowing.
+    pub fn scaledToFit(self: View) View {
+        var v = self;
+        v.mods.scaled_to_fit = true;
+        return v;
+    }
     pub fn background(self: View, c: Color) View {
         var v = self;
         v.mods.background = .{ .color = c };
@@ -578,6 +615,71 @@ pub const View = struct {
 
 threadlocal var current_arena: ?Allocator = null;
 
+// --- Wrapped-text layout cache -------------------------------------------------
+// Word-wrapping is recomputed on every measure AND paint of every `WrappedText`,
+// so a long, mostly-static transcript re-wraps all its bubbles 60×/sec. This
+// cache keys the wrap result by (content, font size, width) so settled text is a
+// cheap lookup; only changing text (e.g. a streaming reply) actually re-wraps.
+pub const WrapCache = struct {
+    gpa: Allocator,
+    map: std.AutoHashMapUnmanaged(u64, []shape.WrappedLine) = .empty,
+
+    pub fn init(gpa: Allocator) WrapCache {
+        return .{ .gpa = gpa };
+    }
+    pub fn deinit(self: *WrapCache) void {
+        self.clear();
+        self.map.deinit(self.gpa);
+    }
+    fn clear(self: *WrapCache) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |v| self.gpa.free(v.*);
+        self.map.clearRetainingCapacity();
+    }
+    fn keyFor(text: []const u8, px: f32, max_w: f32) u64 {
+        var h = std.hash.Wyhash.init(0x21a17e);
+        h.update(text);
+        const pxq: u32 = @bitCast(px);
+        const mwq: u32 = @intFromFloat(@max(0, @round(max_w)));
+        h.update(std.mem.asBytes(&pxq));
+        h.update(std.mem.asBytes(&mwq));
+        return h.final();
+    }
+};
+
+threadlocal var g_wrap_cache: ?*WrapCache = null;
+
+/// Install the per-thread wrapped-text cache (the app's render loop owns it and
+/// sets it once). Passing null disables caching (the default — headless/one-shot
+/// renders just re-wrap each time).
+pub fn setWrapCache(c: ?*WrapCache) void {
+    g_wrap_cache = c;
+}
+
+/// Wrap `text`, returning cached line offsets when available. The returned slice
+/// is valid for the current frame (cache-owned when cached, else `arena`-owned).
+fn wrapCached(arena: Allocator, face: anytype, text: []const u8, px: f32, max_w: f32) []shape.WrappedLine {
+    const wc = g_wrap_cache orelse
+        return shape.wrapText(arena, face, text, px, max_w) catch &.{};
+    const k = WrapCache.keyFor(text, px, max_w);
+    if (wc.map.count() > 2048) wc.clear();
+    const gop = wc.map.getOrPut(wc.gpa, k) catch
+        return shape.wrapText(arena, face, text, px, max_w) catch &.{};
+    if (gop.found_existing) {
+        const lines = gop.value_ptr.*;
+        // Guard against a (vanishingly rare) hash collision yielding offsets past
+        // the current string — re-wrap rather than slice out of bounds.
+        if (lines.len == 0 or lines[lines.len - 1].end <= text.len) return lines;
+        wc.gpa.free(lines);
+    }
+    const lines = shape.wrapText(wc.gpa, face, text, px, max_w) catch {
+        _ = wc.map.remove(k);
+        return shape.wrapText(arena, face, text, px, max_w) catch &.{};
+    };
+    gop.value_ptr.* = lines;
+    return lines;
+}
+
 /// The handful of theme colors that *composed* (theme-less) constructors need at
 /// build time — chiefly selection tints for `Sidebar`/`Table`/`RadioGroup`.
 /// Constructors have no `Context`, so the app publishes these once per frame via
@@ -671,6 +773,33 @@ pub fn Capsule(c: Color) View {
 pub fn Ellipse(c: Color) View {
     return .{ .kind = .{ .shape = .{ .shape = .ellipse, .fill = .{ .color = c } } } };
 }
+
+/// Three dots bouncing in a phase-shifted wave — an inline "thinking…" indicator
+/// (e.g. a streaming chat reply). `t_ms` is a monotonic millisecond clock (such
+/// as `SDL_GetTicks`); this fn never reads a wall clock, so the caller must keep
+/// redrawing (the app's busy-check does this during generation) for it to move.
+pub fn LoadingDots(t_ms: u64, color: Color) View {
+    const diam: f32 = 16; // dot diameter
+    const amp: f32 = 10; // bounce height
+    const cycle: u64 = 1000; // ms per wave
+    const u = @as(f32, @floatFromInt(t_ms % cycle)) / @as(f32, @floatFromInt(cycle));
+    const mk = struct {
+        fn dot(uu: f32, idx: f32, c: Color) View {
+            // Phase-shift each dot so they bounce in sequence; lift ∈ [0, amp].
+            const ang = (uu - idx * 0.18) * std.math.tau;
+            const lift = amp * 0.5 * (1.0 + @sin(ang));
+            // Frame is `diam + amp` tall so the top/bottom padding (which sums to
+            // `amp`) leaves a full `diam`-sized circle — padding shares the frame
+            // with the shape, so a `diam`-tall frame would shrink the dot instead.
+            return Circle(c)
+                .frameWidth(diam)
+                .frameHeight(diam + amp)
+                .paddingInsets(.{ .top = amp - lift, .bottom = lift });
+        }
+    }.dot;
+    return HStack(.{ mk(u, 0, color), mk(u, 1, color), mk(u, 2, color) }).spacing(7);
+}
+
 pub fn Button(label: []const u8, on_tap: Callback) View {
     return .{ .kind = .{ .button = .{ .label = label, .action = on_tap } } };
 }
@@ -1073,10 +1202,7 @@ const WrappedTextMeasure = struct {
         const self: *const WrappedTextMeasure = @ptrCast(@alignCast(p));
         const lh = shape.lineHeight(self.face, self.px);
         const max_w = prop.width orelse big;
-        const lines = shape.wrapText(self.arena, self.face, self.string, self.px, max_w) catch {
-            // On OOM fall back to a single line so layout still progresses.
-            return .{ .width = shape.measureLineWidth(self.face, self.string, self.px), .height = lh };
-        };
+        const lines = wrapCached(self.arena, self.face, self.string, self.px, max_w);
         var width: f32 = 0;
         for (lines) |ln| width = @max(width, ln.width);
         return .{
@@ -1138,11 +1264,20 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
         },
         .text => |t| {
             const px = resolvedFontSize(ctx, v);
-            const sz = Size{
-                .width = shape.measureLineWidth(ctx.cache.face, t.string, px),
-                .height = shape.lineHeight(ctx.cache.face, px),
-            };
-            return .{ .leaf = engine.SizingHints.fixedSize(sz) };
+            const tw = shape.measureLineWidth(ctx.cache.face, t.string, px);
+            const lh = shape.lineHeight(ctx.cache.face, px);
+            // A truncating Text may shrink below its natural width (down to an
+            // ellipsis) so the layout can fit it to a narrow cell; it's painted
+            // tail-truncated. A normal Text is rigid at its measured width.
+            if (v.mods.truncate) {
+                const ell = shape.measureLineWidth(ctx.cache.face, "…", px);
+                return .{ .leaf = .{
+                    .min = .{ .width = @min(ell, tw), .height = lh },
+                    .ideal = .{ .width = tw, .height = lh },
+                    .max = .{ .width = tw, .height = lh },
+                } };
+            }
+            return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = tw, .height = lh }) };
         },
         .wrapped_text => |wt| {
             const px = resolvedFontSize(ctx, v);
@@ -1190,10 +1325,21 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             .ideal = .{ .width = 140, .height = progress_h },
             .max = .{ .width = inf, .height = progress_h },
         } },
-        .image => |im| return .{ .leaf = engine.SizingHints.fixedSize(.{
-            .width = @floatFromInt(im.image.width),
-            .height = @floatFromInt(im.image.height),
-        }) },
+        .image => |im| {
+            const iw: f32 = @floatFromInt(im.image.width);
+            const ih: f32 = @floatFromInt(im.image.height);
+            // A scaled-to-fit image may shrink to 0 or grow to fill whatever frame
+            // it's offered (it's drawn aspect-fit). A plain image is rigid at its
+            // native pixel size.
+            if (v.mods.scaled_to_fit) {
+                return .{ .leaf = .{
+                    .min = .{},
+                    .ideal = .{ .width = iw, .height = ih },
+                    .max = .{ .width = inf, .height = inf },
+                } };
+            }
+            return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = iw, .height = ih }) };
+        },
         .icon => |ic| return .{ .leaf = engine.SizingHints.fixedSize(.{ .width = ic.size, .height = ic.size }) },
         .icon_button => |ib| {
             return .{ .leaf = engine.SizingHints.fixedSize(.{
@@ -1229,7 +1375,9 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
         .picker => |pk| {
             const px = ctx.theme.typography.body.size;
             var w: f32 = 0;
-            for (pk.options) |opt| w += shape.measureLineWidth(ctx.cache.face, opt, px) + 24;
+            // Per-segment horizontal padding (each side gets half) so labels have
+            // breathing room and don't crowd the segment dividers.
+            for (pk.options) |opt| w += shape.measureLineWidth(ctx.cache.face, opt, px) + 40;
             const h = ctx.theme.metrics.control_height;
             return .{ .leaf = .{
                 .min = .{ .width = w, .height = h },
@@ -1530,7 +1678,9 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
         .divider, .vdivider => try canvas.fillRect(rect, ctx.theme.colors.separator.multiplyAlpha(op)),
         .text => |t| {
             const px = resolvedFontSize(ctx, v);
-            drawTextC(ctx, canvas, t.string, px, ctx.foreground.multiplyAlpha(op), rect.origin()) catch {};
+            const str = if (v.mods.truncate) truncateToWidth(ctx, t.string, px, rect.width) else t.string;
+            drawTextC(ctx, canvas, str, px, ctx.foreground.multiplyAlpha(op), rect.origin()) catch {};
+            // Accessibility always exposes the full, untruncated string.
             try emitA11y(ctx, v, rect, .static_text, t.string, "");
         },
         .wrapped_text => |wt| {
@@ -1554,7 +1704,8 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
         .stepper => |s| try paintStepper(ctx, s, rect, canvas),
         .progress => |pr| try paintProgress(ctx, pr, rect, canvas),
         .image => |im| {
-            try canvas.drawImage(rect, im.image);
+            const r = if (v.mods.scaled_to_fit) aspectFitRect(rect, im.image.width, im.image.height) else rect;
+            try canvas.drawImage(r, im.image);
             try emitA11y(ctx, v, rect, .image, "", "");
         },
         .icon => |ic| {
@@ -1692,6 +1843,45 @@ fn drawTextC(ctx: *const Context, canvas: *Canvas, text: []const u8, px: f32, co
     }
 }
 
+/// Tail-truncate `str` to fit `max_w` at font size `px`, appending an ellipsis
+/// (returns `str` unchanged when it already fits). The clipped string is built in
+/// the per-frame arena. Used for `.truncated()` single-line Text.
+fn truncateToWidth(ctx: *const Context, str: []const u8, px: f32, max_w: f32) []const u8 {
+    if (shape.measureLineWidth(ctx.cache.face, str, px) <= max_w) return str;
+    const ell = "…";
+    const ell_w = shape.measureLineWidth(ctx.cache.face, ell, px);
+    if (max_w <= ell_w) return ell; // no room even for the body — just the ellipsis
+    const budget = max_w - ell_w;
+    // Longest UTF-8 prefix (whole codepoints) whose width fits the budget.
+    var fit: usize = 0;
+    var i: usize = 0;
+    while (i < str.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(str[i]) catch 1;
+        const next = @min(i + cp_len, str.len);
+        if (shape.measureLineWidth(ctx.cache.face, str[0..next], px) > budget) break;
+        fit = next;
+        i = next;
+    }
+    return std.fmt.allocPrint(ctx.arena, "{s}{s}", .{ str[0..fit], ell }) catch ell;
+}
+
+/// The largest centered sub-rect of `rect` with the image's aspect ratio
+/// (SwiftUI `.scaledToFit()` / `object-fit: contain`).
+fn aspectFitRect(rect: Rect, iw: u32, ih: u32) Rect {
+    const fw: f32 = @floatFromInt(iw);
+    const fh: f32 = @floatFromInt(ih);
+    if (fw <= 0 or fh <= 0 or rect.width <= 0 or rect.height <= 0) return rect;
+    const scale = @min(rect.width / fw, rect.height / fh);
+    const w = fw * scale;
+    const h = fh * scale;
+    return .{
+        .x = rect.x + (rect.width - w) / 2,
+        .y = rect.y + (rect.height - h) / 2,
+        .width = w,
+        .height = h,
+    };
+}
+
 fn vcenter(rect: Rect, h: f32) f32 {
     return rect.y + (rect.height - h) / 2;
 }
@@ -1819,7 +2009,7 @@ fn paintWrappedText(ctx: *const Context, v: View, wt: WrappedTextData, rect: Rec
     const px = resolvedFontSize(ctx, v);
     const lh = shape.lineHeight(ctx.cache.face, px);
     const color = ctx.foreground.multiplyAlpha(op);
-    const lines = try shape.wrapText(ctx.arena, ctx.cache.face, wt.string, px, rect.width);
+    const lines = wrapCached(ctx.arena, ctx.cache.face, wt.string, px, rect.width);
     for (lines, 0..) |ln, i| {
         const slice = wt.string[ln.start..ln.end];
         const y = rect.y + @as(f32, @floatFromInt(i)) * lh;
@@ -3406,6 +3596,65 @@ test "view: Table shows a header + rows and selects a row on tap" {
     try testing.expectEqual(@as(usize, 3), row_hits);
     try testing.expect(dispatchTap(env.hits.items, second.?.center()));
     try testing.expectEqual(@as(i64, 1), sel.get());
+}
+
+test "view: DataTable sortable header toggles the sort binding" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var sort = state.State(SortColumn).init(testing.allocator, .{});
+    defer sort.deinit();
+    const cols = [_]DataColumn{
+        .{ .title = "Name" }, // not sortable -> no tap target
+        .{ .title = "Size", .width = 80, .sortable = true, .trailing = true },
+    };
+    const rows = [_][]const View{
+        &.{ Text("Ada"), Text("6 GB") },
+        &.{ Text("Alan"), Text("9 GB") },
+    };
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    try render(&c, DataTable(&cols, &rows, sort.binding(), null), .{ .x = 0, .y = 0, .width = 300, .height = 200 }, &canvas);
+
+    // Only the one sortable header registers a tap target.
+    var header_hit: ?Rect = null;
+    var count: usize = 0;
+    for (env.hits.items) |hr| {
+        if (hr.action == .callback) {
+            header_hit = hr.rect;
+            count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+
+    // First tap on a fresh column sorts by it, descending.
+    try testing.expect(dispatchTap(env.hits.items, header_hit.?.center()));
+    try testing.expectEqual(@as(i64, 1), sort.get().index);
+    try testing.expectEqual(SortDir.descending, sort.get().dir);
+
+    // Tapping the same column again toggles to ascending.
+    try testing.expect(dispatchTap(env.hits.items, header_hit.?.center()));
+    try testing.expectEqual(SortDir.ascending, sort.get().dir);
+}
+
+test "view: truncateToWidth shortens overflowing text with an ellipsis" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    const long = "Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-NEO-CODE";
+    const px: f32 = 13;
+    const full = shape.measureLineWidth(c.cache.face, long, px);
+
+    // Ample room → returned unchanged.
+    try testing.expectEqualStrings(long, truncateToWidth(&c, long, px, full + 10));
+
+    // Constrained → shortened, ends with the ellipsis, and fits the budget.
+    const out = truncateToWidth(&c, long, px, full / 2);
+    try testing.expect(out.len < long.len);
+    try testing.expect(std.mem.endsWith(u8, out, "…"));
+    try testing.expect(shape.measureLineWidth(c.cache.face, out, px) <= full / 2);
 }
 
 fn gridCell(cell_color: Color) View {

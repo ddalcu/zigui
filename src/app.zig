@@ -189,6 +189,13 @@ pub fn setClipboardText(allocator: std.mem.Allocator, text: []const u8) void {
     _ = c.SDL_SetClipboardText(z.ptr);
 }
 
+/// Open a URL (or `file://…` path) in the OS default handler — opens a folder in
+/// Finder/Explorer/the file manager, or a web URL in the browser. Cross-platform
+/// via SDL3 (`NSWorkspace` / `ShellExecute` / `xdg-open`). Returns false on failure.
+pub fn openUrl(url: [*:0]const u8) bool {
+    return c.SDL_OpenURL(url);
+}
+
 /// Read UTF-8 text from the system clipboard. Returns an allocator-owned copy the
 /// caller must free, or null when the clipboard is empty. (SDL returns an empty
 /// string rather than null on failure; we normalize that to null.)
@@ -274,6 +281,24 @@ pub fn openFileDialog(filters: []const FileFilter, default_location: ?[*:0]const
         g_window,
         if (filters.len > 0) filters.ptr else null,
         @intCast(filters.len),
+        default_location orelse null,
+        false, // allow_many
+    );
+    return true;
+}
+
+/// Show the native "Open Folder" dialog (single folder). Returns false if a
+/// dialog is already open. Shares the same result plumbing as `openFileDialog`
+/// — poll `takeFileDialogResult` each frame for the chosen directory path.
+/// Call from the main thread.
+pub fn openFolderDialog(default_location: ?[*:0]const u8) bool {
+    if (g_dialog_open) return false;
+    g_dialog_open = true;
+    g_dialog_done.store(false, .release);
+    c.SDL_ShowOpenFolderDialog(
+        fileDialogThunk,
+        null,
+        g_window,
         default_location orelse null,
         false, // allow_many
     );
@@ -531,6 +556,13 @@ pub fn run(
 
     // Let the (platform-free) context menu copy/paste via the SDL clipboard.
     zigui.setClipboardOps(.{ .copy = clipboardCopy, .paste = clipboardPaste });
+
+    // Cache wrapped-text layout across frames so a long, static transcript isn't
+    // re-wrapped on every redraw (only changing text actually re-wraps).
+    var wrap_cache = zigui.WrapCache.init(gpa);
+    defer wrap_cache.deinit();
+    zigui.setWrapCache(&wrap_cache);
+    defer zigui.setWrapCache(null);
 
     // A dedicated arena + scratch region lists for redraws issued from the macOS
     // live-resize event watch, so a watch-triggered frame never aliases the main

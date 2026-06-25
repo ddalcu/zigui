@@ -192,3 +192,136 @@ fn tableCell(content: View, width: ?f32, leading: bool) View {
     if (width) |w| return v.frameWidth(w);
     return v.frameMaxWidth();
 }
+
+// ---------------------------------------------------------------------------
+// DataTable — a sortable table whose cells are arbitrary views
+// ---------------------------------------------------------------------------
+
+/// Sort direction for a `DataTable` column.
+pub const SortDir = enum { ascending, descending };
+
+/// Which column a `DataTable` is sorted by, and in which direction. `index` is
+/// the column's position in the `columns` slice (-1 = unsorted). Keep this in app
+/// `State` and pass `.binding()` to `DataTable`: the table flips it when a
+/// sortable header is clicked, and the app re-sorts its rows to match. A fresh
+/// column defaults to `.descending` (largest / most / newest first); clicking the
+/// active column again toggles the direction.
+pub const SortColumn = struct { index: i64 = -1, dir: SortDir = .descending };
+
+/// One column of a `DataTable`. `width` of `null` makes the column flexible (it
+/// shares the leftover width evenly with the other flexible columns). `sortable`
+/// makes the header clickable — it toggles the table's `sort` binding and shows a
+/// direction chevron when active. `trailing` right-aligns the header and cells
+/// (use it for numeric columns).
+pub const DataColumn = struct {
+    title: []const u8,
+    width: ?f32 = null,
+    sortable: bool = false,
+    trailing: bool = false,
+};
+
+const SortCtx = struct { binding: Binding(SortColumn), col: i64 };
+
+fn sortThunk(p: ?*anyopaque) void {
+    const c: *SortCtx = @ptrCast(@alignCast(p.?));
+    const cur = c.binding.get();
+    if (cur.index == c.col) {
+        c.binding.set(.{ .index = c.col, .dir = if (cur.dir == .descending) .ascending else .descending });
+    } else {
+        c.binding.set(.{ .index = c.col, .dir = .descending });
+    }
+}
+
+/// A `Callback` that, when a sortable header is tapped, sets `binding` to sort by
+/// `col` (toggling the direction if it was already the sorted column).
+fn sortAction(binding: Binding(SortColumn), col: i64) view.Callback {
+    const c = view.buildAlloc().create(SortCtx) catch @panic("oom");
+    c.* = .{ .binding = binding, .col = col };
+    return .{ .ctx = c, .func = sortThunk };
+}
+
+/// Size a cell to its column (fixed width, or flexible) and pin its content to
+/// the leading edge (or trailing, for numeric columns) via the frame's alignment
+/// — NOT a Spacer, so a `.truncated()` child can shrink to fill the column rather
+/// than being squeezed to half-width by a competing Spacer.
+fn dataCell(content: View, col: DataColumn) View {
+    const framed = if (col.width) |w| content.frameWidth(w) else content.frameMaxWidth();
+    return if (col.trailing) framed.frameAlign(.trailing) else framed.frameAlign(.leading);
+}
+
+fn headerCell(col: DataColumn, index: usize, sort: ?Binding(SortColumn)) View {
+    const bt = view.buildTokens();
+    const sortable = col.sortable and sort != null;
+    const active = sortable and sort.?.get().index == @as(i64, @intCast(index));
+    const dir: SortDir = if (sort) |s| s.get().dir else .descending;
+
+    const label = view.Text(col.title).font(.subheadline)
+        .foreground(if (active) bt.accent else bt.secondary_label);
+    const arrow = view.Icon(if (dir == .ascending) icons.Icon.chevron_up else icons.Icon.chevron_down, 10, bt.accent);
+
+    // Title (+ active sort arrow). `makeStackFromSlice` keeps the slice, so it must
+    // live in the build arena, not on the stack. `dataCell` pins it to the column
+    // edge — no Spacer needed.
+    var buf: [2]View = undefined;
+    var n: usize = 0;
+    buf[n] = label;
+    n += 1;
+    if (active) {
+        buf[n] = arrow;
+        n += 1;
+    }
+    const kids = view.buildAlloc().alloc(View, n) catch @panic("oom");
+    @memcpy(kids, buf[0..n]);
+
+    var cell = dataCell(view.makeStackFromSlice(.horizontal, 4, .center, kids), col);
+    if (sortable) {
+        cell = cell.paddingInsets(.{ .top = 2, .leading = 4, .bottom = 2, .trailing = 4 })
+            .cornerRadius(5)
+            .hoverFill(bt.hover)
+            .onTap(sortAction(sort.?, @intCast(index)));
+    }
+    return cell;
+}
+
+/// A multi-column table whose cells are arbitrary views (badges, buttons, icons —
+/// not just text), with clickable, sortable headers. `rows[r][c]` is the view for
+/// row `r`, column `c`; rows shorter than `columns` pad with blanks. Pass a `sort`
+/// binding to enable sorting: clicking a `sortable` header updates the binding and
+/// shows a direction chevron, and the app re-sorts its data to match (the table
+/// renders rows in the order given — it does not reorder them itself). Pass a
+/// `scroll` state to make the body wheel-scrollable (the offset persists across
+/// frames); pass null for a static viewport. The fixed header sits over
+/// zebra-striped body rows; wrap the result in a fixed `.frameHeight`/
+/// `.frameMaxHeight` for the bordered, scrollable look.
+pub fn DataTable(columns: []const DataColumn, rows: []const []const View, sort: ?Binding(SortColumn), scroll: ?*view.ScrollState) View {
+    const bt = view.buildTokens();
+
+    const header_cells = view.buildAlloc().alloc(View, columns.len) catch @panic("oom");
+    for (columns, 0..) |col, c| header_cells[c] = headerCell(col, c, sort);
+    const header = view.makeStackFromSlice(.horizontal, 8, .center, header_cells)
+        .paddingInsets(.{ .top = 6, .leading = 8, .bottom = 6, .trailing = 8 })
+        .frameMaxWidth();
+
+    const row_views = view.buildAlloc().alloc(View, rows.len) catch @panic("oom");
+    for (rows, 0..) |row, r| {
+        const cells = view.buildAlloc().alloc(View, columns.len) catch @panic("oom");
+        for (columns, 0..) |col, c| {
+            const content = if (c < row.len) row[c] else view.Spacer();
+            cells[c] = dataCell(content, col);
+        }
+        var rv = view.makeStackFromSlice(.horizontal, 8, .center, cells)
+            .paddingInsets(.{ .top = 6, .leading = 8, .bottom = 6, .trailing = 8 })
+            .frameMaxWidth();
+        // Subtle zebra striping like a macOS table.
+        if (r % 2 == 1) rv = rv.background(bt.row_stripe);
+        row_views[r] = rv;
+    }
+    const body = view.makeStackFromSlice(.vertical, 0, .leading, row_views).frameMaxWidth();
+    const viewport = if (scroll) |s| view.ScrollViewState(s, body) else view.ScrollView(body);
+
+    return view.VStack(.{
+        header,
+        view.Divider(),
+        viewport.frameMaxWidth().frameMaxHeight(),
+    }).spacing(0).frameMaxWidth();
+}

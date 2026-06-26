@@ -22,6 +22,10 @@ pub const Config = struct {
     title: [:0]const u8 = "zigui",
     width: u32 = 900,
     height: u32 = 600,
+    /// Minimum window size the user can resize to (0 = no limit). Applied via
+    /// SDL_SetWindowMinimumSize after the window is created.
+    min_width: u32 = 0,
+    min_height: u32 = 0,
     theme: zigui.Theme = zigui.default_theme,
     /// When true, the window's close button hides the window (keeping the app
     /// alive in the tray) instead of quitting. Use with a `Tray` that offers a
@@ -498,6 +502,9 @@ pub fn run(
         return Error.SdlInit;
     };
     defer c.SDL_DestroyWindow(window);
+
+    if (cfg.min_width > 0 and cfg.min_height > 0)
+        _ = c.SDL_SetWindowMinimumSize(window, @intCast(cfg.min_width), @intCast(cfg.min_height));
 
     // Prefer the GPU backend; when device/swapchain creation fails (no Vulkan
     // driver, headless CI, ZIGUI_SOFTWARE set) fall back to the software

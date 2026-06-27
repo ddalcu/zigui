@@ -47,8 +47,12 @@ pub const DrawCommand = union(enum) {
     },
     line: struct { a: Point, b: Point, width: f32 = 1, color: Color },
     /// A glyph (or any coverage mask) tinted with `color`, drawn so the mask's
-    /// top-left lands at `rect` origin and is scaled to `rect` size.
-    glyph: struct { rect: Rect, color: Color, coverage: Coverage },
+    /// top-left lands at `rect` origin and is scaled to `rect` size. `gamma` is
+    /// the exponent applied to coverage at composite time (`cov' = pow(cov,
+    /// gamma)`): 1.0 leaves it untouched, < 1 thickens the anti-aliased edge
+    /// (gamma-correct text on a dark background), > 1 thins it (dark-on-light).
+    /// Both backends apply it identically, so the paths stay pixel-matched.
+    glyph: struct { rect: Rect, color: Color, coverage: Coverage, gamma: f32 = 1 },
     image: struct { rect: Rect, image: Image },
     /// Blur the pixels already drawn beneath `rect`, then composite `tint` over
     /// the result — the primitive behind frosted "material" backgrounds. `sigma`
@@ -105,6 +109,11 @@ pub const Canvas = struct {
     }
     pub fn drawGlyph(self: *Canvas, rect: Rect, color: Color, coverage: Coverage) !void {
         try self.push(.{ .glyph = .{ .rect = rect, .color = color, .coverage = coverage } });
+    }
+    /// Like `drawGlyph` but with an explicit coverage `gamma` (see the `glyph`
+    /// command). The text path uses this to apply the active `setTextGamma`.
+    pub fn drawGlyphGamma(self: *Canvas, rect: Rect, color: Color, coverage: Coverage, gamma: f32) !void {
+        try self.push(.{ .glyph = .{ .rect = rect, .color = color, .coverage = coverage, .gamma = gamma } });
     }
     pub fn drawImage(self: *Canvas, rect: Rect, image: Image) !void {
         try self.push(.{ .image = .{ .rect = rect, .image = image } });

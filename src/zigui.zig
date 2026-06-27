@@ -59,6 +59,8 @@ pub const icons = @import("icons.zig");
 pub const Font = font.Font;
 pub const GlyphCache = atlas.GlyphCache;
 pub const drawText = font.drawText;
+pub const setTextGamma = font.setTextGamma;
+pub const textGamma = font.textGamma;
 
 pub const theme = @import("theme/theme.zig");
 pub const macos = @import("theme/macos.zig");

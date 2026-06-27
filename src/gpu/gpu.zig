@@ -604,6 +604,7 @@ pub const Gpu = struct {
         arena: Allocator,
         commands: []const zigui.DrawCommand,
         clear: zigui.Color,
+        oversample: f32,
     ) bool {
         const window = self.window orelse return false;
         const cmdbuf = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return false;
@@ -614,22 +615,29 @@ pub const Gpu = struct {
             _ = c.SDL_SubmitGPUCommandBuffer(cmdbuf);
             return false;
         }
-        const scene = self.translateScene(arena, commands, @floatFromInt(sw), @floatFromInt(sh)) orelse {
+        // Supersampling: render the scene into an oversampled texture (`dw`×`dh`)
+        // matching the already-scaled command list, then downscale it onto the
+        // swapchain in the final blit (LINEAR). `oversample` == 1 keeps the old
+        // 1:1 path exactly (NEAREST blit).
+        const ss = @max(1, oversample);
+        const dw: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(sw)) * ss));
+        const dh: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(sh)) * ss));
+        const scene = self.translateScene(arena, commands, @floatFromInt(dw), @floatFromInt(dh)) orelse {
             _ = c.SDL_SubmitGPUCommandBuffer(cmdbuf);
             return false;
         };
-        if (!self.ensureAtlasTexture() or !self.ensureFrameTextures(sw, sh) or !self.upload(cmdbuf, scene)) {
+        if (!self.ensureAtlasTexture() or !self.ensureFrameTextures(dw, dh) or !self.upload(cmdbuf, scene)) {
             _ = c.SDL_SubmitGPUCommandBuffer(cmdbuf);
             return false;
         }
 
-        self.encode(cmdbuf, scene, clear, sw, sh);
+        self.encode(cmdbuf, scene, clear, dw, dh);
 
         c.SDL_BlitGPUTexture(cmdbuf, &.{
-            .source = .{ .texture = self.scene_tex, .w = sw, .h = sh },
+            .source = .{ .texture = self.scene_tex, .w = dw, .h = dh },
             .destination = .{ .texture = swap_tex, .w = sw, .h = sh },
             .load_op = c.SDL_GPU_LOADOP_DONT_CARE,
-            .filter = c.SDL_GPU_FILTER_NEAREST,
+            .filter = if (dw != sw) c.SDL_GPU_FILTER_LINEAR else c.SDL_GPU_FILTER_NEAREST,
         });
         return c.SDL_SubmitGPUCommandBuffer(cmdbuf);
     }

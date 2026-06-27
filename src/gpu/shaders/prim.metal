@@ -96,6 +96,8 @@ fragment float4 prim_fragment(VOut in [[stage_in]],
         color = mix(in.color0, in.color1, t);
     } else if (kind == 3) {
         cov = atlas.sample(smp, in.uv).a;
+        // Coverage gamma (text contrast) in params.y; see prim.frag.
+        if (in.params.y != 1.0) cov = pow(cov, in.params.y);
     } else if (kind == 4) {
         color = atlas.sample(smp, in.uv);
     } else {

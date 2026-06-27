@@ -55,6 +55,23 @@ pub const Font = struct {
     }
 };
 
+/// Coverage gamma applied to every glyph the text path emits (see the `glyph`
+/// `DrawCommand`). 1.0 is a no-op — the default — so headless tests and callers
+/// that never set it render exactly as before. The app sets it per frame from
+/// the theme background (dark → < 1 to gamma-correct light text; light → 1.0).
+/// Thread-local so a render thread never races the main loop, mirroring the
+/// `setWrapCache` / `setThemeTokens` pattern.
+threadlocal var g_text_gamma: f32 = 1;
+
+/// Set the coverage gamma for subsequently emitted glyphs. See `g_text_gamma`.
+pub fn setTextGamma(gamma: f32) void {
+    g_text_gamma = gamma;
+}
+/// The gamma currently applied to emitted glyphs (1.0 = untouched).
+pub fn textGamma() f32 {
+    return g_text_gamma;
+}
+
 /// Paint `text` into `canvas` with its top-left at `origin`, at `pixel_size`,
 /// tinted `color`, using `cache` for glyph bitmaps.
 pub fn drawText(
@@ -78,11 +95,11 @@ pub fn drawText(
             .width = @floatFromInt(raster.width),
             .height = @floatFromInt(raster.height),
         };
-        try canvas.drawGlyph(rect, color, .{
+        try canvas.drawGlyphGamma(rect, color, .{
             .width = raster.width,
             .height = raster.height,
             .data = raster.data,
-        });
+        }, g_text_gamma);
     }
 }
 
@@ -114,11 +131,11 @@ pub fn drawTextScaled(
             .width = @as(f32, @floatFromInt(raster.width)) / scale,
             .height = @as(f32, @floatFromInt(raster.height)) / scale,
         };
-        try canvas.drawGlyph(rect, color, .{
+        try canvas.drawGlyphGamma(rect, color, .{
             .width = raster.width,
             .height = raster.height,
             .data = raster.data,
-        });
+        }, g_text_gamma);
     }
 }
 
@@ -149,11 +166,11 @@ pub fn drawIcon(
         .width = w,
         .height = h,
     };
-    try canvas.drawGlyph(rect, color, .{
+    try canvas.drawGlyphGamma(rect, color, .{
         .width = raster.width,
         .height = raster.height,
         .data = raster.data,
-    });
+    }, g_text_gamma);
 }
 
 // ---------------------------------------------------------------------------

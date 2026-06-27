@@ -113,7 +113,7 @@ pub fn render(allocator: Allocator, fb: *Framebuffer, commands: []const DrawComm
                 .c1 = c.c1,
             } }),
             .line => |c| drawLine(fb, clips.items, c.a, c.b, c.width, c.color),
-            .glyph => |c| drawGlyph(fb, clips.items, c.rect, c.color, c.coverage),
+            .glyph => |c| drawGlyph(fb, clips.items, c.rect, c.color, c.coverage, c.gamma),
             .image => |c| drawImage(fb, clips.items, c.rect, c.image),
             .blur_rect => |c| try blurRect(allocator, fb, clips.items, c.rect, c.radius, c.sigma, c.tint),
         }
@@ -455,7 +455,7 @@ fn drawLine(fb: *Framebuffer, clips: []const Clip, a: Point, b: Point, width: f3
     }
 }
 
-fn drawGlyph(fb: *Framebuffer, clips: []const Clip, rect: Rect, color: Color, cov: canvas_mod.Coverage) void {
+fn drawGlyph(fb: *Framebuffer, clips: []const Clip, rect: Rect, color: Color, cov: canvas_mod.Coverage, gamma: f32) void {
     if (cov.width == 0 or cov.height == 0) return;
     const cc = clippedBoundsOf(fb, clips, rect, 0);
     const b = cc.bounds;
@@ -479,6 +479,11 @@ fn drawGlyph(fb: *Framebuffer, clips: []const Clip, rect: Rect, color: Color, co
             const ui: u32 = @intFromFloat(u);
             if (ui >= cov.width) continue;
             var c = @as(f32, @floatFromInt(row[ui])) / 255.0;
+            // Coverage gamma (text contrast): thicken/thin the anti-aliased edge
+            // so light text on a dark background isn't rendered too thin. Skipped
+            // at gamma == 1 so the default path is byte-identical (no pow). Must
+            // precede the clip multiply to match the GPU shader exactly.
+            if (gamma != 1 and c > 0) c = std.math.pow(f32, c, gamma);
             if (cc.check_clip and c > 0) c *= clipCoverage(clips, px, py);
             if (c > 0) fb.blend(x, y, color, c);
         }
@@ -633,6 +638,35 @@ test "raster: glyph coverage is tinted and blitted" {
     try renderCanvas(&fb, &c);
     try testing.expect(fb.at(0, 0).approxEql(Color.red, 0.02)); // covered texel
     try testing.expect(fb.at(1, 1).approxEql(Color.white, 0.02)); // uncovered
+}
+
+test "raster: glyph coverage gamma thickens the anti-aliased edge" {
+    // A half-covered texel of light text on a dark background. gamma == 1 blends
+    // at raw 0.5 coverage; gamma < 1 raises the coverage, so the edge pixel ends
+    // up lighter (more ink) — the gamma-correct fix for thin light-on-dark text.
+    const data = [_]u8{128}; // ~0.502 coverage
+    const cov = canvas_mod.Coverage{ .width = 1, .height = 1, .data = &data };
+
+    var plain = try Framebuffer.init(testing.allocator, 1, 1);
+    defer plain.deinit();
+    plain.clear(Color.black);
+    var c1 = Canvas.init(testing.allocator);
+    defer c1.deinit();
+    try c1.drawGlyph(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, Color.white, cov);
+    try renderCanvas(&plain, &c1);
+
+    var corrected = try Framebuffer.init(testing.allocator, 1, 1);
+    defer corrected.deinit();
+    corrected.clear(Color.black);
+    var c2 = Canvas.init(testing.allocator);
+    defer c2.deinit();
+    try c2.drawGlyphGamma(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, Color.white, cov, 0.5);
+    try renderCanvas(&corrected, &c2);
+
+    // gamma 0.5 raises ~0.502 coverage to ~0.709, so the pixel is brighter.
+    try testing.expect(corrected.at(0, 0).r > plain.at(0, 0).r + 0.15);
+    // gamma == 1 leaves the raw coverage untouched.
+    try testing.expectApproxEqAbs(@as(f32, 0.502), plain.at(0, 0).r, 0.01);
 }
 
 test "raster: image blit copies pixels" {

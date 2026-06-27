@@ -60,6 +60,10 @@ void main() {
         color = mix(f_color0, f_color1, t);
     } else if (kind == 3) { // glyph: coverage in atlas alpha, tinted by color0
         cov = texture(atlas, v_uv).a;
+        // Coverage gamma (text contrast) in params.y — repurposed here since
+        // glyphs have no corner radius. Mirrors raster.zig's drawGlyph: thicken
+        // the AA edge for light-on-dark text. Applied before the clip multiply.
+        if (f_params.y != 1.0) cov = pow(cov, f_params.y);
     } else if (kind == 4) { // image: RGBA straight from the atlas
         color = texture(atlas, v_uv);
     } else { // line segment with round caps

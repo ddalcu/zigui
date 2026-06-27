@@ -337,6 +337,10 @@ pub fn translate(
                             try coverageToRgba(arena, g.coverage),
                         );
                         inst.params[0] = @floatFromInt(@intFromEnum(Kind.glyph));
+                        // params[1] (unused by glyphs — no corner radius) carries
+                        // the coverage gamma the fragment shader applies, matching
+                        // the software rasterizer's `drawGlyph`.
+                        inst.params[1] = g.gamma;
                     },
                     .image => |im| {
                         if (im.image.width == 0 or im.image.height == 0) continue;

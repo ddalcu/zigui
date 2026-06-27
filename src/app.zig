@@ -18,6 +18,9 @@ pub const c = @cImport({
 
 pub const gpu = @import("gpu/gpu.zig");
 
+/// Row-major RGBA8 window icon (`rgba` is `w*h*4` bytes). See `Config.icon`.
+pub const WindowIcon = struct { rgba: []const u8, w: c_int, h: c_int };
+
 pub const Config = struct {
     title: [:0]const u8 = "zigui",
     width: u32 = 900,
@@ -36,6 +39,18 @@ pub const Config = struct {
     /// software path; the `ZIGUI_SOFTWARE` environment variable does the same
     /// at runtime.
     gpu: bool = true,
+    /// Optional window/taskbar icon, set via `SDL_SetWindowIcon` after the window
+    /// is created. `rgba` is row-major RGBA8 (`w*h*4` bytes); the surface is
+    /// copied by SDL, so the caller may free `rgba` after `run` sets it.
+    icon: ?WindowIcon = null,
+    /// Supersampling factor: the UI is rendered into a framebuffer this many
+    /// times larger per axis, then downscaled on present (SSAA). On a low-DPI
+    /// (100%) display this is what makes text crisp — gamma adds weight, but
+    /// only extra device pixels add edge resolution. 1 = off (default). 2 is a
+    /// good value for 96-dpi monitors; it costs ~4× the fill (negligible on the
+    /// GPU, heavier on the software fallback). Capped internally so an already
+    /// HiDPI display isn't oversampled past ~2× effective device pixels.
+    supersample: f32 = 1,
 };
 
 pub const Error = error{ SdlInit, TrayInit };
@@ -149,6 +164,13 @@ pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
 /// The cursor's last known position in logical points, or null when it has left
 /// the window. Fed into `Context.hover_point` each frame for hover highlights.
 var g_hover_point: ?zigui.geometry.Point = null;
+
+/// Scale converting SDL mouse coordinates (logical window points) into the
+/// design-point space that hit/scroll regions live in. `drawFrame` updates it
+/// each frame to `pixel_density / display_scale`: 1.0 on macOS (where the OS UI
+/// scale rides on the backing scale), but <1 on Windows/Linux at a non-100% OS
+/// display-scale setting, where the two diverge. See `drawFrame`.
+var g_event_scale: f32 = 1;
 
 var g_frame_log: bool = false;
 pub fn setFrameLog(on: bool) void {
@@ -506,6 +528,14 @@ pub fn run(
     if (cfg.min_width > 0 and cfg.min_height > 0)
         _ = c.SDL_SetWindowMinimumSize(window, @intCast(cfg.min_width), @intCast(cfg.min_height));
 
+    // Window/taskbar icon (SDL copies the surface, so we free it immediately).
+    if (cfg.icon) |ic| {
+        if (makeSurface(ic.rgba, ic.w, ic.h)) |surf| {
+            _ = c.SDL_SetWindowIcon(window, surf);
+            c.SDL_DestroySurface(surf);
+        }
+    }
+
     // Prefer the GPU backend; when device/swapchain creation fails (no Vulkan
     // driver, headless CI, ZIGUI_SOFTWARE set) fall back to the software
     // rasterizer presented through an SDL streaming texture.
@@ -637,9 +667,39 @@ pub fn run(
             _ = c.SDL_GetWindowSizeInPixels(fr.window, &pw, &ph);
             if (lw <= 0 or lh <= 0 or pw <= 0 or ph <= 0) return false;
             const t0 = c.SDL_GetPerformanceCounter();
-            const scale: f32 = @as(f32, @floatFromInt(pw)) / @as(f32, @floatFromInt(lw));
-            const uw: u32 = @intCast(pw);
-            const uh: u32 = @intCast(ph);
+            const fpw: f32 = @floatFromInt(pw);
+            const fph: f32 = @floatFromInt(ph);
+            // `display_scale` is the OS-honored content scale: it folds the HiDPI
+            // backing density AND the user's display-scale setting (Windows
+            // 125/150/200%, fractional scaling on Linux). The earlier `pw/lw`
+            // captured only the backing density, so non-100% OS scaling was
+            // ignored everywhere except macOS (where the two coincide). We lay the
+            // UI out in `device_pixels / display_scale` design points and scale
+            // each ×display_scale, so a control keeps its physical size on any
+            // display. A 0.0 return means SDL couldn't query it — fall back to 1.
+            const display_scale = c.SDL_GetWindowDisplayScale(fr.window);
+            const base_scale: f32 = if (display_scale > 0) display_scale else 1;
+            // Supersampling (SSAA): render into a framebuffer `ss`× larger per
+            // axis, then downscale on present. This is the lever that makes text
+            // crisp on a low-DPI (100%) display. Capped so the *total* device
+            // scale stays ≤ 2 — a Retina/HiDPI panel already has the pixels, so
+            // we never render it at 4×.
+            const ss: f32 = @max(1, @min(@max(1, fr.cfg.supersample), 2 / base_scale));
+            // `scale` is device-pixels-per-design-point (backing × supersample);
+            // layout still happens in design points (`base_scale` only), so hit
+            // regions and event mapping are unaffected by `ss`.
+            const scale: f32 = base_scale * ss;
+            const point_w = fpw / base_scale;
+            const point_h = fph / base_scale;
+            // SDL mouse events arrive in logical window points; hit regions live
+            // in design points. Convert by pixel_density / display_scale (== 1 on
+            // macOS); `ss` cancels out since it doesn't change the design space.
+            const pixel_density = fpw / @as(f32, @floatFromInt(lw));
+            g_event_scale = pixel_density / base_scale;
+            // The framebuffer/scene is the oversampled device size; present
+            // downscales it to the window's actual pixel size (pw×ph).
+            const uw: u32 = @intFromFloat(@round(fpw * ss));
+            const uh: u32 = @intFromFloat(@round(fph * ss));
 
             // Frame clock for time-based UI (auto-hiding scrollbars, etc.).
             zigui.setFrameTime(c.SDL_GetTicks());
@@ -668,15 +728,27 @@ pub fn run(
             ctx.icon_cache = fr.icon_cache;
             ctx.hover_point = g_hover_point;
 
+            // Coverage gamma for text: a straight sRGB alpha-blend renders the
+            // anti-aliased edge of light glyphs on a dark background too thin
+            // (the classic "soft" custom-UI text). Gamma-correcting the coverage
+            // restores weight. Dark themes lighten the edge (~0.6 ≈ the
+            // gamma-correct result); light themes are left untouched (1.0) since
+            // dark-on-light doesn't suffer the same thinning. Both backends apply
+            // the same exponent, so software/GPU output stays pixel-matched.
+            const dark_ui = theme.colors.window_background.luminance() < 0.5;
+            zigui.setTextGamma(if (dark_ui) 0.6 else 1.0);
+
             var canvas = zigui.Canvas.init(arena);
             // No background fill command here: the framebuffer's `clear` below paints
             // the window background with a fast @memset, so emitting a full-window
             // fill_rrect would just re-rasterize every pixel through the SDF path.
-            zigui.renderScaled(&ctx, root, .{ .x = 0, .y = 0, .width = @floatFromInt(lw), .height = @floatFromInt(lh) }, scale, &canvas) catch {};
+            zigui.renderScaled(&ctx, root, .{ .x = 0, .y = 0, .width = point_w, .height = point_h }, scale, &canvas) catch {};
 
             if (fr.gpu_backend) |g| {
                 // GPU backend: translate + replay the command list on the GPU.
-                if (!g.frame(arena, canvas.commands.items, theme.colors.window_background)) return false;
+                // `ss` makes it render the scene oversampled and downscale on the
+                // final blit (SSAA), mirroring the software texture path below.
+                if (!g.frame(arena, canvas.commands.items, theme.colors.window_background, ss)) return false;
             } else {
                 // Software backend. Persistent framebuffer + RGBA buffer:
                 // reallocated only when the pixel size changes, so a
@@ -692,11 +764,17 @@ pub fn run(
                 }
                 fr.fb.toRgba8(fr.rgba.*);
 
-                if (fr.texture.* == null or fr.tex_w.* != pw or fr.tex_h.* != ph) {
+                // The texture is the oversampled (uw×uh) size; `SDL_RenderTexture`
+                // with a null dst stretches it to the window's pixel size, and the
+                // LINEAR scale mode makes that a clean SSAA downsample.
+                const iuw: c_int = @intCast(uw);
+                const iuh: c_int = @intCast(uh);
+                if (fr.texture.* == null or fr.tex_w.* != iuw or fr.tex_h.* != iuh) {
                     if (fr.texture.*) |t| c.SDL_DestroyTexture(t);
-                    fr.texture.* = c.SDL_CreateTexture(rend, c.SDL_PIXELFORMAT_ABGR8888, c.SDL_TEXTUREACCESS_STREAMING, pw, ph);
-                    fr.tex_w.* = pw;
-                    fr.tex_h.* = ph;
+                    fr.texture.* = c.SDL_CreateTexture(rend, c.SDL_PIXELFORMAT_ABGR8888, c.SDL_TEXTUREACCESS_STREAMING, iuw, iuh);
+                    if (fr.texture.*) |t| _ = c.SDL_SetTextureScaleMode(t, c.SDL_SCALEMODE_LINEAR);
+                    fr.tex_w.* = iuw;
+                    fr.tex_h.* = iuh;
                 }
                 _ = c.SDL_UpdateTexture(fr.texture.*, null, fr.rgba.*.ptr, @intCast(uw * 4));
                 _ = c.SDL_RenderClear(rend);
@@ -784,9 +862,10 @@ pub fn run(
             continue;
         }
 
-        // Event handling. Hit/scroll regions stay in logical points (renderScaled
-        // leaves them unscaled) and SDL reports mouse coordinates in points too,
-        // so no conversion is needed before dispatch. While animating *or* while a
+        // Event handling. Hit/scroll regions stay in design points (renderScaled
+        // leaves them unscaled); SDL reports mouse coordinates in logical window
+        // points, so `handleEvent` converts via `g_event_scale` before dispatch
+        // (a no-op on macOS). While animating *or* while a
         // busy predicate is set (e.g. a streaming request in flight), wake on a
         // ~60fps timeout and rebuild each frame; otherwise block for input.
         var ev: c.SDL_Event = undefined;
@@ -815,6 +894,12 @@ fn waitOne(running: *bool, st: anytype, cfg: Config) void {
     }
 }
 
+/// SDL reports mouse coordinates in logical window points; hit/scroll regions
+/// live in design points. Bring an event coordinate into region space.
+fn eventPoint(x: f32, y: f32) zigui.geometry.Point {
+    return .{ .x = x * g_event_scale, .y = y * g_event_scale };
+}
+
 fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, scrolls: []const zigui.ScrollRegion) void {
     // With frame logging on, also log which events wake the loop (each wake
     // costs a full rebuild+raster) so redraw storms can be attributed.
@@ -827,7 +912,7 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             running.* = false;
         },
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
-            const p = zigui.geometry.Point{ .x = ev.button.x, .y = ev.button.y };
+            const p = eventPoint(ev.button.x, ev.button.y);
             if (ev.button.button == c.SDL_BUTTON_RIGHT) {
                 // Right-click pops the text context menu when over an editable
                 // field; elsewhere it just dismisses any open menu.
@@ -852,7 +937,7 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         },
         // Drag the mouse with the left button held to extend a text selection.
         c.SDL_EVENT_MOUSE_MOTION => {
-            const mp = zigui.geometry.Point{ .x = ev.motion.x, .y = ev.motion.y };
+            const mp = eventPoint(ev.motion.x, ev.motion.y);
             g_hover_point = mp; // drives Modifiers.hover_fill highlights
             // Track the hovered context-menu item (the loop redraws after this
             // event, so the highlight follows the cursor).
@@ -867,7 +952,7 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             var mx: f32 = 0;
             var my: f32 = 0;
             _ = c.SDL_GetMouseState(&mx, &my);
-            _ = zigui.dispatchScroll(scrolls, .{ .x = mx, .y = my }, ev.wheel.y);
+            _ = zigui.dispatchScroll(scrolls, eventPoint(mx, my), ev.wheel.y);
         },
         c.SDL_EVENT_TEXT_INPUT => {
             if (zigui.focusedField()) |f| {

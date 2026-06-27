@@ -252,6 +252,10 @@ pub const Modifiers = struct {
     /// centering (letterboxed) — instead of rendering at fixed native pixels.
     /// See `.scaledToFit()`.
     scaled_to_fit: bool = false,
+    /// A `TextEditor` that word-wraps long lines to its width (no horizontal
+    /// scroll) — for prose/prompt inputs. Ignored when line numbers are on (a
+    /// code editor stays non-wrapping). See `.softWrap()`.
+    soft_wrap: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,6 +482,13 @@ pub const View = struct {
     pub fn scaledToFit(self: View) View {
         var v = self;
         v.mods.scaled_to_fit = true;
+        return v;
+    }
+    /// Word-wrap a `TextEditor` to its width (prose/prompt input). No effect on
+    /// other views or on an editor with line numbers.
+    pub fn softWrap(self: View) View {
+        var v = self;
+        v.mods.soft_wrap = true;
         return v;
     }
     pub fn background(self: View, c: Color) View {
@@ -1007,14 +1018,26 @@ pub const TextClick = struct {
     origin: Point,
     scroll_y: f32,
     line_height: f32,
+    /// Wrapped visual rows (byte ranges into the text) when the editor is in
+    /// soft-wrap mode; empty for the normal one-row-per-logical-line editor.
+    /// Computed at paint and valid until the next rebuild (arena), so the click
+    /// maps to a caret without re-wrapping. See `caretIndexAt`.
+    rows: []const shape.WrappedLine = &.{},
 };
 
 /// Map a pixel point to a caret byte index within a `TextEditor`, clamping to
 /// the document (a point above/below/left maps to the nearest edge).
 fn caretIndexAt(tc: TextClick, p: Point) usize {
     const txt = tc.state.text();
-    const total = text_buffer.countLines(txt);
     const rel_y = p.y - tc.origin.y + tc.scroll_y;
+    // Soft-wrap editor: rows are visual wrapped lines (byte ranges into `txt`).
+    if (tc.rows.len > 0) {
+        var ri: usize = if (rel_y <= 0) 0 else @intFromFloat(rel_y / tc.line_height);
+        if (ri >= tc.rows.len) ri = tc.rows.len - 1;
+        const row = tc.rows[ri];
+        return row.start + text_buffer.caretInLine(tc.face, tc.px, txt[row.start..row.end], p.x - tc.origin.x);
+    }
+    const total = text_buffer.countLines(txt);
     var li: usize = if (rel_y <= 0) 0 else @intFromFloat(rel_y / tc.line_height);
     if (li >= total) li = total - 1;
     const r = text_buffer.nthLineRange(txt, li);
@@ -2111,6 +2134,79 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
     const text_x = rect.x + gutter_w + pad;
     const top = rect.y + pad;
     const view_h = @max(0, rect.height - 2 * pad);
+
+    // Soft-wrap mode (prose/prompt inputs): render visual wrapped rows instead of
+    // one row per logical line, so long text wraps to the width and stays visible
+    // (no horizontal scroll). Disabled when line numbers are on (code editor).
+    if (v.mods.soft_wrap and !ed.line_numbers) {
+        const wrap_w = @max(1, rect.x + rect.width - pad - text_x);
+        const rows = wrapCached(ctx.arena, face, text, px, wrap_w);
+        const nrows = rows.len;
+
+        ed.scroll.content_h = @as(f32, @floatFromInt(nrows)) * lh;
+        ed.scroll.viewport_h = view_h;
+
+        var caret_row: usize = nrows - 1;
+        for (rows, 0..) |row, i| {
+            if (st.caret <= row.end) {
+                caret_row = i;
+                break;
+            }
+        }
+        if (st.caret != st.last_caret) {
+            const cy = @as(f32, @floatFromInt(caret_row)) * lh;
+            if (cy < ed.scroll.offset) {
+                ed.scroll.offset = cy;
+            } else if (cy + lh > ed.scroll.offset + view_h) {
+                ed.scroll.offset = cy + lh - view_h;
+            }
+            st.last_caret = st.caret;
+        }
+        ed.scroll.offset = std.math.clamp(ed.scroll.offset, 0, ed.scroll.maxOffset());
+        const off = ed.scroll.offset;
+
+        const fg = ctx.foreground.multiplyAlpha(op);
+        const sel_c = ctx.theme.colors.selection.multiplyAlpha(op);
+        const sel = st.selectionRange();
+
+        try canvas.pushClip(rect.insetBy(2, 2), 0);
+        for (rows, 0..) |row, i| {
+            const y = top - off + @as(f32, @floatFromInt(i)) * lh;
+            if (y + lh < top or y > top + view_h) continue;
+            if (sel) |s| {
+                if (s.start <= row.end and s.end >= row.start) {
+                    const a = @max(s.start, row.start);
+                    const b = @min(s.end, row.end);
+                    const hx0 = text_x + text_buffer.editorPrefixWidth(face, px, text[row.start..a]);
+                    const hx1 = text_x + text_buffer.editorPrefixWidth(face, px, text[row.start..b]);
+                    try canvas.fillRect(.{ .x = hx0, .y = y, .width = @max(1, hx1 - hx0), .height = lh }, sel_c);
+                }
+            }
+            if (row.end > row.start) drawEditorLine(ctx, canvas, text[row.start..row.end], px, fg, .{ .x = text_x, .y = y });
+            if (focused and i == caret_row) {
+                const cpos = std.math.clamp(st.caret, row.start, row.end);
+                const cx = text_x + text_buffer.editorPrefixWidth(face, px, text[row.start..cpos]);
+                try canvas.line(.{ .x = cx, .y = y + 1 }, .{ .x = cx, .y = y + lh - 1 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
+            }
+        }
+        canvas.popClip() catch {};
+
+        try ctx.hit_regions.append(ctx.arena, .{
+            .rect = rect,
+            .action = .{ .text_click = .{
+                .state = st,
+                .face = face,
+                .px = px,
+                .origin = .{ .x = text_x, .y = top },
+                .scroll_y = off,
+                .line_height = lh,
+                .rows = rows,
+            } },
+            .disabled = ctx.disabled,
+        });
+        if (ctx.scroll_regions) |regs| try regs.append(ctx.arena, .{ .rect = rect, .state = ed.scroll });
+        return;
+    }
 
     // Scroll geometry, then auto-follow the caret only when it actually moved.
     ed.scroll.content_h = @as(f32, @floatFromInt(nlines)) * lh;

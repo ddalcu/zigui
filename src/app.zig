@@ -851,16 +851,6 @@ pub fn run(
     _ = c.SDL_AddEventWatch(Render.resizeWatch, &frame);
     defer c.SDL_RemoveEventWatch(Render.resizeWatch, &frame);
 
-    // Persistent (gpa-owned) copies of the last presented frame's hit/scroll
-    // regions. When a frame is skipped (hidden window, or the GPU swapchain is
-    // congested by a heavy compute worker and the non-blocking acquire has no
-    // image), input keeps being dispatched against these — the layout can't
-    // have changed, since nothing new was presented.
-    var last_hits: std.ArrayList(zigui.HitRegion) = .empty;
-    defer last_hits.deinit(gpa);
-    var last_scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
-    defer last_scrolls.deinit(gpa);
-
     while (running) {
         // Per-frame hook (e.g. refresh the system-tray menu). Runs whether or not
         // the window is visible, so the tray tracks status even when hidden.
@@ -889,25 +879,30 @@ pub fn run(
         var hits: std.ArrayList(zigui.HitRegion) = .empty;
         var scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
         if (!Render.drawFrame(&frame, &arena_state, &hits, &scrolls)) {
-            // Frame skipped (hidden/degenerate window, or congested swapchain).
-            // Keep events flowing against the LAST presented frame's regions;
-            // while busy, wake on a short timeout so the next present retries
+            // Frame skipped. On the congested-swapchain path, drawFrame has
+            // already rebuilt the tree and filled `hits`/`scrolls` before the
+            // GPU acquire failed, so these regions describe the CURRENT frame
+            // and their `Callback.ctx` pointers target the current frame
+            // arena — valid until the next drawFrame resets it. Dispatching
+            // against them is therefore safe. A snapshot of a *previous*
+            // frame's regions never is: ctx pointers may be frame-arena-owned,
+            // and that arena was reset (and reused) by the rebuild above —
+            // dispatching a stale snapshot is a use-after-reset (observed as a
+            // sidebar-tap segfault during video generation). The pre-build
+            // early returns (hidden/degenerate window) leave the lists empty,
+            // which just makes dispatch a harmless no-op.
+            // While busy, wake on a short timeout so the next present retries
             // promptly instead of stalling until the next input event.
             var ev: c.SDL_Event = undefined;
             const ms = busyIntervalMs();
             if (ms != 0) {
-                if (c.SDL_WaitEventTimeout(&ev, @intCast(@min(ms, 16)))) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
+                if (c.SDL_WaitEventTimeout(&ev, @intCast(@min(ms, 16)))) handleEvent(&ev, &running, hits.items, scrolls.items);
             } else {
-                if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
+                if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
             }
-            while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
+            while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
             continue;
         }
-        // Snapshot the presented frame's regions for the skip path above.
-        last_hits.clearRetainingCapacity();
-        last_hits.appendSlice(gpa, hits.items) catch {};
-        last_scrolls.clearRetainingCapacity();
-        last_scrolls.appendSlice(gpa, scrolls.items) catch {};
 
         // Event handling. Hit/scroll regions stay in design points (renderScaled
         // leaves them unscaled); SDL reports mouse coordinates in logical window

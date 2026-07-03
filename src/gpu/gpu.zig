@@ -611,8 +611,14 @@ pub const Gpu = struct {
         var swap_tex: ?*c.SDL_GPUTexture = null;
         var sw: u32 = 0;
         var sh: u32 = 0;
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(cmdbuf, window, &swap_tex, &sw, &sh) or swap_tex == null) {
-            _ = c.SDL_SubmitGPUCommandBuffer(cmdbuf);
+        // NON-blocking acquire: when the swapchain has no image ready (all
+        // frames in flight — e.g. the GPU is saturated by an AI worker's
+        // compute kernels), skip this frame instead of stalling the UI thread
+        // in a fence wait (SDL's Metal fence wait is a busy-spin, so the old
+        // SDL_WaitAndAcquireGPUSwapchainTexture both froze input for the
+        // duration of the longest kernel AND burned a core).
+        if (!c.SDL_AcquireGPUSwapchainTexture(cmdbuf, window, &swap_tex, &sw, &sh) or swap_tex == null) {
+            _ = c.SDL_CancelGPUCommandBuffer(cmdbuf);
             return false;
         }
         // Supersampling: render the scene into an oversampled texture (`dw`×`dh`)

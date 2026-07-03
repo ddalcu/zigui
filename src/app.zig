@@ -105,6 +105,27 @@ pub fn setBusyCheck(f: ?*const fn () bool) void {
     g_busy_fn = f;
 }
 
+/// A cadence-returning generalization of `setBusyCheck`: while the provider
+/// returns a non-zero interval (ms), the loop wakes on that timeout instead of
+/// blocking on input and rebuilds each frame — so a heavy GPU job can repaint a
+/// spinner at 10 fps (not fighting the worker for the GPU at 60) while video
+/// playback keeps its own smooth cadence. 0 means fully idle (block on input).
+/// Takes precedence over the boolean predicate when both are set.
+var g_busy_interval_fn: ?*const fn () u32 = null;
+pub fn setBusyInterval(f: ?*const fn () u32) void {
+    g_busy_interval_fn = f;
+}
+
+/// The app-requested wake cadence in ms (0 = idle): the interval provider when
+/// set, else 16 ms while the boolean busy predicate holds.
+fn busyIntervalMs() u32 {
+    if (g_busy_interval_fn) |f| return f();
+    if (g_busy_fn) |f| {
+        if (f()) return 16;
+    }
+    return 0;
+}
+
 /// An optional theme provider, queried once per frame so the app can switch
 /// light/dark (or any theme) live without restarting. When null the loop uses
 /// the static `Config.theme`. Set by examples via `setThemeProvider`.
@@ -830,6 +851,16 @@ pub fn run(
     _ = c.SDL_AddEventWatch(Render.resizeWatch, &frame);
     defer c.SDL_RemoveEventWatch(Render.resizeWatch, &frame);
 
+    // Persistent (gpa-owned) copies of the last presented frame's hit/scroll
+    // regions. When a frame is skipped (hidden window, or the GPU swapchain is
+    // congested by a heavy compute worker and the non-blocking acquire has no
+    // image), input keeps being dispatched against these — the layout can't
+    // have changed, since nothing new was presented.
+    var last_hits: std.ArrayList(zigui.HitRegion) = .empty;
+    defer last_hits.deinit(gpa);
+    var last_scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
+    defer last_scrolls.deinit(gpa);
+
     while (running) {
         // Per-frame hook (e.g. refresh the system-tray menu). Runs whether or not
         // the window is visible, so the tray tracks status even when hidden.
@@ -842,10 +873,10 @@ pub fn run(
         if ((c.SDL_GetWindowFlags(window) & c.SDL_WINDOW_HIDDEN) != 0) {
             const no_hits: []const zigui.HitRegion = &.{};
             const no_scrolls: []const zigui.ScrollRegion = &.{};
-            const busy = if (g_busy_fn) |f| f() else false;
+            const busy_ms = busyIntervalMs();
             var ev: c.SDL_Event = undefined;
-            if (busy) {
-                if (c.SDL_WaitEventTimeout(&ev, 16)) handleEvent(&ev, &running, no_hits, no_scrolls);
+            if (busy_ms != 0) {
+                if (c.SDL_WaitEventTimeout(&ev, @intCast(busy_ms))) handleEvent(&ev, &running, no_hits, no_scrolls);
             } else {
                 if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, no_hits, no_scrolls);
             }
@@ -858,9 +889,25 @@ pub fn run(
         var hits: std.ArrayList(zigui.HitRegion) = .empty;
         var scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
         if (!Render.drawFrame(&frame, &arena_state, &hits, &scrolls)) {
-            waitOne(&running, st, cfg);
+            // Frame skipped (hidden/degenerate window, or congested swapchain).
+            // Keep events flowing against the LAST presented frame's regions;
+            // while busy, wake on a short timeout so the next present retries
+            // promptly instead of stalling until the next input event.
+            var ev: c.SDL_Event = undefined;
+            const ms = busyIntervalMs();
+            if (ms != 0) {
+                if (c.SDL_WaitEventTimeout(&ev, @intCast(@min(ms, 16)))) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
+            } else {
+                if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
+            }
+            while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, last_hits.items, last_scrolls.items);
             continue;
         }
+        // Snapshot the presented frame's regions for the skip path above.
+        last_hits.clearRetainingCapacity();
+        last_hits.appendSlice(gpa, hits.items) catch {};
+        last_scrolls.clearRetainingCapacity();
+        last_scrolls.appendSlice(gpa, scrolls.items) catch {};
 
         // Event handling. Hit/scroll regions stay in design points (renderScaled
         // leaves them unscaled); SDL reports mouse coordinates in logical window
@@ -869,9 +916,14 @@ pub fn run(
         // busy predicate is set (e.g. a streaming request in flight), wake on a
         // ~60fps timeout and rebuild each frame; otherwise block for input.
         var ev: c.SDL_Event = undefined;
-        const busy = anim.active() or zigui.scrollbarsAnimating(c.SDL_GetTicks()) or (if (g_busy_fn) |f| f() else false);
-        if (busy) {
-            if (c.SDL_WaitEventTimeout(&ev, 16)) handleEvent(&ev, &running, hits.items, scrolls.items);
+        // UI animations keep their own ~60fps cadence; the app's requested
+        // interval (e.g. a slow spinner repaint during a heavy GPU job) paces
+        // the loop only when nothing is animating.
+        const app_ms = busyIntervalMs();
+        const anim_busy = anim.active() or zigui.scrollbarsAnimating(c.SDL_GetTicks());
+        const busy_ms: u32 = if (anim_busy) (if (app_ms == 0) 16 else @min(app_ms, 16)) else app_ms;
+        if (busy_ms != 0) {
+            if (c.SDL_WaitEventTimeout(&ev, @intCast(busy_ms))) handleEvent(&ev, &running, hits.items, scrolls.items);
             while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
             const now = c.SDL_GetTicks();
             const dt: f32 = @as(f32, @floatFromInt(now - last_ms)) / 1000.0;
@@ -882,15 +934,6 @@ pub fn run(
             while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
             last_ms = c.SDL_GetTicks();
         }
-    }
-}
-
-fn waitOne(running: *bool, st: anytype, cfg: Config) void {
-    _ = st;
-    _ = cfg;
-    var ev: c.SDL_Event = undefined;
-    if (c.SDL_WaitEvent(&ev)) {
-        if (ev.type == c.SDL_EVENT_QUIT) running.* = false;
     }
 }
 

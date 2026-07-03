@@ -73,7 +73,11 @@ pub fn showWindow() void {
 pub fn hideWindow() void {
     if (g_window) |w| _ = c.SDL_HideWindow(w);
 }
-/// Ask the run loop to exit (e.g. from a tray "Quit" entry).
+/// Ask the run loop to exit (e.g. from a tray "Quit" entry). Only flips the
+/// flag: a tray/menu callback fires inside macOS's Cocoa menu-tracking loop,
+/// which swallows any SDL wakeup event we'd push here, so the loop can't be
+/// woken from this context. Instead the loop caps its idle wait (`idle_wake_ms`)
+/// and re-checks `running` on the timeout — see the wait sites in `run`.
 pub fn quit() void {
     if (g_running) |r| r.* = false;
 }
@@ -115,6 +119,19 @@ var g_busy_interval_fn: ?*const fn () u32 = null;
 pub fn setBusyInterval(f: ?*const fn () u32) void {
     g_busy_interval_fn = f;
 }
+
+/// Ceiling on the idle wait (ms) when the app has no busy work. A fully
+/// blocking `SDL_WaitEvent` only returns on an SDL event, so state changed by a
+/// context that posts none — most importantly a tray/menu callback — isn't
+/// observed until the next incidental event. When the window is visible that's
+/// the user's next mouse-over; when it's hidden-to-tray there's no window to
+/// receive one, so `app.quit()` from the tray would hang the process forever.
+/// Capping the wait lets the loop re-check `running` (and re-run the frame hook,
+/// e.g. tray status) ~every 250 ms while idle. Both idle wait sites skip the
+/// redraw on a timeout (nothing changed), so this stays ~free — measured <0.5%
+/// CPU idle — while bounding worst-case tray-action latency to this interval
+/// instead of "until the next incidental event".
+const idle_wake_ms: c_int = 250;
 
 /// The app-requested wake cadence in ms (0 = idle): the interval provider when
 /// set, else 16 ms while the boolean busy predicate holds.
@@ -865,11 +882,10 @@ pub fn run(
             const no_scrolls: []const zigui.ScrollRegion = &.{};
             const busy_ms = busyIntervalMs();
             var ev: c.SDL_Event = undefined;
-            if (busy_ms != 0) {
-                if (c.SDL_WaitEventTimeout(&ev, @intCast(busy_ms))) handleEvent(&ev, &running, no_hits, no_scrolls);
-            } else {
-                if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, no_hits, no_scrolls);
-            }
+            // Cap the idle wait (`idle_wake_ms`): a hidden-to-tray window can't
+            // receive an event to observe a tray callback's `running = false`,
+            // so a blocking wait here hangs Quit forever.
+            if (c.SDL_WaitEventTimeout(&ev, if (busy_ms != 0) @intCast(busy_ms) else idle_wake_ms)) handleEvent(&ev, &running, no_hits, no_scrolls);
             while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, no_hits, no_scrolls);
             continue;
         }
@@ -925,8 +941,28 @@ pub fn run(
             last_ms = now;
             anim.tick(dt);
         } else {
-            if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
-            while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
+            // Fully idle: wait for input. A blocking SDL_WaitEvent would only
+            // return on an SDL event, but a tray/menu callback flips `running`
+            // (tray Quit) or updates tray state while posting none — so a bare
+            // block leaves the app parked until the user's next mouse-over, and
+            // hangs forever when the window is hidden. Instead wait in
+            // `idle_wake_ms` slices: on a timeout re-run the frame hook (keeps
+            // the tray live) and re-check `running`, WITHOUT redrawing — nothing
+            // changed, so idle stays ~free (no 4 Hz repaint). Only a real event
+            // breaks out to the redraw at the top of the outer loop; it
+            // dispatches against the last frame's hit regions, still valid since
+            // no drawFrame has reset the arena.
+            while (running) {
+                if (c.SDL_WaitEventTimeout(&ev, idle_wake_ms)) {
+                    handleEvent(&ev, &running, hits.items, scrolls.items);
+                    while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
+                    break;
+                }
+                if (g_frame_fn) |f| f();
+                // Background work (a generation, playback) may have flipped the
+                // busy cadence on: leave idle so the outer loop redraws at it.
+                if (busyIntervalMs() != 0) break;
+            }
             last_ms = c.SDL_GetTicks();
         }
     }

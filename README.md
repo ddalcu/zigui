@@ -25,6 +25,11 @@ And the `edit` example — a multi-line text editor:
 Every frame is the **same pure-Zig renderer** — no native widgets, themes are
 just palettes + painters.
 
+A real app built on zigui — [zig-ai](https://github.com/ddalcu/zig-ai), a local
+chat/image/video/voice desktop app:
+
+![zig-ai](docs/zig-ai.png)
+
 ## Why
 
 SwiftUI is the gold standard for ergonomic, good-looking native UI — but it is

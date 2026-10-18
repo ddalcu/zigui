@@ -232,7 +232,7 @@ Gotchas for future work here:
   window/server) — Linux CI without Vulkan falls back, so don't gate CI on it.
 
 ### Icons — `Icon` / `IconButton` (bundled icon font, reuses the glyph path)
-A second embedded font (`assets/fonts/icons.ttf`, a ~50-glyph subset of **Lucide**,
+A second embedded font (`assets/fonts/lucide.ttf`, the full **Lucide** set,
 ISC) is wired as the `icon_font` anonymous import alongside Inter, exposed as
 `Font.icons()` and `ttf.icon_ttf`. The catalog is `src/icons.zig`: `Icon` (re-
 exported as `zigui.IconName`) is an `enum(u21)` whose **value is each glyph's PUA
@@ -245,8 +245,8 @@ when null, icons paint nothing — the safe fast path). View constructors:
 `Icon(.heart, 18, color_or_null)` (a `size`×`size` leaf; `null` color inherits
 `.foreground`) and `IconButton(.trash, 18, callback)` (a padded square tap target
 reusing `.callback`). Call sites rely on enum-literal inference, so the `IconName`
-type name is rarely spelled out. Subset/regenerate via `pyftsubset` + the codepoints
-in `icons.zig`; attribution in `assets/fonts/NOTICE.md`. (Tests: `view: Icon …`,
+type name is rarely spelled out. `icons.zig` is generated from lucide-static's
+`font/info.json`; attribution in `assets/fonts/NOTICE.md`. (Tests: `view: Icon …`,
 `view: IconButton …`; `drawIcon: …` in `font.zig`.)
 
 ### Grids — `LazyVGrid` / `LazyHGrid` (composition, no new primitive)

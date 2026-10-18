@@ -170,12 +170,12 @@ const swatches = [_]zigui.Color{
 };
 
 const icon_gallery = [_]zigui.IconName{
-    .home, .search,       .settings,    .user,     .users,    .heart,
-    .star, .bell,         .mail,        .calendar, .clock,    .folder,
-    .file, .image,        .download,    .upload,   .trash,    .edit,
-    .copy, .share,        .lock,        .unlock,   .eye,      .eye_off,
-    .play, .pause,        .sun,         .moon,     .sparkles, .zap,
-    .cpu,  .shield_check, .badge_check, .info,     .check,    .send,
+    .house, .search,       .settings,    .user,      .users,    .heart,
+    .star,  .bell,         .mail,        .calendar,  .clock,    .folder,
+    .file,  .image,        .download,    .upload,    .trash,    .edit,
+    .copy,  .share,        .lock,        .lock_open, .eye,      .eye_off,
+    .play,  .pause,        .sun,         .moon,      .sparkles, .zap,
+    .cpu,   .shield_check, .badge_check, .info,      .check,    .send,
 };
 
 // A 64×64 RGBA gradient built at comptime so the `Image` component has something

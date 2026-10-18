@@ -38,6 +38,8 @@ const menu_mod = @import("../components/menu.zig");
 const grid = @import("../components/grid.zig");
 const list_mod = @import("../components/list.zig");
 const collections = @import("../components/collections.zig");
+const fontset_mod = @import("../text/fontset.zig");
+pub const richtext = @import("richtext.zig");
 const text_buffer = @import("../components/text_buffer.zig");
 
 pub const Binding = state.Binding;
@@ -88,6 +90,13 @@ pub const TextFieldState = text_buffer.TextFieldState;
 // ---------------------------------------------------------------------------
 
 /// A type-erased UI callback (button tap, toggle, etc.).
+/// A pointer-drag handler: gets the movement since the last event while the
+/// button is held after a press inside the view.
+pub const DragCallback = struct {
+    ctx: ?*anyopaque = null,
+    func: *const fn (?*anyopaque, dx: f32, dy: f32) void,
+};
+
 pub const Callback = struct {
     ctx: ?*anyopaque = null,
     func: *const fn (?*anyopaque) void,
@@ -220,10 +229,18 @@ pub const Modifiers = struct {
     corner_radius: f32 = 0,
     foreground: ?Color = null,
     font: ?FontToken = null,
+    /// Overrides the weight a `.font()` token (or the inherited style) implies.
+    weight: ?theme_mod.FontWeight = null,
+    size: ?f32 = null,
+    italic: bool = false,
+    mono: bool = false,
     border_color: ?Color = null,
     border_width: f32 = 1,
     opacity: f32 = 1,
     on_tap: ?Callback = null,
+    on_drag: ?DragCallback = null,
+    /// Right-click (see `View.onSecondaryTap`).
+    on_secondary: ?Callback = null,
     /// A background painted only while the cursor is within this view's frame
     /// (see `Context.hover_point`). Gives menu rows / list rows a live hover
     /// highlight without per-widget state.
@@ -232,6 +249,16 @@ pub const Modifiers = struct {
     /// field's `TextFieldState` during paint; see `submitFocused`.
     on_submit: ?Callback = null,
     disabled: bool = false,
+    /// Marks this view as a hover scope: descendants with `reveal_on_hover`
+    /// paint (and take taps) only while the cursor is inside this view.
+    hover_scope: bool = false,
+    reveal_on_hover: bool = false,
+    /// A `TextEditor` that draws no field surface of its own (its container
+    /// supplies the chrome) and may override its inner padding.
+    chromeless: bool = false,
+    editor_pad: ?f32 = null,
+    /// A `TextField` that shows bullets instead of its text (API keys).
+    secure: bool = false,
     /// Overlays presented from this view (sheets/alerts/popovers). A slice so a
     /// view can stack more than one — chaining `.sheet(...).alert(...)` appends
     /// rather than overwriting.
@@ -266,6 +293,7 @@ pub const ShapeKind = enum { rect, rounded_rect, circle, capsule, ellipse };
 
 pub const TextData = struct { string: []const u8 };
 pub const WrappedTextData = struct { string: []const u8 };
+pub const RichTextData = struct { spans: []const richtext.Span, line_mult: f32 = 1.25, pre: bool = false };
 pub const SpacerData = struct { min_length: f32 = 0 };
 pub const ShapeData = struct { shape: ShapeKind, corner_radius: f32 = 0, fill: Fill };
 pub const StackData = struct {
@@ -373,6 +401,8 @@ pub const Kind = union(enum) {
     /// Multi-line text that word-wraps to the proposed width (height grows with
     /// the number of wrapped lines). Lowered to an `engine.measured` node.
     wrapped_text: WrappedTextData,
+    /// Inline-styled wrapped paragraph (markdown prose).
+    rich_text: RichTextData,
     spacer: SpacerData,
     divider,
     /// A vertical hairline (rigid narrow width, fills the cross-axis height) —
@@ -441,6 +471,15 @@ pub const View = struct {
         var v = self;
         var f = v.mods.frame orelse FrameSpec{};
         f.height = h;
+        v.mods.frame = f;
+        return v;
+    }
+    /// Cap the width at `w` (SwiftUI `.frame(maxWidth: w)`): hugs its content up
+    /// to `w`, then wraps.
+    pub fn frameCap(self: View, w: f32) View {
+        var v = self;
+        var f = v.mods.frame orelse FrameSpec{};
+        f.max_width = w;
         v.mods.frame = f;
         return v;
     }
@@ -518,6 +557,28 @@ pub const View = struct {
         v.mods.font = tok;
         return v;
     }
+    pub fn weight(self: View, w: theme_mod.FontWeight) View {
+        var v = self;
+        v.mods.weight = w;
+        return v;
+    }
+    pub fn italic(self: View) View {
+        var v = self;
+        v.mods.italic = true;
+        return v;
+    }
+    /// Monospace face (JetBrains Mono).
+    pub fn mono(self: View) View {
+        var v = self;
+        v.mods.mono = true;
+        return v;
+    }
+    /// Point size override, independent of the font tokens.
+    pub fn size(self: View, px: f32) View {
+        var v = self;
+        v.mods.size = px;
+        return v;
+    }
     pub fn cornerRadius(self: View, r: f32) View {
         var v = self;
         v.mods.corner_radius = r;
@@ -538,6 +599,32 @@ pub const View = struct {
         v.mods.border_width = width;
         return v;
     }
+    pub fn secure(self: View) View {
+        var v = self;
+        v.mods.secure = true;
+        return v;
+    }
+    /// A `TextEditor` without its own field chrome; `pad` is its inner padding.
+    pub fn chromeless(self: View, pad: f32) View {
+        var v = self;
+        v.mods.chromeless = true;
+        v.mods.editor_pad = pad;
+        return v;
+    }
+    /// This view is a hover scope (see `revealOnHover`).
+    pub fn hoverScope(self: View) View {
+        var v = self;
+        v.mods.hover_scope = true;
+        return v;
+    }
+    /// Draw (and hit-test) this view only while the cursor is inside the
+    /// nearest enclosing `hoverScope` — a row's delete button. Layout space is
+    /// always reserved, so revealing never reflows the row.
+    pub fn revealOnHover(self: View) View {
+        var v = self;
+        v.mods.reveal_on_hover = true;
+        return v;
+    }
     pub fn opacity(self: View, o: f32) View {
         var v = self;
         v.mods.opacity = o;
@@ -546,6 +633,18 @@ pub const View = struct {
     pub fn onTap(self: View, cb: Callback) View {
         var v = self;
         v.mods.on_tap = cb;
+        return v;
+    }
+    /// Run `cb` on a right-click inside this view (a row's context menu).
+    pub fn onSecondaryTap(self: View, cb: Callback) View {
+        var v = self;
+        v.mods.on_secondary = cb;
+        return v;
+    }
+    /// Report pointer movement while the button is held after a press here.
+    pub fn onDrag(self: View, cb: DragCallback) View {
+        var v = self;
+        v.mods.on_drag = cb;
         return v;
     }
     /// Paint `color` behind this view only while the cursor hovers it (honoring
@@ -751,6 +850,47 @@ pub fn Text(s: []const u8) View {
 }
 /// Multi-line text: word-wraps to the width it is proposed, growing taller as it
 /// wraps. Use this (rather than `Text`) for paragraphs and chat bubbles.
+/// A wrapped paragraph of styled spans (bold/italic/mono/link/background...).
+pub fn RichText(spans: []const richtext.Span) View {
+    return RichTextSpaced(spans, 1.25);
+}
+/// Preformatted spans (code): leading spaces survive and lines do not wrap.
+pub fn RichTextPre(spans: []const richtext.Span, line_mult: f32) View {
+    var v = RichTextSpaced(spans, line_mult);
+    v.kind.rich_text.pre = true;
+    return v;
+}
+pub fn RichTextSpaced(spans: []const richtext.Span, line_mult: f32) View {
+    // Copied into the build arena: the caller's slice is usually a stack array.
+    const owned = buildAlloc().dupe(richtext.Span, spans) catch @panic("oom");
+    return .{ .kind = .{ .rich_text = .{ .spans = owned, .line_mult = line_mult } } };
+}
+
+/// The window's size in design points, set by the app loop before each build
+/// so views can size to it (a reading column, table columns).
+var g_viewport: Size = .{ .width = 1100, .height = 760 };
+pub fn setViewport(w: f32, h: f32) void {
+    g_viewport = .{ .width = w, .height = h };
+}
+pub fn viewport() Size {
+    return g_viewport;
+}
+
+/// Called with the URL when a link span is tapped. The app sets it once.
+var g_link_handler: ?*const fn ([]const u8) void = null;
+pub fn setLinkHandler(f: ?*const fn ([]const u8) void) void {
+    g_link_handler = f;
+}
+/// Invoke the app's link handler directly (a button that opens a URL).
+pub fn openLinkHandler(url: []const u8) void {
+    if (g_link_handler) |h| h(url);
+}
+const LinkCtx = struct { url: []const u8 };
+fn linkThunk(p: ?*anyopaque) void {
+    const c: *LinkCtx = @ptrCast(@alignCast(p.?));
+    if (g_link_handler) |h| h(c.url);
+}
+
 pub fn WrappedText(s: []const u8) View {
     return .{ .kind = .{ .wrapped_text = .{ .string = s } } };
 }
@@ -1007,6 +1147,10 @@ pub const HitAction = union(enum) {
     text_click: TextClick,
     /// Select a specific value (e.g. a picker segment).
     select: struct { binding: Binding(i64), value: i64 },
+    /// Arm a drag-area handler (see `View.onDrag`).
+    drag: DragCallback,
+    /// A right-click handler; never fires on a primary click (`dispatchTap` skips it).
+    secondary: Callback,
 };
 
 /// Geometry captured for a `TextEditor`'s clickable text area, enough to map a
@@ -1115,6 +1259,14 @@ pub const Context = struct {
     /// Glyph cache for the bundled icon font (`Font.icons()`). When null, `Icon`
     /// and `IconButton` paint nothing — wire it (app + tests) to draw icons.
     icon_cache: ?*atlas.GlyphCache = null,
+    /// Bundled faces; when set, weight/italic/mono pick the glyph cache (`cache`
+    /// is then the primary-weight fallback used before any style applies).
+    fonts: ?*fontset_mod.FontSet = null,
+    font_weight: theme_mod.FontWeight = .regular,
+    font_italic: bool = false,
+    font_mono: bool = false,
+    /// The cursor is inside the nearest enclosing `hoverScope`.
+    in_hover_scope: bool = false,
 
     pub fn init(theme: Theme, cache: *atlas.GlyphCache, arena_alloc: Allocator, hits: *std.ArrayList(HitRegion)) Context {
         return .{
@@ -1159,8 +1311,30 @@ pub const Context = struct {
 };
 
 fn resolvedFontSize(ctx: *const Context, v: View) f32 {
+    if (v.mods.size) |sz| return sz;
     if (v.mods.font) |tok| return fontStyle(ctx.theme, tok).size;
     return ctx.font_size;
+}
+
+/// Fold a view's font modifiers into the inherited context: size, weight,
+/// italic, mono — and pick the matching glyph cache so every measure/paint
+/// below uses the right face.
+fn applyFontMods(c: *Context, v: View) void {
+    const m = v.mods;
+    if (m.font) |tok| {
+        const st = fontStyle(c.theme, tok);
+        c.font_size = st.size;
+        c.font_weight = st.weight;
+    }
+    if (m.size) |sz| c.font_size = sz;
+    if (m.weight) |w| c.font_weight = w;
+    if (m.italic) c.font_italic = true;
+    if (m.mono) c.font_mono = true;
+    if (c.fonts) |fs| {
+        if (m.font != null or m.size != null or m.weight != null or m.italic or m.mono) {
+            c.cache = fs.cache(.{ .weight = c.font_weight, .italic = c.font_italic, .mono = c.font_mono });
+        }
+    }
 }
 fn fontStyle(t: Theme, tok: FontToken) theme_mod.TextStyle {
     return switch (tok) {
@@ -1235,13 +1409,36 @@ const WrappedTextMeasure = struct {
     }
 };
 
+const RichTextMeasure = struct {
+    arena: Allocator,
+    spans: []const richtext.Span,
+    faces: richtext.Faces,
+    px: f32,
+    mult: f32,
+    pre: bool,
+
+    fn measure(p: *const anyopaque, prop: engine.Proposal) Size {
+        const self: *const RichTextMeasure = @ptrCast(@alignCast(p));
+        const max_w = prop.width orelse big;
+        const l = richtext.layout(self.arena, self.spans, self.faces, self.px, self.mult, max_w, self.pre) catch return .{};
+        return .{ .width = @min(l.width, max_w), .height = l.height };
+    }
+};
+
+fn richFaces(ctx: *const Context) richtext.Faces {
+    return .{ .fonts = ctx.fonts, .fallback = ctx.cache.face, .base_weight = ctx.font_weight };
+}
+
 const big: f32 = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Lowering: View -> layout.Node
 // ---------------------------------------------------------------------------
 
-fn buildNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
+fn buildNode(parent_ctx: *const Context, v: View) Allocator.Error!engine.Node {
+    var styled = parent_ctx.*;
+    applyFontMods(&styled, v);
+    const ctx = &styled;
     var node = try buildContentNode(ctx, v);
     if (v.mods.padding) |p| {
         const child = try ctx.arena.create(engine.Node);
@@ -1307,6 +1504,11 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             const m = try ctx.arena.create(WrappedTextMeasure);
             m.* = .{ .face = ctx.cache.face, .arena = ctx.arena, .string = wt.string, .px = px };
             return .{ .measured = .{ .ctx = m, .measureFn = WrappedTextMeasure.measure } };
+        },
+        .rich_text => |rt| {
+            const m = try ctx.arena.create(RichTextMeasure);
+            m.* = .{ .arena = ctx.arena, .spans = rt.spans, .faces = richFaces(ctx), .px = resolvedFontSize(ctx, v), .mult = rt.line_mult, .pre = rt.pre };
+            return .{ .measured = .{ .ctx = m, .measureFn = RichTextMeasure.measure } };
         },
         .shape => return .{ .leaf = .{
             .min = .{},
@@ -1607,16 +1809,18 @@ fn anchoredRect(root: Rect, anchor: Rect, size: Size) Rect {
 
 fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas) Allocator.Error!void {
     const outer = lr.frame;
+    if (v.mods.reveal_on_hover and !ctx.in_hover_scope) return;
 
     // Resolve inherited environment for this subtree.
     var child_ctx = ctx.*;
     child_ctx.opacity = ctx.opacity * v.mods.opacity;
     if (v.mods.disabled) child_ctx.disabled = true;
     if (v.mods.foreground) |fg| child_ctx.foreground = fg;
-    if (v.mods.font) |tok| child_ctx.font_size = fontStyle(ctx.theme, tok).size;
+    applyFontMods(&child_ctx, v);
     // An accessibility-hidden view drops itself and its whole subtree from the
     // a11y tree by clearing the sink for this branch.
     if (v.mods.a11y_hidden) child_ctx.a11y = null;
+    if (v.mods.hover_scope) child_ctx.in_hover_scope = if (ctx.hover_point) |hp| outer.contains(hp) else false;
 
     const op = child_ctx.opacity;
 
@@ -1653,14 +1857,23 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     if (v.mods.frame != null) clr = clr.children[0];
     if (v.mods.padding != null) clr = clr.children[0];
 
-    try paintContent(&child_ctx, v, clr, canvas);
-
-    // Border (in front of content), and tap region.
-    if (v.mods.border_color) |bc| {
-        try canvas.strokeRoundedRect(outer, v.mods.corner_radius, v.mods.border_width, bc.multiplyAlpha(op));
+    // The view's own tap region goes in BEFORE its content: regions are tested
+    // last-registered first, so a button inside a tappable row must win.
+    if (v.mods.on_secondary) |cb| {
+        try ctx.hit_regions.append(ctx.arena, .{ .rect = outer, .action = .{ .secondary = cb }, .disabled = child_ctx.disabled });
     }
     if (v.mods.on_tap) |cb| {
         try ctx.hit_regions.append(ctx.arena, .{ .rect = outer, .action = .{ .callback = cb }, .disabled = child_ctx.disabled });
+    }
+    if (v.mods.on_drag) |dcb| {
+        try ctx.hit_regions.append(ctx.arena, .{ .rect = outer, .action = .{ .drag = dcb }, .disabled = child_ctx.disabled });
+    }
+
+    try paintContent(&child_ctx, v, clr, canvas);
+
+    // Border (in front of content).
+    if (v.mods.border_color) |bc| {
+        try canvas.strokeRoundedRect(outer, v.mods.corner_radius, v.mods.border_width, bc.multiplyAlpha(op));
     }
 
     // A presented overlay is not drawn inline — it is enqueued for the drain
@@ -1706,6 +1919,7 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
             // Accessibility always exposes the full, untruncated string.
             try emitA11y(ctx, v, rect, .static_text, t.string, "");
         },
+        .rich_text => |rt| paintRichText(ctx, v, rt, rect, canvas) catch {},
         .wrapped_text => |wt| {
             paintWrappedText(ctx, v, wt, rect, canvas) catch {};
             try emitA11y(ctx, v, rect, .static_text, wt.string, "");
@@ -2027,6 +2241,44 @@ fn paintIconButton(ctx: *const Context, ib: IconButtonData, rect: Rect, canvas: 
 
 /// Paint wrapped text: re-wrap to the laid-out rect width and draw each line,
 /// stacked by line height, top-aligned within `rect`.
+fn paintRichText(ctx: *const Context, v: View, rt: RichTextData, rect: Rect, canvas: *Canvas) !void {
+    const op = ctx.opacity;
+    const px = resolvedFontSize(ctx, v);
+    const faces = richFaces(ctx);
+    const lay = try richtext.layout(ctx.arena, rt.spans, faces, px, rt.line_mult, rect.width, rt.pre);
+    for (lay.lines) |ln| {
+        const baseline = rect.y + ln.y + ln.baseline;
+        for (ln.runs) |r| {
+            const sp = rt.spans[r.span];
+            const face = faces.forSpan(sp);
+            const spx = px * sp.size_scale;
+            const lh = shape.lineHeight(face, spx);
+            const asc = shape.ascentPixels(face, spx);
+            const x = rect.x + r.x;
+            if (sp.bg) |bg| try canvas.fillRoundedRect(.{ .x = x - 2, .y = baseline - asc, .width = r.w + 4, .height = lh }, 4, bg.multiplyAlpha(op));
+            const color = (sp.color orelse if (sp.link != null) ctx.theme.colors.accent else ctx.foreground).multiplyAlpha(op);
+            const cache = faces.cacheFor(sp) orelse ctx.cache;
+            const piece = sp.text[r.start..r.end];
+            if (ctx.scale == 1) {
+                try font_mod.drawText(canvas, cache, piece, spx, color, .{ .x = x, .y = baseline - asc });
+            } else {
+                try font_mod.drawTextScaled(canvas, cache, piece, spx, ctx.scale, color, .{ .x = x, .y = baseline - asc });
+            }
+            if (sp.underline or sp.link != null) try canvas.fillRect(.{ .x = x, .y = baseline + 1.5, .width = r.w, .height = 1 }, color);
+            if (sp.strike) try canvas.fillRect(.{ .x = x, .y = baseline - asc * 0.35, .width = r.w, .height = 1 }, color);
+            if (sp.link) |url| {
+                const lc = try ctx.arena.create(LinkCtx);
+                lc.* = .{ .url = url };
+                try ctx.hit_regions.append(ctx.arena, .{
+                    .rect = .{ .x = x, .y = baseline - asc, .width = r.w, .height = lh },
+                    .action = .{ .callback = .{ .ctx = lc, .func = linkThunk } },
+                    .disabled = ctx.disabled,
+                });
+            }
+        }
+    }
+}
+
 fn paintWrappedText(ctx: *const Context, v: View, wt: WrappedTextData, rect: Rect, canvas: *Canvas) !void {
     const op = ctx.opacity;
     const px = resolvedFontSize(ctx, v);
@@ -2058,10 +2310,18 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     // Inset text past the corner curve (more for pills).
     const pad: f32 = @max(8, @min(radius, 14));
     const ty = vcenter(rect, lh);
-    const content = tf.state.text();
+    const real = tf.state.text();
+    var content = real;
+    if (v.mods.secure) {
+        const n = std.unicode.utf8CountCodepoints(real) catch real.len;
+        const dots = try ctx.arena.alloc(u8, n * 3);
+        for (0..n) |i| @memcpy(dots[i * 3 ..][0..3], "\u{2022}");
+        content = dots;
+    }
+    const secure = v.mods.secure;
 
     // Selection highlight, drawn behind the text so the glyphs stay readable.
-    if (focused) {
+    if (focused and !secure) {
         if (tf.state.selectionRange()) |s| {
             const hx0 = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..s.start], px);
             const hx1 = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..s.end], px);
@@ -2076,7 +2336,8 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     }
     // caret
     if (focused) {
-        const caret_x = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..tf.state.caret], px);
+        const caret_at = if (secure) (std.unicode.utf8CountCodepoints(real[0..tf.state.caret]) catch tf.state.caret) * 3 else tf.state.caret;
+        const caret_x = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..caret_at], px);
         try canvas.line(.{ .x = caret_x, .y = ty + 2 }, .{ .x = caret_x, .y = ty + lh - 2 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
     }
     // A `text_click` region (not a bare `.focus`) so a single-line field also
@@ -2084,7 +2345,7 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     // selection — its one line starts at the text origin with no scroll.
     try ctx.hit_regions.append(ctx.arena, .{
         .rect = rect,
-        .action = .{ .text_click = .{
+        .action = if (secure) .{ .focus = tf.state } else .{ .text_click = .{
             .state = tf.state,
             .face = ctx.cache.face,
             .px = px,
@@ -2124,12 +2385,12 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
 
     const radius = if (v.mods.corner_radius > 0) v.mods.corner_radius else m.control_corner_radius;
     // The theme draws the editor surface (background + border).
-    try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
+    if (!v.mods.chromeless) try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
 
     const text = st.text();
     const nlines = text_buffer.countLines(text);
 
-    const pad: f32 = 8;
+    const pad: f32 = v.mods.editor_pad orelse 8;
     const gutter_w: f32 = if (ed.line_numbers) gutterWidth(face, px, nlines, pad) else pad;
     const text_x = rect.x + gutter_w + pad;
     const top = rect.y + pad;
@@ -2408,11 +2669,30 @@ threadlocal var g_drag: ?*TextFieldState = null;
 /// press). Identifies the slider's hit region across rebuilds, the way `g_drag`
 /// uses the `*TextFieldState` pointer for a text drag.
 threadlocal var g_slider_drag: ?*anyopaque = null;
+/// A drag-area handler armed by a press, and the last pointer position fed to it.
+threadlocal var g_area_drag: ?DragCallback = null;
+threadlocal var g_area_last: Point = .{ .x = 0, .y = 0 };
+/// Where the last primary press landed, for `armDrag` from inside a tap handler.
+threadlocal var g_press: Point = .{ .x = 0, .y = 0 };
+/// Called when a drag armed by `armDrag`/`onDrag` ends (mouse-up).
+threadlocal var g_drag_end: ?*const fn () void = null;
+
+/// A tap handler turns the press it is handling into a drag: `cb` then gets pointer deltas.
+pub fn armDrag(cb: DragCallback) void {
+    g_area_drag = cb;
+    g_area_last = g_press;
+}
+
+pub fn setDragEndHook(f: ?*const fn () void) void {
+    g_drag_end = f;
+}
 
 /// End an in-progress mouse drag-selection (the app calls this on mouse-up).
 pub fn endDrag() void {
+    if (g_area_drag != null) if (g_drag_end) |f| f();
     g_drag = null;
     g_slider_drag = null;
+    g_area_drag = null;
 }
 
 /// Continue a drag started by a mouse-down on a `TextEditor` (extend the
@@ -2420,6 +2700,11 @@ pub fn endDrag() void {
 /// region is re-emitted every frame, so this re-reads the current geometry.
 /// No-op when no drag is active.
 pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
+    if (g_area_drag) |d| {
+        d.func(d.ctx, p.x - g_area_last.x, p.y - g_area_last.y);
+        g_area_last = p;
+        return;
+    }
     if (g_drag == null and g_slider_drag == null) return;
     var i = regions.len;
     while (i > 0) {
@@ -2444,16 +2729,51 @@ pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
 /// Dispatch a tap at `p` to the top-most enabled hit region containing it.
 /// Returns true if a callback fired.
 pub fn dispatchTap(regions: []const HitRegion, p: Point) bool {
+    g_press = p;
     var i = regions.len;
     while (i > 0) {
         i -= 1;
         const r = regions[i];
+        if (r.action == .secondary) continue;
         if (!r.disabled and r.rect.contains(p)) {
             performAction(r.action, p);
             return true;
         }
     }
     return false;
+}
+
+/// Right-click at `p`: run the top-most `onSecondaryTap` handler under it.
+pub fn dispatchSecondaryTap(regions: []const HitRegion, p: Point) bool {
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or !r.rect.contains(p)) continue;
+        switch (r.action) {
+            .secondary => |cb| {
+                cb.call();
+                return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+threadlocal var g_click_shift = false;
+threadlocal var g_click_cmd = false;
+
+/// The app records the modifier keys held at a press so a tap handler can read them.
+pub fn setClickMods(shift: bool, cmd: bool) void {
+    g_click_shift = shift;
+    g_click_cmd = cmd;
+}
+pub fn clickShift() bool {
+    return g_click_shift;
+}
+pub fn clickCmd() bool {
+    return g_click_cmd;
 }
 
 /// Handle a double-click at `p`: if the top-most region under it is an editable
@@ -2575,6 +2895,11 @@ fn performAction(a: HitAction, p: Point) void {
             g_drag = tc.state;
         },
         .select => |s| s.binding.set(s.value),
+        .drag => |d| {
+            g_area_drag = d;
+            g_area_last = p;
+        },
+        .secondary => {},
     }
 }
 
@@ -2919,8 +3244,12 @@ test "view: Button registers a hit region and tap fires the action" {
 
 const Counter = struct {
     var value: u32 = 0;
+    var secondary: u32 = 0;
     fn inc() void {
         value += 1;
+    }
+    fn inc2() void {
+        secondary += 1;
     }
 };
 
@@ -2936,6 +3265,62 @@ test "view: disabled view's tap region does not fire" {
     try render(&c, tree, .{ .x = 0, .y = 0, .width = 20, .height = 20 }, &canvas);
     try testing.expect(!dispatchTap(env.hits.items, .{ .x = 10, .y = 10 }));
     try testing.expectEqual(@as(u32, 0), Counter.value);
+}
+
+test "view: a right-click handler fires on secondary only, a tap on primary only" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    Counter.value = 0;
+    const tree = Rectangle(Color.red).frame(20, 20).onTap(action(Counter.inc)).onSecondaryTap(action(Counter.inc2));
+    try render(&c, tree, .{ .x = 0, .y = 0, .width = 20, .height = 20 }, &canvas);
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 10, .y = 10 }));
+    try testing.expectEqual(@as(u32, 1), Counter.value);
+    try testing.expectEqual(@as(u32, 0), Counter.secondary);
+    try testing.expect(dispatchSecondaryTap(env.hits.items, .{ .x = 10, .y = 10 }));
+    try testing.expectEqual(@as(u32, 1), Counter.value);
+    try testing.expectEqual(@as(u32, 1), Counter.secondary);
+    try testing.expect(!dispatchSecondaryTap(env.hits.items, .{ .x = 99, .y = 99 }));
+}
+
+const DragProbe = struct {
+    var travel: f32 = 0;
+    var ended: u32 = 0;
+    fn move(_: ?*anyopaque, _: f32, dy: f32) void {
+        travel += dy;
+    }
+    fn end() void {
+        ended += 1;
+    }
+};
+
+test "view: a tap handler can arm a drag from its own press; the end hook fires once" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    DragProbe.travel = 0;
+    DragProbe.ended = 0;
+    const tree = Rectangle(Color.red).frame(20, 20).onTap(action(struct {
+        fn arm() void {
+            armDrag(.{ .func = DragProbe.move });
+        }
+    }.arm));
+    try render(&c, tree, .{ .x = 0, .y = 0, .width = 20, .height = 20 }, &canvas);
+    setDragEndHook(DragProbe.end);
+    defer setDragEndHook(null);
+    try testing.expect(dispatchTap(env.hits.items, .{ .x = 10, .y = 4 }));
+    dispatchDrag(env.hits.items, .{ .x = 10, .y = 14 });
+    dispatchDrag(env.hits.items, .{ .x = 10, .y = 19 });
+    try testing.expectEqual(@as(f32, 15), DragProbe.travel);
+    endDrag();
+    endDrag();
+    try testing.expectEqual(@as(u32, 1), DragProbe.ended);
 }
 
 test "view: ForEach expands into stack children" {

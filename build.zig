@@ -25,10 +25,21 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("inter_font", .{
         .root_source_file = b.path("assets/fonts/Inter.ttf"),
     });
-    // Bundle the icon font (a subset of Lucide, ISC) the same way, importable as
+    // The other Inter weights/italics and JetBrains Mono (both OFL) behind
+    // `FontSet`, which picks a face per view weight/italic/mono.
+    for ([_][2][]const u8{
+        .{ "inter_medium", "Inter-Medium.ttf" },
+        .{ "inter_semibold", "Inter-SemiBold.ttf" },
+        .{ "inter_bold", "Inter-Bold.ttf" },
+        .{ "inter_italic", "Inter-Italic.ttf" },
+        .{ "inter_bold_italic", "Inter-BoldItalic.ttf" },
+        .{ "mono_regular", "JetBrainsMono-Regular.ttf" },
+        .{ "mono_bold", "JetBrainsMono-Bold.ttf" },
+    }) |f| mod.addAnonymousImport(f[0], .{ .root_source_file = b.path(b.fmt("assets/fonts/{s}", .{f[1]})) });
+    // Bundle the icon font (the full Lucide set, ISC) the same way, importable as
     // `@embedFile("icon_font")`. See `src/icons.zig` and `assets/fonts/NOTICE.md`.
     mod.addAnonymousImport("icon_font", .{
-        .root_source_file = b.path("assets/fonts/icons.ttf"),
+        .root_source_file = b.path("assets/fonts/lucide.ttf"),
     });
     // Bundle the monochrome emoji fallback font (Noto Emoji, OFL), importable as
     // `@embedFile("emoji_font")`. Wired as a fallback face for glyphs Inter

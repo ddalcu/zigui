@@ -71,6 +71,14 @@ pub fn showWindow() void {
 pub fn hideWindow() void {
     if (g_window) |w| _ = c.SDL_HideWindow(w);
 }
+/// Wake the event loop from any thread (a worker finished something the UI
+/// should show). Safe to call before/after `run`; a no-op while SDL is down.
+pub fn wake() void {
+    var ev = std.mem.zeroes(c.SDL_Event);
+    ev.type = c.SDL_EVENT_USER;
+    _ = c.SDL_PushEvent(&ev);
+}
+
 /// Ask the run loop to exit (e.g. from a tray "Quit" entry). Only flips the
 /// flag: a tray/menu callback fires inside macOS's Cocoa menu-tracking loop,
 /// which swallows any SDL wakeup event we'd push here, so the loop can't be
@@ -94,6 +102,8 @@ pub fn setHideOnClose(v: bool) void {
 /// (e.g. `app.animator().?.animateTo(&state, 1, 0.3, .ease_in_out)`). Set for the
 /// duration of `run`. Mirrors the focused-field thread-local pattern in `view`.
 var g_animator: ?*zigui.Animator = null;
+/// Bundled faces for weight/italic/mono (see `zigui.FontSet`); set for the run.
+var g_fonts: ?*zigui.FontSet = null;
 pub fn animator() ?*zigui.Animator {
     return g_animator;
 }
@@ -193,6 +203,12 @@ pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
     g_key_fn = f;
 }
 
+/// Called with the path of each file dropped onto the window.
+var g_drop_fn: ?*const fn (path: []const u8) void = null;
+pub fn setDropHandler(f: ?*const fn (path: []const u8) void) void {
+    g_drop_fn = f;
+}
+
 /// When true, the loop prints rolling frame-time stats (last/avg/max ms + the
 /// equivalent fps) to stderr ~once per second. Off by default; also enabled at
 /// startup if the `ZIGUI_FRAME_LOG` environment variable is set. Useful for
@@ -261,6 +277,17 @@ pub fn openUrl(url: [*:0]const u8) bool {
 /// Read UTF-8 text from the system clipboard. Returns an allocator-owned copy the
 /// caller must free, or null when the clipboard is empty. (SDL returns an empty
 /// string rather than null on failure; we normalize that to null.)
+/// The clipboard's PNG image, if it holds one (caller frees).
+pub fn getClipboardPng(allocator: std.mem.Allocator) ?[]u8 {
+    if (!c.SDL_HasClipboardData("image/png")) return null;
+    var n: usize = 0;
+    const p = c.SDL_GetClipboardData("image/png", &n) orelse return null;
+    defer c.SDL_free(p);
+    if (n == 0) return null;
+    const src: [*]const u8 = @ptrCast(p);
+    return allocator.dupe(u8, src[0..n]) catch null;
+}
+
 pub fn getClipboardText(allocator: std.mem.Allocator) ?[]u8 {
     const p = c.SDL_GetClipboardText();
     defer c.SDL_free(p);
@@ -601,6 +628,11 @@ pub fn run(
     var icon_cache = zigui.GlyphCache.init(gpa, &icon_font.face);
     defer icon_cache.deinit();
 
+    const fonts = try zigui.FontSet.create(gpa);
+    defer fonts.destroy();
+    g_fonts = fonts;
+    defer g_fonts = null;
+
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
 
@@ -749,6 +781,7 @@ pub fn run(
             // Publish the active theme's selection tints so composed constructors
             // (Sidebar/Table/RadioGroup) pick up dark mode and custom accents.
             zigui.setThemeTokens(theme);
+            zigui.setViewport(point_w, point_h);
             zigui.beginBuild(arena);
             const root = body(fr.st);
             zigui.endBuild();
@@ -762,6 +795,7 @@ pub fn run(
             var ctx = zigui.Context.initFull(theme, fr.cache, arena, hits, &overlays, null);
             ctx.scroll_regions = scrolls;
             ctx.icon_cache = fr.icon_cache;
+            ctx.fonts = g_fonts;
             ctx.hover_point = g_hover_point;
 
             // Coverage gamma for text: a straight sRGB alpha-blend renders the
@@ -990,10 +1024,14 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
                 // field; elsewhere it just dismisses any open menu.
                 if (zigui.fieldAt(hits, p)) |field| {
                     zigui.openContextMenu(field, p);
-                } else {
+                } else if (!zigui.dispatchSecondaryTap(hits, p)) {
                     zigui.closeContextMenu();
                 }
-            } else if (zigui.contextMenuOpen()) {
+            } else if (blk: {
+                const m = c.SDL_GetModState();
+                zigui.setClickMods((m & c.SDL_KMOD_SHIFT) != 0, (m & (c.SDL_KMOD_GUI | c.SDL_KMOD_CTRL)) != 0);
+                break :blk zigui.contextMenuOpen();
+            }) {
                 // A left-click while the menu is open routes to the menu (an item
                 // or the dismiss region) without disturbing focus.
                 _ = zigui.dispatchTap(hits, p);
@@ -1020,6 +1058,9 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => zigui.endDrag(),
         c.SDL_EVENT_WINDOW_MOUSE_LEAVE => g_hover_point = null,
+        c.SDL_EVENT_DROP_FILE => {
+            if (g_drop_fn) |f| if (ev.drop.data != null) f(std.mem.span(ev.drop.data));
+        },
         c.SDL_EVENT_MOUSE_WHEEL => {
             var mx: f32 = 0;
             var my: f32 = 0;

@@ -12,9 +12,7 @@
 const std = @import("std");
 const zigui = @import("zigui");
 
-pub const c = @cImport({
-    @cInclude("SDL3/SDL.h");
-});
+pub const c = @import("sdl_c");
 
 pub const gpu = @import("gpu/gpu.zig");
 
@@ -248,7 +246,7 @@ const FrameStats = struct {
 
 /// Put UTF-8 `text` on the system clipboard. `text` need not be NUL-terminated.
 pub fn setClipboardText(allocator: std.mem.Allocator, text: []const u8) void {
-    const z = allocator.dupeZ(u8, text) catch return;
+    const z = allocator.dupeSentinel(u8, text, 0) catch return;
     defer allocator.free(z);
     _ = c.SDL_SetClipboardText(z.ptr);
 }

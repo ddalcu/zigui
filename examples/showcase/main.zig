@@ -12,11 +12,9 @@ const std = @import("std");
 const zigui = @import("zigui");
 const app = @import("zigui_app");
 
-// libc file write for the headless `--screenshot` path (std.fs needs std.Io in 0.16).
-const cstdio = @cImport({
-    @cInclude("stdio.h");
-    @cInclude("time.h"); // clock() for --bench (std.time.Timer needs std.Io in 0.16)
-});
+// libc file write for the headless `--screenshot` path (std.fs needs std.Io), and
+// clock() for --bench (std.time.Timer needs std.Io). See examples/cstdio.h.
+const cstdio = @import("cstdio");
 
 // ── Theme: appearance (light/dark) × accent ───────────────────────────────────
 
@@ -640,7 +638,7 @@ fn writeBmpRgba(path: [:0]const u8, rgba: []const u8, w: u32, h: u32) void {
     const img_size = stride * h;
     const f = cstdio.fopen(path.ptr, "wb") orelse return;
     defer _ = cstdio.fclose(f);
-    var hdr = [_]u8{0} ** 54;
+    var hdr: [54]u8 = @splat(0);
     hdr[0] = 'B';
     hdr[1] = 'M';
     std.mem.writeInt(u32, hdr[2..6], @intCast(54 + img_size), .little);

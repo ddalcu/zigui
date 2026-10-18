@@ -3,14 +3,14 @@
 # The zigui core (geometry, color, state, layout, theme, text, canvas, software
 # rasterizer, view layer, components) has no C dependencies, so the entire test
 # suite builds and runs on Linux with nothing but the Zig toolchain — no GPU,
-# window server, or SDL required. This image downloads Zig 0.16.0 and runs
+# window server, or SDL required. This image downloads Zig 0.17.0 and runs
 # `zig build test`; a successful build means the suite is green on Linux.
 #
 #   docker build -t zigui-test .
 #
 FROM debian:bookworm-slim
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -24,9 +24,7 @@ const app = @import("zigui_app");
 // File and (headless) screenshot I/O. std.fs needs the new std.Io model in Zig
 // 0.16; libc is already linked into examples, so we use stdio directly — the
 // same approach as examples/llm-chat.
-const cstdio = @cImport({
-    @cInclude("stdio.h");
-});
+const cstdio = @import("cstdio");
 
 /// The live theme, recomputed by `themeProvider` from the app state each frame
 /// (so every view built this frame sees the same scheme). `g_app` lets the
@@ -113,7 +111,7 @@ var g_app: ?*AppState = null;
 // --- file I/O (libc) ---------------------------------------------------------
 
 fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const cpath = try gpa.dupeZ(u8, path);
+    const cpath = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(cpath);
     const f = cstdio.fopen(cpath.ptr, "rb") orelse return error.OpenFailed;
     defer _ = cstdio.fclose(f);
@@ -130,7 +128,7 @@ fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn writeFile(path: []const u8, data: []const u8) !void {
     const gpa = std.heap.page_allocator;
-    const cpath = try gpa.dupeZ(u8, path);
+    const cpath = try gpa.dupeSentinel(u8, path, 0);
     defer gpa.free(cpath);
     const f = cstdio.fopen(cpath.ptr, "wb") orelse return error.OpenFailed;
     defer _ = cstdio.fclose(f);
@@ -270,7 +268,7 @@ fn findPrev(st: *AppState) void {
 fn copySelection() void {
     const f = zigui.focusedField() orelse return;
     const r = f.selectionRange() orelse return;
-    const z = std.heap.page_allocator.dupeZ(u8, f.text()[r.start..r.end]) catch return;
+    const z = std.heap.page_allocator.dupeSentinel(u8, f.text()[r.start..r.end], 0) catch return;
     defer std.heap.page_allocator.free(z);
     _ = app.c.SDL_SetClipboardText(z.ptr);
 }
@@ -504,7 +502,7 @@ fn writeBmp(path: [:0]const u8, fb: *const zigui.Framebuffer) void {
     const f = cstdio.fopen(path.ptr, "wb") orelse return;
     defer _ = cstdio.fclose(f);
 
-    var hdr = [_]u8{0} ** 54;
+    var hdr: [54]u8 = @splat(0);
     hdr[0] = 'B';
     hdr[1] = 'M';
     std.mem.writeInt(u32, hdr[2..6], @intCast(54 + img_size), .little);

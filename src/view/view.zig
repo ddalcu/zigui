@@ -957,9 +957,9 @@ pub fn toViews(children: anytype) []View {
         @memcpy(out, children);
         return out;
     }
-    const fields = std.meta.fields(T);
-    var out = buildAlloc().alloc(View, fields.len) catch @panic("oom");
-    inline for (fields, 0..) |fld, i| out[i] = @field(children, fld.name);
+    const names = comptime std.meta.fieldNames(T);
+    var out = buildAlloc().alloc(View, names.len) catch @panic("oom");
+    inline for (names, 0..) |name, i| out[i] = @field(children, name);
     return out;
 }
 
@@ -3212,7 +3212,8 @@ test "view: Image blits pixels" {
     defer env.deinit();
     var c = env.ctx();
     // 4x4 opaque green image; an Image keeps its intrinsic size by default.
-    const px = [_]u8{ 0, 255, 0, 255 } ** 16;
+    var px: [64]u8 = undefined;
+    for (0..16) |i| px[i * 4 ..][0..4].* = .{ 0, 255, 0, 255 };
     const img = canvas_mod.Image{ .width = 4, .height = 4, .pixels = &px };
     var fb = try renderToFb(&env, &c, Image(img), .{ .x = 0, .y = 0, .width = 4, .height = 4 }, 4, 4);
     defer fb.deinit();

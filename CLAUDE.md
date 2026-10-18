@@ -8,7 +8,7 @@ implemented. User-facing docs live in [README.md](README.md); design rationale i
 
 ## TL;DR
 
-`zigui` is a SwiftUI-like UI library in **pure Zig 0.16**. The core (geometry,
+`zigui` is a SwiftUI-like UI library in **pure Zig 0.17**. The core (geometry,
 color, state, layout, theme, text, canvas, software rasterizer, GPU scene
 translation, view layer, components) has **no C dependencies** and is fully
 unit-tested headlessly. SDL3 links only into example executables (`src/app.zig`
@@ -60,6 +60,12 @@ into `showcase` and removed.
   the backend compiles/links, or the `--screenshot` flag to render one frame.
 - Tests are **inline** (`test "..." {}` blocks). A module's tests only run if the
   root (`src/zigui.zig`) imports it — add a `pub const x = @import(...)` there.
+- **Zig 0.17 gotchas** (on top of the 0.16 ones below):
+  - `@cImport` is gone: C headers go through `b.addTranslateC` and are imported
+    as a module (`sdl_c` from `src/sdl_c.h`, `cstdio` from `examples/cstdio.h`).
+  - Array repetition `[_]u8{0} ** n` no longer parses; use `@splat`.
+  - `allocator.dupeZ` is gone: `dupeSentinel(u8, s, 0)`.
+  - `std.meta.fields` is a compile error now; `std.meta.fieldNames` still works.
 - **Zig 0.16 gotchas hit during the build** (so you don't rediscover them):
   - `std.ArrayList(T)` is **unmanaged**: `var l: std.ArrayList(T) = .empty;`
     then `l.append(allocator, x)`, `l.deinit(allocator)`.

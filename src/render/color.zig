@@ -142,6 +142,7 @@ pub const Color = struct {
 
     // -- named colors -------------------------------------------------------
 
+    pub const clear = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };
     pub const white = Color{ .r = 1, .g = 1, .b = 1, .a = 1 };
     pub const black = Color{ .r = 0, .g = 0, .b = 0, .a = 1 };
     pub const transparent = Color{ .r = 0, .g = 0, .b = 0, .a = 0 };

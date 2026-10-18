@@ -689,7 +689,7 @@ test "ttf: unmapped codepoint returns glyph 0" {
 }
 
 test "ttf: rejects non-TrueType data" {
-    var junk = [_]u8{0} ** 16;
+    var junk: [16]u8 = @splat(0);
     junk[0] = 'O';
     junk[1] = 'T';
     junk[2] = 'T';

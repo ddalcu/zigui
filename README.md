@@ -174,7 +174,7 @@ zig build showcase edit              # build the examples without running them
 docker build -t zigui-test .   # downloads Zig, runs the full suite on Linux
 ```
 
-Requires Zig 0.16.0+.
+Requires Zig 0.17.0+.
 
 ## Extending zigui
 

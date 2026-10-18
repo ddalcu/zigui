@@ -513,7 +513,7 @@ test "gpu_scene: atlas reports full and recovers by growing" {
     defer atlas.deinit();
 
     // An 8x8 mask + 1px pad cannot fit an 8x8 atlas.
-    const data = [_]u8{255} ** 64;
+    const data: [64]u8 = @splat(255);
     const cov = canvas_mod.Coverage{ .width = 8, .height = 8, .data = &data };
     const cmds = [_]DrawCommand{
         .{ .glyph = .{ .rect = .{ .x = 0, .y = 0, .width = 8, .height = 8 }, .color = Color.red, .coverage = cov } },
@@ -531,7 +531,7 @@ test "gpu_scene: atlas reports full and recovers by growing" {
 test "gpu_scene: shelf packer separates entries with padding" {
     var atlas = Atlas.init(testing.allocator, 32);
     defer atlas.deinit();
-    const px = [_]u8{0} ** (4 * 4 * 4);
+    const px: [64]u8 = @splat(0);
     const a = try atlas.place(1, 4, 4, &px);
     const b = try atlas.place(2, 4, 4, &px);
     try testing.expect(a[0] != b[0] or a[1] != b[1]); // distinct slots

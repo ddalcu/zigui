@@ -12,6 +12,7 @@
 const std = @import("std");
 const zigui = @import("zigui");
 
+const builtin = @import("builtin");
 pub const c = @import("sdl_c");
 
 pub const gpu = @import("gpu/gpu.zig");
@@ -49,7 +50,33 @@ pub const Config = struct {
     /// GPU, heavier on the software fallback). Capped internally so an already
     /// HiDPI display isn't oversampled past ~2× effective device pixels.
     supersample: f32 = 1,
+    /// macOS: hide the title and let the content run under a transparent,
+    /// toolbar-height titlebar (the traffic lights float over the app's own
+    /// top band, as in Finder / the Swift apps). The top `drag_band` points that
+    /// hold no control then drag the window everywhere (on every OS), so an app
+    /// that draws its own band behaves like a native titlebar.
+    unified_titlebar: bool = false,
+    drag_band: f32 = 0,
+    /// macOS menu bar menus, after the application menu (ignored elsewhere:
+    /// there is no menu bar to put them in).
+    menus: []const Menu = &.{},
 };
+
+/// One menu-bar entry. An empty title is a separator. `action` runs on the UI
+/// thread; `selector` instead sends a standard Cocoa action down the responder
+/// chain ("performMiniaturize:"). `key` + modifiers is the key equivalent
+/// (Command is implied).
+pub const MenuItem = struct {
+    title: [:0]const u8 = "",
+    key: [:0]const u8 = "",
+    shift: bool = false,
+    ctrl: bool = false,
+    option: bool = false,
+    action: ?zigui.Callback = null,
+    selector: ?[:0]const u8 = null,
+};
+
+pub const Menu = struct { title: [:0]const u8, items: []const MenuItem };
 
 pub const Error = error{ SdlInit, TrayInit };
 
@@ -140,6 +167,24 @@ pub fn setBusyInterval(f: ?*const fn () u32) void {
 /// CPU idle — while bounding worst-case tray-action latency to this interval
 /// instead of "until the next incidental event".
 const idle_wake_ms: c_int = 250;
+
+/// The caret blinks ~530 ms per phase (the macOS default); any key or click
+/// restarts the cycle solid, so the caret never vanishes while typing.
+const blink_ms: u64 = 530;
+var g_blink_epoch: u64 = 0;
+/// The phase the last frame drew, so idle waits know when a redraw is due.
+var g_caret_drawn: bool = true;
+
+fn caretPhaseOn(now: u64) bool {
+    return ((now -| g_blink_epoch) / blink_ms) % 2 == 0;
+}
+
+/// Wait slice while idle: up to the next caret flip when a field is focused.
+fn idleWaitMs() c_int {
+    if (zigui.focusedField() == null) return idle_wake_ms;
+    const left = blink_ms - (c.SDL_GetTicks() -| g_blink_epoch) % blink_ms;
+    return @intCast(@min(left + 1, @as(u64, @intCast(idle_wake_ms))));
+}
 
 /// The app-requested wake cadence in ms (0 = idle): the interval provider when
 /// set, else 16 ms while the boolean busy predicate holds.
@@ -261,6 +306,17 @@ const FrameStats = struct {
 // ---------------------------------------------------------------------------
 
 /// Put UTF-8 `text` on the system clipboard. `text` need not be NUL-terminated.
+/// The I-beam over text (fields, editors, selectable text), else the arrow.
+var g_cursors: [2]?*c.SDL_Cursor = .{ null, null };
+var g_text_cursor = false;
+fn setTextCursor(on: bool) void {
+    if (on == g_text_cursor) return;
+    g_text_cursor = on;
+    const i: usize = @intFromBool(on);
+    if (g_cursors[i] == null) g_cursors[i] = c.SDL_CreateSystemCursor(if (on) c.SDL_SYSTEM_CURSOR_TEXT else c.SDL_SYSTEM_CURSOR_DEFAULT);
+    if (g_cursors[i]) |cur| _ = c.SDL_SetCursor(cur);
+}
+
 pub fn setClipboardText(allocator: std.mem.Allocator, text: []const u8) void {
     const z = allocator.dupeSentinel(u8, text, 0) catch return;
     defer allocator.free(z);
@@ -524,6 +580,7 @@ pub const Tray = struct {
             c.SDL_DestroySurface(surf);
             return Error.TrayInit;
         };
+        if (builtin.os.tag == .macos) cocoa.templateStatusIcons();
         return .{ .handle = handle, .root = root, .icon = surf, .gpa = gpa };
     }
 
@@ -539,6 +596,19 @@ pub const Tray = struct {
         return .{ .owner = self, .menu = self.root };
     }
 
+    /// Remove every entry (and drop their callbacks), for a menu rebuilt from
+    /// changed state. Call on the main thread, never from inside a callback.
+    pub fn clear(self: *Tray) void {
+        while (true) {
+            var n: c_int = 0;
+            const entries = c.SDL_GetTrayEntries(self.root, &n) orelse break;
+            if (n == 0) break;
+            c.SDL_RemoveTrayEntry(@constCast(entries[0]));
+        }
+        for (self.callbacks.items) |cb| self.gpa.destroy(cb);
+        self.callbacks.clearRetainingCapacity();
+    }
+
     /// Replace the icon (e.g. to reflect a status change). Copies `rgba`, so the
     /// caller may free it afterwards.
     pub fn setIcon(self: *Tray, rgba: []const u8, w: c_int, h: c_int) void {
@@ -546,6 +616,7 @@ pub const Tray = struct {
         c.SDL_SetTrayIcon(self.handle, surf);
         if (self.icon) |old| c.SDL_DestroySurface(old);
         self.icon = surf;
+        if (builtin.os.tag == .macos) cocoa.templateStatusIcons();
     }
 
     /// Box `cb` so it outlives this call (SDL keeps the userdata pointer), and
@@ -590,6 +661,12 @@ pub fn run(
 
     if (cfg.min_width > 0 and cfg.min_height > 0)
         _ = c.SDL_SetWindowMinimumSize(window, @intCast(cfg.min_width), @intCast(cfg.min_height));
+    if (cfg.unified_titlebar and builtin.os.tag == .macos) cocoa.unifyTitlebar(window);
+    if (cfg.menus.len > 0 and builtin.os.tag == .macos) cocoa.setMenuBar(cfg.menus);
+    if (cfg.drag_band > 0) {
+        g_drag_band = cfg.drag_band;
+        _ = c.SDL_SetWindowHitTest(window, bandHitTest, null);
+    }
 
     // Window/taskbar icon (SDL copies the surface, so we free it immediately).
     if (cfg.icon) |ic| {
@@ -782,6 +859,8 @@ pub fn run(
             // (Sidebar/Table/RadioGroup) pick up dark mode and custom accents.
             zigui.setThemeTokens(theme);
             zigui.setViewport(point_w, point_h);
+            g_caret_drawn = caretPhaseOn(c.SDL_GetTicks());
+            zigui.setCaretVisible(g_caret_drawn);
             zigui.beginBuild(arena);
             const root = body(fr.st);
             zigui.endBuild();
@@ -926,7 +1005,10 @@ pub fn run(
         // the next arena reset, exactly like the pre-refactor loop.
         var hits: std.ArrayList(zigui.HitRegion) = .empty;
         var scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
-        if (!Render.drawFrame(&frame, &arena_state, &hits, &scrolls)) {
+        const drew = Render.drawFrame(&frame, &arena_state, &hits, &scrolls);
+        // The regions SDL's hit test sees while this frame waits for input.
+        g_band_hits = hits.items;
+        if (!drew) {
             // Frame skipped. On the congested-swapchain path, drawFrame has
             // already rebuilt the tree and filled `hits`/`scrolls` before the
             // GPU acquire failed, so these regions describe the CURRENT frame
@@ -985,7 +1067,7 @@ pub fn run(
             // dispatches against the last frame's hit regions, still valid since
             // no drawFrame has reset the arena.
             while (running) {
-                if (c.SDL_WaitEventTimeout(&ev, idle_wake_ms)) {
+                if (c.SDL_WaitEventTimeout(&ev, idleWaitMs())) {
                     handleEvent(&ev, &running, hits.items, scrolls.items);
                     while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
                     break;
@@ -994,11 +1076,158 @@ pub fn run(
                 // Background work (a generation, playback) may have flipped the
                 // busy cadence on: leave idle so the outer loop redraws at it.
                 if (busyIntervalMs() != 0) break;
+                // The caret's blink phase flipped: redraw just for it.
+                if (zigui.focusedField() != null and caretPhaseOn(c.SDL_GetTicks()) != g_caret_drawn) break;
             }
             last_ms = c.SDL_GetTicks();
         }
     }
 }
+
+var g_drag_band: f32 = 0;
+/// The current frame's hit regions, for `bandHitTest` (SDL calls it from inside
+/// the event pump, where the loop's lists are out of reach).
+var g_band_hits: []const zigui.HitRegion = &.{};
+
+/// Empty space in the top band drags the window; anything tappable there
+/// (a toolbar button, a title menu) keeps its clicks.
+fn bandHitTest(_: ?*c.SDL_Window, area: [*c]const c.SDL_Point, _: ?*anyopaque) callconv(.c) c.SDL_HitTestResult {
+    const p = eventPoint(@floatFromInt(area.*.x), @floatFromInt(area.*.y));
+    if (p.y >= g_drag_band or zigui.contextMenuOpen()) return c.SDL_HITTEST_NORMAL;
+    for (g_band_hits) |h| {
+        if (h.action == .secondary) continue;
+        if (p.x >= h.rect.x and p.x < h.rect.x + h.rect.width and p.y >= h.rect.y and p.y < h.rect.y + h.rect.height) return c.SDL_HITTEST_NORMAL;
+    }
+    return c.SDL_HITTEST_DRAGGABLE;
+}
+
+/// The bits of AppKit SDL does not expose, reached through the Objective-C runtime.
+const cocoa = struct {
+    const Id = ?*anyopaque;
+    extern "objc" fn objc_getClass(name: [*:0]const u8) Id;
+    extern "objc" fn sel_registerName(name: [*:0]const u8) Id;
+    extern "objc" fn objc_msgSend() void;
+
+    extern "objc" fn objc_allocateClassPair(superclass: Id, name: [*:0]const u8, extra: usize) Id;
+    extern "objc" fn objc_registerClassPair(cls: Id) void;
+    extern "objc" fn class_addMethod(cls: Id, name: Id, imp: *const anyopaque, types: [*:0]const u8) u8;
+
+    fn send(comptime R: type, target: Id, sel: [*:0]const u8, args: anytype) R {
+        const Fn = switch (args.len) {
+            0 => fn (Id, Id) callconv(.c) R,
+            1 => fn (Id, Id, @TypeOf(args[0])) callconv(.c) R,
+            3 => fn (Id, Id, @TypeOf(args[0]), @TypeOf(args[1]), @TypeOf(args[2])) callconv(.c) R,
+            else => @compileError("zero, one or three arguments"),
+        };
+        const f: *const Fn = @ptrCast(&objc_msgSend);
+        return @call(.auto, f, .{ target, sel_registerName(sel) } ++ args);
+    }
+
+    /// Transparent titlebar + full-size content + hidden title, and an empty
+    /// unified toolbar so the titlebar is toolbar-height (the traffic lights
+    /// sit inset, centred in a 52pt band).
+    fn unifyTitlebar(window: *c.SDL_Window) void {
+        const win: Id = c.SDL_GetPointerProperty(c.SDL_GetWindowProperties(window), c.SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, null);
+        if (win == null) return;
+        const full_size_content: u64 = 1 << 15;
+        send(void, win, "setStyleMask:", .{send(u64, win, "styleMask", .{}) | full_size_content});
+        send(void, win, "setTitlebarAppearsTransparent:", .{@as(u8, 1)});
+        send(void, win, "setTitleVisibility:", .{@as(i64, 1)}); // NSWindowTitleHidden
+        const toolbar = send(Id, objc_getClass("NSToolbar"), "new", .{});
+        send(void, toolbar, "setShowsBaselineSeparator:", .{@as(u8, 0)});
+        send(void, win, "setToolbar:", .{toolbar});
+        send(void, win, "setToolbarStyle:", .{@as(i64, 3)}); // NSWindowToolbarStyleUnified
+    }
+
+    /// Mark this app's menu-bar icons as template images, so macOS draws them
+    /// in the menu bar's own colour (white on a dark bar, black on a light
+    /// one) like every native status item. SDL hands AppKit a plain image.
+    /// The items live in this process's NSStatusBarWindows; their button is a
+    /// public NSStatusBarButton.
+    fn templateStatusIcons() void {
+        const ns_app = send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
+        const windows = send(Id, ns_app, "windows", .{});
+        const button_cls = objc_getClass("NSStatusBarButton");
+        const n: u64 = send(u64, windows, "count", .{});
+        for (0..n) |i| {
+            const win = send(Id, windows, "objectAtIndex:", .{@as(u64, i)});
+            const view = send(Id, win, "contentView", .{}) orelse continue;
+            templateIn(view, button_cls);
+        }
+    }
+
+    fn templateIn(view: Id, button_cls: Id) void {
+        if (send(u8, view, "isKindOfClass:", .{button_cls}) != 0) {
+            const img = send(Id, view, "image", .{}) orelse return;
+            send(void, img, "setTemplate:", .{@as(u8, 1)});
+            send(void, view, "setImage:", .{img});
+            return;
+        }
+        const subs = send(Id, view, "subviews", .{});
+        const n: u64 = send(u64, subs, "count", .{});
+        for (0..n) |i| templateIn(send(Id, subs, "objectAtIndex:", .{@as(u64, i)}), button_cls);
+    }
+
+    fn nsString(s: [*:0]const u8) Id {
+        return send(Id, objc_getClass("NSString"), "stringWithUTF8String:", .{s});
+    }
+
+    /// Menu actions, indexed by each item's tag (they live for the process).
+    var actions: std.ArrayList(zigui.Callback) = .empty;
+
+    /// `fire:` on the one target object: run the tagged action, then wake the
+    /// loop (a menu click produces no SDL event of its own).
+    fn fire(_: Id, _: Id, sender: Id) callconv(.c) void {
+        const tag = send(i64, sender, "tag", .{});
+        if (tag >= 0 and tag < actions.items.len) {
+            const cb = actions.items[@intCast(tag)];
+            cb.func(cb.ctx);
+        }
+        wake();
+    }
+
+    fn menuTarget() Id {
+        const cls = objc_allocateClassPair(objc_getClass("NSObject"), "ZiguiMenuTarget", 0) orelse return null;
+        _ = class_addMethod(cls, sel_registerName("fire:"), @ptrCast(&fire), "v@:@");
+        objc_registerClassPair(cls);
+        return send(Id, cls, "new", .{});
+    }
+
+    /// Keep SDL's application menu (About / Hide / Quit) and replace the rest.
+    fn setMenuBar(menus: []const Menu) void {
+        const ns_app = send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
+        const bar = send(Id, ns_app, "mainMenu", .{}) orelse return;
+        while (send(i64, bar, "numberOfItems", .{}) > 1) send(void, bar, "removeItemAtIndex:", .{@as(i64, 1)});
+        const tgt = menuTarget();
+        for (menus) |m| {
+            const holder = send(Id, objc_getClass("NSMenuItem"), "new", .{});
+            const sub = send(Id, send(Id, objc_getClass("NSMenu"), "alloc", .{}), "initWithTitle:", .{nsString(m.title)});
+            for (m.items) |it| {
+                if (it.title.len == 0) {
+                    send(void, sub, "addItem:", .{send(Id, objc_getClass("NSMenuItem"), "separatorItem", .{})});
+                    continue;
+                }
+                const sel = sel_registerName(if (it.selector) |s| s else "fire:");
+                const item = send(Id, send(Id, objc_getClass("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{ nsString(it.title), sel, nsString(it.key) });
+                if (it.key.len > 0) {
+                    var mask: u64 = 1 << 20; // Command
+                    if (it.shift) mask |= 1 << 17;
+                    if (it.ctrl) mask |= 1 << 18;
+                    if (it.option) mask |= 1 << 19;
+                    send(void, item, "setKeyEquivalentModifierMask:", .{mask});
+                }
+                if (it.action) |cb| {
+                    send(void, item, "setTag:", .{@as(i64, @intCast(actions.items.len))});
+                    actions.append(std.heap.page_allocator, cb) catch continue;
+                    send(void, item, "setTarget:", .{tgt});
+                }
+                send(void, sub, "addItem:", .{item});
+            }
+            send(void, holder, "setSubmenu:", .{sub});
+            send(void, bar, "addItem:", .{holder});
+        }
+    }
+};
 
 /// SDL reports mouse coordinates in logical window points; hit/scroll regions
 /// live in design points. Bring an event coordinate into region space.
@@ -1010,6 +1239,10 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
     // With frame logging on, also log which events wake the loop (each wake
     // costs a full rebuild+raster) so redraw storms can be attributed.
     if (g_frame_log) std.debug.print("[zigui] event 0x{x}\n", .{ev.type});
+    switch (ev.type) {
+        c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_MOUSE_BUTTON_DOWN => g_blink_epoch = c.SDL_GetTicks(),
+        else => {},
+    }
     switch (ev.type) {
         c.SDL_EVENT_QUIT => running.* = false,
         // The close button: hide-to-tray when configured, else quit. (⌘Q still
@@ -1041,6 +1274,8 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
                 // In a text field, double-click selects the word and triple-click
                 // selects all; any other target falls back to a normal tap.
                 if (ev.button.clicks >= 3 and zigui.dispatchTripleClick(hits, p)) {} else if (ev.button.clicks == 2 and zigui.dispatchDoubleClick(hits, p)) {} else {
+                    zigui.setTapCount(ev.button.clicks);
+                    defer zigui.setTapCount(1);
                     _ = zigui.dispatchTap(hits, p);
                 }
             }
@@ -1055,6 +1290,7 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             if ((ev.motion.state & c.SDL_BUTTON_LMASK) != 0) {
                 zigui.dispatchDrag(hits, mp);
             }
+            setTextCursor(zigui.textCursorAt(hits, mp));
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => zigui.endDrag(),
         c.SDL_EVENT_WINDOW_MOUSE_LEAVE => g_hover_point = null,
@@ -1082,6 +1318,11 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             // Escape closes an open context menu before anything else sees the key.
             if (zigui.contextMenuOpen() and ev.key.key == c.SDLK_ESCAPE) {
                 zigui.closeContextMenu();
+                return;
+            }
+            // ⌘C with no field focused copies selected text (chat, code).
+            if (zigui.focusedField() == null and ev.key.key == c.SDLK_C and (ev.key.mod & (c.SDL_KMOD_GUI | c.SDL_KMOD_CTRL)) != 0) {
+                if (zigui.selectedText()) |t| setClipboardText(std.heap.page_allocator, t);
                 return;
             }
             if (zigui.focusedField()) |f| {

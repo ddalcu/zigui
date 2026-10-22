@@ -102,7 +102,59 @@ const big: f32 = 1_000_000;
 // Measure pass
 // ---------------------------------------------------------------------------
 
+/// Per-frame memo for `measure`. A stack measures each child up to three times
+/// (min, max, then its share), and every nested stack does the same, so an
+/// uncached measure is exponential in nesting depth — a markdown bubble is ~15
+/// levels deep. Nodes are immutable once built, so (node identity, proposal)
+/// always measures the same within a frame. The key is the pointer that makes
+/// the node unique: a stack's children slice, a frame's or padding's child, a
+/// measured leaf's context. Live only between `beginMeasureCache` and
+/// `endMeasureCache` (the view layer's `render`), because the next frame's
+/// arena reuses those addresses. The map's storage persists (cleared, not
+/// freed) so a frame never pays for growing it again. Layout runs on one
+/// thread (the UI loop), hence a plain global.
+const MemoKey = struct { ptr: usize, w: u64, h: u64 };
+var memo_map: std.AutoHashMapUnmanaged(MemoKey, Size) = .empty;
+var memo_on = false;
+
+/// Start memoizing `measure`. Returns false when a cache is already active, in
+/// which case the caller must not end it.
+pub fn beginMeasureCache() bool {
+    if (memo_on) return false;
+    memo_map.clearRetainingCapacity();
+    memo_on = true;
+    return true;
+}
+pub fn endMeasureCache() void {
+    memo_on = false;
+}
+
+fn axisKey(v: ?f32, tag: u64) u64 {
+    return (tag << 33) | if (v) |x| @as(u64, @as(u32, @bitCast(x))) else (1 << 32);
+}
+
+fn memoKey(node: Node, prop: Proposal) ?MemoKey {
+    const id: struct { ptr: usize, tag: u64 } = switch (node) {
+        .leaf, .spacer => return null, // cheaper than a lookup
+        .measured => |m| .{ .ptr = @intFromPtr(m.ctx), .tag = 1 },
+        .padding => |p| .{ .ptr = @intFromPtr(p.child), .tag = 2 },
+        .frame => |f| .{ .ptr = @intFromPtr(f.child), .tag = 3 },
+        .stack => |s| if (s.children.len == 0) return null else .{ .ptr = @intFromPtr(s.children.ptr), .tag = 4 },
+    };
+    return .{ .ptr = id.ptr, .w = axisKey(prop.width, id.tag), .h = axisKey(prop.height, 0) };
+}
+
 pub fn measure(node: Node, prop: Proposal) Size {
+    if (memo_on) if (memoKey(node, prop)) |k| {
+        if (memo_map.get(k)) |s| return s;
+        const s = measureUncached(node, prop);
+        memo_map.put(std.heap.page_allocator, k, s) catch {};
+        return s;
+    };
+    return measureUncached(node, prop);
+}
+
+fn measureUncached(node: Node, prop: Proposal) Size {
     return switch (node) {
         .leaf => |h| .{
             .width = resolveAxis(prop.width, h.min.width, h.ideal.width, h.max.width),
@@ -167,8 +219,9 @@ fn measureStack(s: Stack, prop: Proposal) Size {
     const main_prop = mainOf(axis, prop);
     const cross_prop = crossOf(axis, prop);
 
-    var sizes_buf: [256]Size = undefined;
-    const sizes = sizes_buf[0..s.children.len];
+    var sizes_sc: stack.Scratch(Size) = .{};
+    defer sizes_sc.deinit();
+    const sizes = sizes_sc.get(s.children.len);
     layoutStackChildren(s, axis, main_prop, cross_prop, sizes);
 
     var total_main: f32 = 0;
@@ -198,16 +251,18 @@ fn layoutStackChildren(s: Stack, axis: Axis, main_prop: ?f32, cross_prop: ?f32, 
     const n = s.children.len;
     if (main_prop) |avail| {
         // Bounded main axis: distribute space.
-        var items_buf: [256]stack.FlexItem = undefined;
-        const items = items_buf[0..n];
+        var items_sc: stack.Scratch(stack.FlexItem) = .{};
+        defer items_sc.deinit();
+        const items = items_sc.get(n);
         for (s.children, 0..) |child, i| {
             items[i] = .{
                 .min = childMain(child, axis, 0, cross_prop),
                 .max = childMain(child, axis, big, cross_prop),
             };
         }
-        var mains_buf: [256]f32 = undefined;
-        const mains = mains_buf[0..n];
+        var mains_sc: stack.Scratch(f32) = .{};
+        defer mains_sc.deinit();
+        const mains = mains_sc.get(n);
         stack.distribute(avail, s.spacing, items, mains);
         for (s.children, 0..) |child, i| {
             const cs = measureInStack(child, axis, mains[i], cross_prop);
@@ -288,8 +343,9 @@ fn arrangeStack(allocator: std.mem.Allocator, s: Stack, rect: Rect) Allocator.Er
     const axis: Axis = if (s.direction == .horizontal) .horizontal else .vertical;
     const cross_extent = crossAxis(axis, rect.size());
 
-    var sizes_buf: [256]Size = undefined;
-    const sizes = sizes_buf[0..s.children.len];
+    var sizes_sc: stack.Scratch(Size) = .{};
+    defer sizes_sc.deinit();
+    const sizes = sizes_sc.get(s.children.len);
     layoutStackChildren(s, axis, mainAxis(axis, rect.size()), cross_extent, sizes);
 
     const results = try allocator.alloc(LayoutResult, s.children.len);
@@ -384,6 +440,14 @@ const testing = std.testing;
 
 fn leaf(w: f32, h: f32) Node {
     return .{ .leaf = SizingHints.fixedSize(.{ .width = w, .height = h }) };
+}
+
+test "a stack longer than 256 children lays out (heap scratch)" {
+    const kids = try std.testing.allocator.alloc(Node, 300);
+    defer std.testing.allocator.free(kids);
+    for (kids) |*k| k.* = .{ .leaf = SizingHints.fixedSize(.{ .width = 10, .height = 2 }) };
+    const sz = measure(.{ .stack = .{ .direction = .vertical, .spacing = 0, .children = kids } }, .{ .width = 100, .height = 1000 });
+    try std.testing.expectEqual(@as(f32, 600), sz.height);
 }
 
 test "measure: leaf reports ideal when proposal unspecified" {

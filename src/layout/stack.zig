@@ -21,6 +21,26 @@ pub const FlexItem = struct {
     }
 };
 
+/// Per-call scratch for a stack's children: on the stack for ordinary stacks,
+/// on the heap for a long list (a model table can hold hundreds of rows).
+/// Use as `var sc: Scratch(T) = .{}; defer sc.deinit(); const xs = sc.get(n);`.
+pub fn Scratch(comptime T: type) type {
+    return struct {
+        buf: [256]T = undefined,
+        heap: ?[]T = null,
+
+        pub fn get(self: *@This(), n: usize) []T {
+            if (n <= self.buf.len) return self.buf[0..n];
+            self.heap = std.heap.page_allocator.alloc(T, n) catch @panic("zigui: out of memory laying out a stack");
+            return self.heap.?;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.heap) |h| std.heap.page_allocator.free(h);
+        }
+    };
+}
+
 /// Fill `out` (len == items.len) with each item's assigned main length.
 pub fn distribute(available: f32, spacing: f32, items: []const FlexItem, out: []f32) void {
     std.debug.assert(out.len == items.len);
@@ -31,13 +51,14 @@ pub fn distribute(available: f32, spacing: f32, items: []const FlexItem, out: []
     var remaining = available - total_spacing;
 
     // Visit indices ordered by ascending flexibility.
-    var order: [256]usize = undefined;
-    std.debug.assert(n <= order.len);
+    var sc: Scratch(usize) = .{};
+    defer sc.deinit();
+    const order = sc.get(n);
     for (0..n) |i| order[i] = i;
-    sortByFlexibility(order[0..n], items);
+    sortByFlexibility(order, items);
 
     var count: f32 = @floatFromInt(n);
-    for (order[0..n]) |idx| {
+    for (order) |idx| {
         const share = remaining / count;
         const sz = std.math.clamp(share, items[idx].min, items[idx].max);
         out[idx] = sz;
@@ -47,8 +68,8 @@ pub fn distribute(available: f32, spacing: f32, items: []const FlexItem, out: []
 }
 
 fn sortByFlexibility(order: []usize, items: []const FlexItem) void {
-    // Simple insertion sort — stable, allocation-free, and n is tiny (children
-    // of one stack). Keeps original order among equally-flexible items.
+    // Simple insertion sort — stable and allocation-free; n is a stack's
+    // children. Keeps original order among equally-flexible items.
     var i: usize = 1;
     while (i < order.len) : (i += 1) {
         const key = order[i];

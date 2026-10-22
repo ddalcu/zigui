@@ -103,6 +103,9 @@ fn addExample(
     });
     app_mod.addImport("sdl_c", sdl_c.createModule());
     linkSdl3(b, app_mod, sdl_c, sdl3_prefix);
+    // app.zig reaches AppKit (unified titlebar, menu bar, template tray icons)
+    // through the Objective-C runtime.
+    if (target.result.os.tag == .macos) app_mod.linkSystemLibrary("objc", .{});
 
     // libc headers the examples use (stdio/time), via translate-c as `cstdio`.
     const cstdio = b.addTranslateC(.{

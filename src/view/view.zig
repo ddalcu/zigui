@@ -252,11 +252,15 @@ pub const Modifiers = struct {
     /// Marks this view as a hover scope: descendants with `reveal_on_hover`
     /// paint (and take taps) only while the cursor is inside this view.
     hover_scope: bool = false,
+    /// A rich-text view whose text can be drag-selected and copied (see `TextSel`).
+    selectable: bool = false,
     reveal_on_hover: bool = false,
     /// A `TextEditor` that draws no field surface of its own (its container
     /// supplies the chrome) and may override its inner padding.
     chromeless: bool = false,
     editor_pad: ?f32 = null,
+    /// A `TextEditor`'s hint while it is empty, drawn where its text starts.
+    editor_placeholder: []const u8 = "",
     /// A `TextField` that shows bullets instead of its text (API keys).
     secure: bool = false,
     /// Overlays presented from this view (sheets/alerts/popovers). A slice so a
@@ -364,6 +368,8 @@ pub const ScrollState = struct {
     /// scroll. The overlay scrollbar shows only briefly after this, then fades out
     /// (see `paintScrollbar`). 0 means "never scrolled" → no bar.
     last_active_ms: u64 = 0,
+    /// The viewport's top edge, recorded at paint (where the scrollbar's track starts).
+    viewport_y: f32 = 0,
 
     /// The furthest the content can be scrolled (0 when it fits the viewport).
     pub fn maxOffset(self: *const ScrollState) f32 {
@@ -429,10 +435,63 @@ pub const Kind = union(enum) {
     /// shares the focus/keyboard plumbing with `textfield`.
     text_editor: TextEditorData,
     picker: PickerData,
+    /// A view that paints itself through a callback (see `Drawing`).
+    drawing: DrawingData,
     /// A transparent container whose children are spliced into the enclosing
     /// stack (used by `ForEach`).
     group: []const View,
 };
+
+pub const DrawingData = struct {
+    ctx: *const anyopaque,
+    draw: *const fn (ctx: *const anyopaque, pen: *Pen, rect: Rect) Allocator.Error!void,
+};
+
+/// What a `Drawing` paints with: a few primitives in the view's own
+/// coordinates (points), with the view's opacity applied.
+pub const Pen = struct {
+    ctx: *const Context,
+    canvas: *Canvas,
+
+    fn tint(self: *const Pen, c: Color) Color {
+        return c.multiplyAlpha(self.ctx.opacity);
+    }
+    pub fn line(self: *Pen, a: Point, b: Point, width: f32, color: Color) Allocator.Error!void {
+        try self.canvas.line(a, b, width, self.tint(color));
+    }
+    pub fn fill(self: *Pen, r: Rect, radius: f32, color: Color) Allocator.Error!void {
+        try self.canvas.fillRoundedRect(r, radius, self.tint(color));
+    }
+    /// `top` at the rect's top edge fading to `bottom` at its bottom edge.
+    pub fn vGradient(self: *Pen, r: Rect, top: Color, bottom: Color) Allocator.Error!void {
+        try self.canvas.push(.{ .linear_gradient = .{ .rect = r, .start = r.origin(), .end = .{ .x = r.x, .y = r.maxY() }, .c0 = self.tint(top), .c1 = self.tint(bottom) } });
+    }
+    /// One line of text with its top-left at `origin`.
+    pub fn text(self: *Pen, s: []const u8, px: f32, color: Color, origin: Point) Allocator.Error!void {
+        try drawTextC(self.ctx, self.canvas, s, px, self.tint(color), origin);
+    }
+    /// Formatted text in the frame arena (paint runs after the build arena is gone).
+    pub fn fmt(self: *const Pen, comptime f: []const u8, args: anytype) []const u8 {
+        return std.fmt.allocPrint(self.ctx.arena, f, args) catch "";
+    }
+    pub fn textWidth(self: *const Pen, s: []const u8, px: f32) f32 {
+        return shape.measureLineWidth(self.ctx.cache.face, s, px);
+    }
+    pub fn lineHeight(self: *const Pen, px: f32) f32 {
+        return shape.lineHeight(self.ctx.cache.face, px);
+    }
+};
+
+/// A view that paints itself: `f(ctx, pen, frame)` runs at paint time, for
+/// charts and other one-off graphics. It fills the space it is offered, so
+/// give it a frame. `ctx` must outlive the frame (the build arena does).
+pub fn Drawing(comptime T: type, ctx: *const T, comptime f: fn (*const T, *Pen, Rect) Allocator.Error!void) View {
+    return .{ .kind = .{ .drawing = .{ .ctx = ctx, .draw = struct {
+        fn g(p: *const anyopaque, pen: *Pen, r: Rect) Allocator.Error!void {
+            try f(@ptrCast(@alignCast(p)), pen, r);
+        }
+    }.g } } };
+}
 
 // ---------------------------------------------------------------------------
 // View + fluent modifiers
@@ -604,7 +663,15 @@ pub const View = struct {
         v.mods.secure = true;
         return v;
     }
-    /// A `TextEditor` without its own field chrome; `pad` is its inner padding.
+    /// A `TextEditor` or `TextField` without its own field chrome; `pad` is the
+    /// editor's inner padding (a field keeps its own).
+    /// The hint a `TextEditor` shows while empty, wrapped and placed exactly
+    /// where typed text (and the caret) will start.
+    pub fn placeholder(self: View, s: []const u8) View {
+        var v = self;
+        v.mods.editor_placeholder = s;
+        return v;
+    }
     pub fn chromeless(self: View, pad: f32) View {
         var v = self;
         v.mods.chromeless = true;
@@ -612,6 +679,13 @@ pub const View = struct {
         return v;
     }
     /// This view is a hover scope (see `revealOnHover`).
+    /// Let the text of this rich-text view be selected with the mouse and
+    /// copied (⌘C). Selection stays within the one view.
+    pub fn selectable(self: View) View {
+        var v = self;
+        v.mods.selectable = true;
+        return v;
+    }
     pub fn hoverScope(self: View) View {
         var v = self;
         v.mods.hover_scope = true;
@@ -733,18 +807,32 @@ threadlocal var current_arena: ?Allocator = null;
 pub const WrapCache = struct {
     gpa: Allocator,
     map: std.AutoHashMapUnmanaged(u64, []shape.WrappedLine) = .empty,
+    /// Rich-text (markdown) paragraph layouts, the bulk of a transcript's cost.
+    rich: std.AutoHashMapUnmanaged(u64, RichEntry) = .empty,
+
+    const RichEntry = struct { layout: richtext.Layout, runs: []richtext.Run };
 
     pub fn init(gpa: Allocator) WrapCache {
         return .{ .gpa = gpa };
     }
     pub fn deinit(self: *WrapCache) void {
         self.clear();
+        self.clearRich();
         self.map.deinit(self.gpa);
+        self.rich.deinit(self.gpa);
     }
     fn clear(self: *WrapCache) void {
         var it = self.map.valueIterator();
         while (it.next()) |v| self.gpa.free(v.*);
         self.map.clearRetainingCapacity();
+    }
+    fn clearRich(self: *WrapCache) void {
+        var it = self.rich.valueIterator();
+        while (it.next()) |e| {
+            self.gpa.free(e.layout.lines);
+            self.gpa.free(e.runs);
+        }
+        self.rich.clearRetainingCapacity();
     }
     fn keyFor(text: []const u8, px: f32, max_w: f32) u64 {
         var h = std.hash.Wyhash.init(0x21a17e);
@@ -788,6 +876,55 @@ fn wrapCached(arena: Allocator, face: anytype, text: []const u8, px: f32, max_w:
     };
     gop.value_ptr.* = lines;
     return lines;
+}
+
+/// Lay out a rich paragraph, from the per-thread cache when its text, the
+/// font-affecting style of every span, the size and the width all match.
+fn richCached(arena: Allocator, spans: []const richtext.Span, faces: richtext.Faces, px: f32, mult: f32, max_w: f32, pre: bool) Allocator.Error!richtext.Layout {
+    const wc = g_wrap_cache orelse return richtext.layout(arena, spans, faces, px, mult, max_w, pre);
+    var h = std.hash.Wyhash.init(0x51c4);
+    for (spans) |sp| {
+        h.update(sp.text);
+        const style = [_]u32{ if (sp.weight) |w| @intFromEnum(w) + 1 else 0, @intFromBool(sp.italic), @intFromBool(sp.mono), @bitCast(sp.size_scale), @intCast(sp.text.len) };
+        h.update(std.mem.asBytes(&style));
+    }
+    const rest = [_]u32{ @bitCast(px), @bitCast(mult), @intFromFloat(@max(0, @min(1.0e9, @round(max_w)))), @intFromBool(pre), @intFromEnum(faces.base_weight), @intFromBool(faces.fonts != null) };
+    h.update(std.mem.asBytes(&rest));
+    const k = h.final();
+    if (wc.rich.get(k)) |e| {
+        // Collision guard: every run must still index into its span.
+        var ok = true;
+        for (e.runs) |r| ok = ok and r.span < spans.len and r.end <= spans[r.span].text.len;
+        if (ok) return e.layout;
+    }
+    const lay = try richtext.layout(arena, spans, faces, px, mult, max_w, pre);
+    if (wc.rich.count() > 4096) wc.clearRich();
+    // Copy into the cache: one block of runs, lines re-pointed into it.
+    var nruns: usize = 0;
+    for (lay.lines) |ln| nruns += ln.runs.len;
+    const runs = wc.gpa.alloc(richtext.Run, nruns) catch return lay;
+    const lines = wc.gpa.alloc(richtext.Line, lay.lines.len) catch {
+        wc.gpa.free(runs);
+        return lay;
+    };
+    var at: usize = 0;
+    for (lay.lines, lines) |src, *dst| {
+        dst.* = src;
+        @memcpy(runs[at..][0..src.runs.len], src.runs);
+        dst.runs = runs[at..][0..src.runs.len];
+        at += src.runs.len;
+    }
+    var copy = lay;
+    copy.lines = lines;
+    if (wc.rich.fetchPut(wc.gpa, k, .{ .layout = copy, .runs = runs }) catch {
+        wc.gpa.free(runs);
+        wc.gpa.free(lines);
+        return lay;
+    }) |old| {
+        wc.gpa.free(old.value.layout.lines);
+        wc.gpa.free(old.value.runs);
+    }
+    return copy;
 }
 
 /// The handful of theme colors that *composed* (theme-less) constructors need at
@@ -1151,6 +1288,8 @@ pub const HitAction = union(enum) {
     drag: DragCallback,
     /// A right-click handler; never fires on a primary click (`dispatchTap` skips it).
     secondary: Callback,
+    /// Press-drag text selection in a selectable rich-text view.
+    text_select: *const SelectHit,
 };
 
 /// Geometry captured for a `TextEditor`'s clickable text area, enough to map a
@@ -1249,6 +1388,9 @@ pub const Context = struct {
     /// `ScrollViewState` registers its viewport so the app can route wheel
     /// events with `dispatchScroll`.
     scroll_regions: ?*std.ArrayList(ScrollRegion) = null,
+    /// The on-screen part of the current scroll viewport (null = everything is
+    /// visible). Views wholly outside it skip painting; see `paint`.
+    visible: ?Rect = null,
     /// Device-pixel scale used by `renderScaled` (1 = logical points == pixels).
     scale: f32 = 1,
     /// The cursor's current location in layout points, or null when the pointer
@@ -1420,7 +1562,7 @@ const RichTextMeasure = struct {
     fn measure(p: *const anyopaque, prop: engine.Proposal) Size {
         const self: *const RichTextMeasure = @ptrCast(@alignCast(p));
         const max_w = prop.width orelse big;
-        const l = richtext.layout(self.arena, self.spans, self.faces, self.px, self.mult, max_w, self.pre) catch return .{};
+        const l = richCached(self.arena, self.spans, self.faces, self.px, self.mult, max_w, self.pre) catch return .{};
         return .{ .width = @min(l.width, max_w), .height = l.height };
     }
 };
@@ -1510,7 +1652,7 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             m.* = .{ .arena = ctx.arena, .spans = rt.spans, .faces = richFaces(ctx), .px = resolvedFontSize(ctx, v), .mult = rt.line_mult, .pre = rt.pre };
             return .{ .measured = .{ .ctx = m, .measureFn = RichTextMeasure.measure } };
         },
-        .shape => return .{ .leaf = .{
+        .shape, .drawing => return .{ .leaf = .{
             .min = .{},
             .ideal = .{ .width = 10, .height = 10 },
             .max = .{ .width = inf, .height = inf },
@@ -1592,8 +1734,10 @@ fn buildContentNode(ctx: *const Context, v: View) Allocator.Error!engine.Node {
             .max = .{ .width = inf, .height = ctx.theme.metrics.control_height },
         } },
         // The editor fills the space it is offered (the gutter/scroll live inside).
+        // At least one line plus its padding, so a frame can make a
+        // single-line editor (a composer) exactly as tall as it asks.
         .text_editor => return .{ .leaf = .{
-            .min = .{ .width = 120, .height = 60 },
+            .min = .{ .width = 120, .height = shape.lineHeight(ctx.cache.face, resolvedFontSize(ctx, v)) + 2 * (v.mods.editor_pad orelse 8) },
             .ideal = .{ .width = 360, .height = 220 },
             .max = .{ .width = inf, .height = inf },
         } },
@@ -1656,6 +1800,9 @@ pub fn renderInto(ctx: *const Context, v: View, rect: Rect, canvas: *Canvas) All
 /// `dispatchTap` gives them priority automatically. Hit regions for tappable
 /// elements are appended to `ctx.hit_regions`.
 pub fn render(ctx: *const Context, v: View, rect: Rect, canvas: *Canvas) !void {
+    // Memoize layout measurement for this frame (see `engine.beginMeasureCache`).
+    const owns_cache = engine.beginMeasureCache();
+    defer if (owns_cache) engine.endMeasureCache();
     try renderInto(ctx, v, rect, canvas);
     if (ctx.overlays) |overlays| {
         // Index-based loop: overlay content rendered below may enqueue *more*
@@ -1778,9 +1925,25 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
     };
     try ctx.theme.painter.panel(ctx.surface(canvas), target, radius, kind);
     try canvas.pushClip(target, radius);
-    try renderInto(ctx, req.content, target, canvas);
+    if (req.style == .popover and target.height + 0.5 < size.height) {
+        // Cut to fit the window: the content scrolls inside the panel. One
+        // popover is open at a time; a new anchor starts it at the top.
+        if (!std.meta.eql(popover_anchor, req.anchor)) {
+            popover_scroll = .{};
+            popover_anchor = req.anchor;
+        }
+        // Painting runs after the build arena is gone: box the content in the frame's.
+        const content = try ctx.arena.create(View);
+        content.* = req.content;
+        const scroller = View{ .kind = .{ .scroll_state = .{ .state = &popover_scroll, .content = content } } };
+        try renderInto(ctx, scroller, target, canvas);
+    } else try renderInto(ctx, req.content, target, canvas);
     try canvas.popClip();
 }
+
+/// Scroll position of a popover too tall for the window (see `drawOverlay`).
+var popover_scroll: ScrollState = .{};
+var popover_anchor: Rect = .{};
 
 fn centerRect(root: Rect, size: Size) Rect {
     return .{
@@ -1791,16 +1954,46 @@ fn centerRect(root: Rect, size: Size) Rect {
     };
 }
 
-/// Position an overlay just below its `anchor`, flipping above and clamping
-/// horizontally so it stays inside `root`.
+/// Position an overlay just below its `anchor`, or above it when it fits
+/// there and not below. When it fits neither side it takes the roomier one and
+/// is cut to the space left (the caller scrolls it): it never covers its anchor
+/// or leaves `root`.
 fn anchoredRect(root: Rect, anchor: Rect, size: Size) Rect {
+    const gap: f32 = 4;
+    const margin: f32 = 8;
     var x = anchor.x;
     if (x + size.width > root.maxX()) x = root.maxX() - size.width;
     if (x < root.x) x = root.x;
-    var y = anchor.maxY() + 4;
-    if (y + size.height > root.maxY()) y = anchor.y - size.height - 4; // flip above
-    if (y < root.y) y = root.y;
-    return .{ .x = x, .y = y, .width = size.width, .height = size.height };
+    const below = root.maxY() - margin - (anchor.maxY() + gap);
+    const above = anchor.y - gap - (root.y + margin);
+    var h = size.height;
+    var y: f32 = undefined;
+    if (h <= below) {
+        y = anchor.maxY() + gap;
+    } else if (h <= above) {
+        y = anchor.y - gap - h;
+    } else if (below >= above) {
+        h = @max(0, below);
+        y = anchor.maxY() + gap;
+    } else {
+        h = @max(0, above);
+        y = anchor.y - gap - h;
+    }
+    return .{ .x = x, .y = y, .width = size.width, .height = h };
+}
+
+test "popover: below when it fits, above when only that fits, else cut to the roomier side" {
+    const root = Rect{ .x = 0, .y = 0, .width = 800, .height = 600 };
+    const low = Rect{ .x = 100, .y = 500, .width = 80, .height = 20 }; // near the bottom
+    // Fits below a high anchor.
+    try std.testing.expectEqual(@as(f32, 124), anchoredRect(root, .{ .x = 100, .y = 100, .width = 80, .height = 20 }, .{ .width = 200, .height = 100 }).y);
+    // Flips above a low anchor, ending above it.
+    const up = anchoredRect(root, low, .{ .width = 200, .height = 300 });
+    try std.testing.expectEqual(@as(f32, 496), up.maxY());
+    // Too tall for either side: cut to the room above, never over the anchor.
+    const cut = anchoredRect(root, low, .{ .width = 200, .height = 2000 });
+    try std.testing.expect(cut.y >= 8 and cut.maxY() <= 496);
+    try std.testing.expectEqual(@as(f32, 488), cut.height);
 }
 
 // ---------------------------------------------------------------------------
@@ -1810,6 +2003,10 @@ fn anchoredRect(root: Rect, anchor: Rect, size: Size) Rect {
 fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas) Allocator.Error!void {
     const outer = lr.frame;
     if (v.mods.reveal_on_hover and !ctx.in_hover_scope) return;
+    // Scrolled out of view: nothing of it can show (a long transcript paints
+    // only the screenful it shows). A view that presents an overlay still
+    // paints, so the overlay request is not lost.
+    if (ctx.visible) |vis| if (!outer.intersects(vis) and v.mods.overlay.len == 0) return;
 
     // Resolve inherited environment for this subtree.
     var child_ctx = ctx.*;
@@ -1925,6 +2122,10 @@ fn paintContent(ctx: *const Context, v: View, clr: engine.LayoutResult, canvas: 
             try emitA11y(ctx, v, rect, .static_text, wt.string, "");
         },
         .shape => |sh| try paintShape(ctx, sh, rect, op, canvas),
+        .drawing => |d| {
+            var pen = Pen{ .ctx = ctx, .canvas = canvas };
+            try d.draw(d.ctx, &pen, rect);
+        },
         .button => |b| {
             try paintButton(ctx, b, rect, canvas);
             try emitA11y(ctx, v, rect, .button, b.label, "");
@@ -2245,7 +2446,14 @@ fn paintRichText(ctx: *const Context, v: View, rt: RichTextData, rect: Rect, can
     const op = ctx.opacity;
     const px = resolvedFontSize(ctx, v);
     const faces = richFaces(ctx);
-    const lay = try richtext.layout(ctx.arena, rt.spans, faces, px, rt.line_mult, rect.width, rt.pre);
+    const lay = try richCached(ctx.arena, rt.spans, faces, px, rt.line_mult, rect.width, rt.pre);
+    if (v.mods.selectable) {
+        // Before the link regions, so a link still takes its own click.
+        const hit = try ctx.arena.create(SelectHit);
+        hit.* = .{ .key = selectKey(rt.spans, px), .origin = rect.origin(), .lay = lay, .spans = rt.spans, .faces = faces, .px = px, .scale = ctx.scale };
+        try ctx.hit_regions.append(ctx.arena, .{ .rect = rect, .action = .{ .text_select = hit }, .disabled = ctx.disabled });
+        if (g_sel) |sel| if (sel.key == hit.key) try paintSelection(ctx, hit, sel, canvas);
+    }
     for (lay.lines) |ln| {
         const baseline = rect.y + ln.y + ln.baseline;
         for (ln.runs) |r| {
@@ -2303,7 +2511,7 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
     // from the event loop on Enter) can reach it without the view tree.
     if (focused) tf.state.on_submit = v.mods.on_submit;
     // The theme draws the input surface (background + border).
-    try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
+    if (!v.mods.chromeless) try ctx.theme.painter.field(ctx.surface(canvas), rect, radius, .{ .focused = focused });
 
     const px = ctx.theme.typography.body.size;
     const lh = shape.lineHeight(ctx.cache.face, px);
@@ -2335,7 +2543,7 @@ fn paintTextField(ctx: *const Context, v: View, tf: TextFieldData, rect: Rect, c
         drawTextC(ctx, canvas, content, px, ctx.foreground.multiplyAlpha(op), .{ .x = rect.x + pad, .y = ty }) catch {};
     }
     // caret
-    if (focused) {
+    if (focused and caret_on) {
         const caret_at = if (secure) (std.unicode.utf8CountCodepoints(real[0..tf.state.caret]) catch tf.state.caret) * 3 else tf.state.caret;
         const caret_x = rect.x + pad + shape.measureLineWidth(ctx.cache.face, content[0..caret_at], px);
         try canvas.line(.{ .x = caret_x, .y = ty + 2 }, .{ .x = caret_x, .y = ty + lh - 2 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
@@ -2431,6 +2639,12 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
         const sel = st.selectionRange();
 
         try canvas.pushClip(rect.insetBy(2, 2), 0);
+        if (text.len == 0 and v.mods.editor_placeholder.len > 0) {
+            const hint = v.mods.editor_placeholder;
+            const hc = ctx.theme.colors.secondary_label.multiplyAlpha(op);
+            for (wrapCached(ctx.arena, face, hint, px, wrap_w), 0..) |row, i|
+                drawEditorLine(ctx, canvas, hint[row.start..row.end], px, hc, .{ .x = text_x, .y = top + @as(f32, @floatFromInt(i)) * lh });
+        }
         for (rows, 0..) |row, i| {
             const y = top - off + @as(f32, @floatFromInt(i)) * lh;
             if (y + lh < top or y > top + view_h) continue;
@@ -2444,7 +2658,7 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
                 }
             }
             if (row.end > row.start) drawEditorLine(ctx, canvas, text[row.start..row.end], px, fg, .{ .x = text_x, .y = y });
-            if (focused and i == caret_row) {
+            if (focused and caret_on and i == caret_row) {
                 const cpos = std.math.clamp(st.caret, row.start, row.end);
                 const cx = text_x + text_buffer.editorPrefixWidth(face, px, text[row.start..cpos]);
                 try canvas.line(.{ .x = cx, .y = y + 1 }, .{ .x = cx, .y = y + lh - 1 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
@@ -2493,6 +2707,8 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
 
     // Clip to the interior (inside the border/corners) while drawing content.
     try canvas.pushClip(rect.insetBy(2, 2), 0);
+    if (text.len == 0 and v.mods.editor_placeholder.len > 0)
+        drawEditorLine(ctx, canvas, v.mods.editor_placeholder, px, ctx.theme.colors.secondary_label.multiplyAlpha(op), .{ .x = text_x, .y = top });
 
     if (ed.line_numbers) {
         const gx = rect.x + gutter_w;
@@ -2529,7 +2745,7 @@ fn paintTextEditor(ctx: *const Context, v: View, ed: TextEditorData, rect: Rect,
 
         if (lend > lstart) drawEditorLine(ctx, canvas, text[lstart..lend], px, fg, .{ .x = text_x, .y = y });
 
-        if (focused and line_no == caret_line) {
+        if (focused and caret_on and line_no == caret_line) {
             const cx = text_x + text_buffer.editorPrefixWidth(face, px, text[lstart..st.caret]);
             try canvas.line(.{ .x = cx, .y = y + 1 }, .{ .x = cx, .y = y + lh - 1 }, 1, ctx.theme.colors.accent.multiplyAlpha(op));
         }
@@ -2609,48 +2825,92 @@ fn paintScroll(ctx: *const Context, sd: ScrollData, rect: Rect, canvas: *Canvas)
 fn paintScrollState(ctx: *const Context, sd: ScrollStateData, rect: Rect, canvas: *Canvas) Allocator.Error!void {
     try canvas.pushClip(rect, 0);
     defer canvas.popClip() catch {};
-    const csize = try measure(ctx, sd.content.*, .{ .width = rect.width, .height = null });
+    // Lower once: measuring and arranging the same nodes lets the frame's
+    // measure memo serve both.
+    const node = try buildNode(ctx, sd.content.*);
+    const csize = engine.measure(node, .{ .width = rect.width, .height = null });
     // Record geometry so maxOffset()/atBottom() are accurate, then clamp.
     sd.state.content_h = csize.height;
     sd.state.viewport_h = rect.height;
     sd.state.offset = std.math.clamp(sd.state.offset, 0, sd.state.maxOffset());
     const content_rect = Rect{ .x = rect.x, .y = rect.y - sd.state.offset, .width = rect.width, .height = csize.height };
-    // renderInto (not render): overlays are drained once, by the top-level render.
-    try renderInto(ctx, sd.content.*, content_rect, canvas);
+    // Paint (not render): overlays are drained once, by the top-level render.
+    var inner = ctx.*;
+    inner.visible = if (ctx.visible) |vis| (vis.intersection(rect) orelse Rect{}) else rect;
+    try paint(&inner, sd.content.*, try engine.arrange(ctx.arena, node, content_rect), canvas);
     if (ctx.scroll_regions) |regions| {
         try regions.append(ctx.arena, .{ .rect = rect, .state = sd.state });
     }
+    sd.state.viewport_y = rect.y;
+    // The scrollbar's strip takes clicks over the content's edge: press to grab
+    // (or jump to) the thumb, then drag it.
+    if (sd.state.maxOffset() > 0.5) try ctx.hit_regions.append(ctx.arena, .{
+        .rect = scrollbarStrip(rect),
+        .action = .{ .callback = .{ .ctx = sd.state, .func = scrollbarPress } },
+        .disabled = false,
+    });
     try paintScrollbar(ctx, sd.state, rect, canvas);
 }
 
 /// Draw a slim, rounded scroll indicator on the right edge of `rect` when the
 /// content overflows. The thumb's length and position track the visible
 /// fraction, like a native overlay scrollbar. No-op when everything fits.
-fn paintScrollbar(ctx: *const Context, ss: *const ScrollState, rect: Rect, canvas: *Canvas) Allocator.Error!void {
+const scrollbar_inset: f32 = 2;
+
+/// The right-edge strip that grabs scrollbar clicks.
+fn scrollbarStrip(view_rect: Rect) Rect {
+    return .{ .x = view_rect.maxX() - 12, .y = view_rect.y, .width = 12, .height = view_rect.height };
+}
+
+/// The thumb's top, length and how far it can travel, for a viewport of
+/// `ss.viewport_h` starting at `top`. Shared by painting and dragging.
+const Thumb = struct { y: f32, h: f32, travel: f32 };
+fn scrollThumb(ss: *const ScrollState, top: f32) ?Thumb {
     const max = ss.maxOffset();
-    if (max <= 0.5 or rect.height <= 0) return; // fits → nothing to show
+    const track_h = ss.viewport_h - scrollbar_inset * 2;
+    if (max <= 0.5 or track_h <= 0) return null;
+    const h = @max(24, track_h * std.math.clamp(ss.viewport_h / ss.content_h, 0.06, 1));
+    const travel = @max(1, track_h - h);
+    return .{ .y = top + scrollbar_inset + travel * std.math.clamp(ss.offset / max, 0, 1), .h = h, .travel = travel };
+}
+
+/// A press in the scrollbar strip: off the thumb, jump so the thumb centres on
+/// the pointer (macOS "jump to the spot clicked"); then drag from there.
+fn scrollbarPress(p: ?*anyopaque) void {
+    const ss: *ScrollState = @ptrCast(@alignCast(p.?));
+    const t = scrollThumb(ss, ss.viewport_y) orelse return;
+    if (g_press.y < t.y or g_press.y > t.y + t.h) {
+        const frac = (g_press.y - ss.viewport_y - scrollbar_inset - t.h / 2) / t.travel;
+        ss.offset = std.math.clamp(frac, 0, 1) * ss.maxOffset();
+    }
+    ss.last_active_ms = g_frame_time_ms;
+    armDrag(.{ .ctx = ss, .func = scrollbarDrag });
+}
+
+fn scrollbarDrag(p: ?*anyopaque, _: f32, dy: f32) void {
+    const ss: *ScrollState = @ptrCast(@alignCast(p.?));
+    const t = scrollThumb(ss, ss.viewport_y) orelse return;
+    ss.scrollBy(dy * ss.maxOffset() / t.travel);
+    ss.last_active_ms = g_frame_time_ms;
+}
+
+fn paintScrollbar(ctx: *const Context, ss: *const ScrollState, rect: Rect, canvas: *Canvas) Allocator.Error!void {
+    const t = scrollThumb(ss, rect.y) orelse return; // fits → nothing to show
+    // Grabbed, or the pointer over its strip: shown solid and a little wider.
+    const dragging = if (g_area_drag) |d| d.ctx == @as(?*anyopaque, @ptrCast(@constCast(ss))) else false;
+    const hot = dragging or (if (ctx.hover_point) |hp| scrollbarStrip(rect).contains(hp) else false);
 
     // Auto-hide: only visible briefly after the last scroll, then fade out.
-    if (ss.last_active_ms == 0 or g_frame_time_ms == 0) return; // never scrolled / headless
-    const since = g_frame_time_ms -| ss.last_active_ms;
-    if (since >= scrollbar_visible_ms) return; // fully hidden
-    const fade: f32 = if (since <= scrollbar_hold_ms)
-        1
-    else
-        1 - @as(f32, @floatFromInt(since - scrollbar_hold_ms)) / @as(f32, @floatFromInt(scrollbar_fade_ms));
+    var fade: f32 = 1;
+    if (!hot) {
+        if (ss.last_active_ms == 0 or g_frame_time_ms == 0) return; // never scrolled / headless
+        const since = g_frame_time_ms -| ss.last_active_ms;
+        if (since >= scrollbar_visible_ms) return; // fully hidden
+        if (since > scrollbar_hold_ms) fade = 1 - @as(f32, @floatFromInt(since - scrollbar_hold_ms)) / @as(f32, @floatFromInt(scrollbar_fade_ms));
+    }
 
-    const track_inset: f32 = 2;
-    const width: f32 = 4;
-    const track_h = rect.height - track_inset * 2;
-    if (track_h <= 0) return;
-
-    const visible_frac = std.math.clamp(rect.height / ss.content_h, 0.06, 1);
-    const thumb_h = @max(24, track_h * visible_frac);
-    const scroll_frac = std.math.clamp(ss.offset / max, 0, 1);
-    const thumb_y = rect.y + track_inset + (track_h - thumb_h) * scroll_frac;
-    const thumb_x = rect.x + rect.width - width - track_inset;
-
-    const thumb = Rect{ .x = thumb_x, .y = thumb_y, .width = width, .height = thumb_h };
+    const width: f32 = if (hot) 7 else 4;
+    const thumb = Rect{ .x = rect.x + rect.width - width - scrollbar_inset, .y = t.y, .width = width, .height = t.h };
     // A muted thumb that reads on both light and dark surfaces.
     const col = ctx.theme.colors.secondary_label.withAlpha(0.45 * ctx.opacity * fade);
     try canvas.fillRoundedRect(thumb, width / 2, col);
@@ -2689,6 +2949,10 @@ pub fn setDragEndHook(f: ?*const fn () void) void {
 
 /// End an in-progress mouse drag-selection (the app calls this on mouse-up).
 pub fn endDrag() void {
+    if (g_sel) |*s| {
+        s.dragging = false;
+        if (s.anchor == s.head) g_sel = null;
+    }
     if (g_area_drag != null) if (g_drag_end) |f| f();
     g_drag = null;
     g_slider_drag = null;
@@ -2705,6 +2969,21 @@ pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
         g_area_last = p;
         return;
     }
+    if (g_sel) |*s| if (s.dragging) {
+        // The view's region is re-emitted each frame: find this frame's copy.
+        var j = regions.len;
+        while (j > 0) {
+            j -= 1;
+            switch (regions[j].action) {
+                .text_select => |h| if (h.key == s.key) {
+                    s.head = h.indexAt(p);
+                    return;
+                },
+                else => {},
+            }
+        }
+        return;
+    };
     if (g_drag == null and g_slider_drag == null) return;
     var i = regions.len;
     while (i > 0) {
@@ -2730,6 +3009,7 @@ pub fn dispatchDrag(regions: []const HitRegion, p: Point) void {
 /// Returns true if a callback fired.
 pub fn dispatchTap(regions: []const HitRegion, p: Point) bool {
     g_press = p;
+    g_sel = null; // a press elsewhere clears it; a press on selectable text starts anew
     var i = regions.len;
     while (i > 0) {
         i -= 1;
@@ -2779,6 +3059,162 @@ pub fn clickCmd() bool {
 /// Handle a double-click at `p`: if the top-most region under it is an editable
 /// text field, select the word there and return true. Otherwise returns false so
 /// the caller can fall back to a normal tap.
+/// The caret's blink phase. The event loop flips it while a field is focused
+/// and holds it on while typing; tests and headless renders keep it on.
+threadlocal var caret_on: bool = true;
+pub fn setCaretVisible(on: bool) void {
+    caret_on = on;
+}
+
+// ---- text selection in rich text --------------------------------------------
+
+/// The one live selection: a byte range in the concatenated span text of the
+/// selectable view whose content hashes to `key`. Views are rebuilt every
+/// frame, so the content hash is what identifies "the same paragraph".
+const TextSel = struct { key: u64, anchor: usize, head: usize, dragging: bool };
+var g_sel: ?TextSel = null;
+/// The selected text, refreshed whenever its view paints (what ⌘C copies).
+var g_sel_text: std.ArrayList(u8) = .empty;
+
+fn selectKey(spans: []const richtext.Span, px: f32) u64 {
+    var h = std.hash.Wyhash.init(0x5e1);
+    for (spans) |sp| h.update(sp.text);
+    h.update(std.mem.asBytes(&px));
+    return h.final();
+}
+
+/// A selectable view's geometry this frame: enough to map a point to a text
+/// offset without the `Context`.
+pub const SelectHit = struct {
+    key: u64,
+    origin: Point,
+    lay: richtext.Layout,
+    spans: []const richtext.Span,
+    faces: richtext.Faces,
+    px: f32,
+    scale: f32,
+
+    /// Where span `si` starts in the concatenated text.
+    fn spanStart(self: *const SelectHit, si: usize) usize {
+        var n: usize = 0;
+        for (self.spans[0..si]) |sp| n += sp.text.len;
+        return n;
+    }
+
+    fn runWidth(self: *const SelectHit, r: richtext.Run, end: usize) f32 {
+        const sp = self.spans[r.span];
+        return shape.measureLineWidth(self.faces.forSpan(sp), sp.text[r.start..end], self.px * sp.size_scale);
+    }
+
+    /// The text offset nearest `p` (clamped into the view).
+    fn indexAt(self: *const SelectHit, p: Point) usize {
+        const lines = self.lay.lines;
+        if (lines.len == 0) return 0;
+        const ly = p.y - self.origin.y;
+        if (ly < 0) return 0;
+        var li: usize = lines.len - 1;
+        for (lines, 0..) |ln, i| if (ly < ln.y + ln.h) {
+            li = i;
+            break;
+        };
+        if (ly >= lines[lines.len - 1].y + lines[lines.len - 1].h) return self.spanStart(self.spans.len);
+        const ln = lines[li];
+        const lx = p.x - self.origin.x;
+        if (ln.runs.len == 0) {
+            // A blank line: just after the previous line's text (its newline).
+            var k = li;
+            while (k > 0) {
+                k -= 1;
+                if (lines[k].runs.len > 0) {
+                    const r = lines[k].runs[lines[k].runs.len - 1];
+                    return @min(self.spanStart(r.span) + r.end + 1, self.spanStart(self.spans.len));
+                }
+            }
+            return 0;
+        }
+        for (ln.runs) |r| {
+            if (lx < r.x) return self.spanStart(r.span) + r.start;
+            if (lx <= r.x + r.w) {
+                // Nearest codepoint boundary inside the run.
+                const text = self.spans[r.span].text;
+                var at: usize = r.start;
+                var i: usize = r.start;
+                while (i < r.end) {
+                    const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+                    const next = @min(r.end, i + n);
+                    const mid = r.x + (self.runWidth(r, i) + self.runWidth(r, next)) / 2;
+                    if (lx < mid) break;
+                    at = next;
+                    i = next;
+                }
+                return self.spanStart(r.span) + at;
+            }
+        }
+        const last = ln.runs[ln.runs.len - 1];
+        return self.spanStart(last.span) + last.end;
+    }
+};
+
+fn paintSelection(ctx: *const Context, h: *const SelectHit, sel: TextSel, canvas: *Canvas) !void {
+    const lo = @min(sel.anchor, sel.head);
+    const hi = @max(sel.anchor, sel.head);
+    if (lo == hi) return;
+    const col = ctx.theme.colors.selection.withAlpha(0.35 * ctx.opacity);
+    for (h.lay.lines) |ln| for (ln.runs) |r| {
+        const base = h.spanStart(r.span);
+        const a = @max(lo, base + r.start);
+        const b = @min(hi, base + r.end);
+        if (a >= b) continue;
+        const x0 = h.origin.x + r.x + h.runWidth(r, a - base);
+        const x1 = h.origin.x + r.x + h.runWidth(r, b - base);
+        try canvas.fillRect(.{ .x = x0, .y = h.origin.y + ln.y, .width = x1 - x0, .height = ln.h }, col);
+    };
+    // Keep the copyable text current.
+    g_sel_text.clearRetainingCapacity();
+    var at: usize = 0;
+    for (h.spans) |sp| {
+        const a = std.math.clamp(lo, at, at + sp.text.len);
+        const b = std.math.clamp(hi, at, at + sp.text.len);
+        if (b > a) g_sel_text.appendSlice(std.heap.page_allocator, sp.text[a - at .. b - at]) catch {};
+        at += sp.text.len;
+    }
+}
+
+/// The selected text (⌘C), or null when nothing is selected.
+pub fn selectedText() ?[]const u8 {
+    const s = g_sel orelse return null;
+    if (s.anchor == s.head or g_sel_text.items.len == 0) return null;
+    return g_sel_text.items;
+}
+
+/// Whether the pointer over `p` should show the text (I-beam) cursor: the
+/// top-most thing under it is a text field, an editor or selectable text.
+pub fn textCursorAt(regions: []const HitRegion, p: Point) bool {
+    if (g_sel) |s| if (s.dragging) return true;
+    var i = regions.len;
+    while (i > 0) {
+        i -= 1;
+        const r = regions[i];
+        if (r.disabled or r.action == .secondary or !r.rect.contains(p)) continue;
+        return switch (r.action) {
+            .text_click, .focus, .text_select => true,
+            else => false,
+        };
+    }
+    return false;
+}
+
+/// The click count of the tap being dispatched (2 = a double-click), so a tap
+/// callback can tell a double-click on a row from a single one. The event loop
+/// sets it before dispatching.
+threadlocal var tap_clicks: u8 = 1;
+pub fn setTapCount(n: u8) void {
+    tap_clicks = @max(1, n);
+}
+pub fn tapCount() u8 {
+    return tap_clicks;
+}
+
 pub fn dispatchDoubleClick(regions: []const HitRegion, p: Point) bool {
     var i = regions.len;
     while (i > 0) {
@@ -2898,6 +3334,10 @@ fn performAction(a: HitAction, p: Point) void {
         .drag => |d| {
             g_area_drag = d;
             g_area_last = p;
+        },
+        .text_select => |h| {
+            const at = h.indexAt(p);
+            g_sel = .{ .key = h.key, .anchor = at, .head = at, .dragging = true };
         },
         .secondary => {},
     }
@@ -4529,6 +4969,91 @@ test "view: chaining .sheet and .alert keeps both overlays (neither clobbers)" {
     try testing.expectEqual(@as(usize, 2), ovs.items.len);
     try testing.expectEqual(OverlayStyle.sheet, ovs.items[0].style);
     try testing.expectEqual(OverlayStyle.alert, ovs.items[1].style);
+}
+
+test "view: a popover taller than the window is cut to fit and scrolls" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var scrolls: std.ArrayList(ScrollRegion) = .empty;
+    c.scroll_regions = &scrolls;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 300, .height = 300 };
+    const tree = VStack(.{ Spacer(), Text("anchor").popover(presented.binding(), Rectangle(Color.blue).frame(80, 2000)) });
+    // The app paints after the build pass ends; so does this test.
+    endBuild();
+    try render(&c, tree, root, &canvas);
+    // A scroll region for the popover, inside the window.
+    try testing.expectEqual(@as(usize, 1), scrolls.items.len);
+    try testing.expect(scrolls.items[0].rect.y >= 0 and scrolls.items[0].rect.maxY() <= 300);
+}
+
+test "view: press-drag over selectable text selects it for copying" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 400, .height = 40 };
+    const tree = RichText(&.{.{ .text = "hello world" }}).selectable().frameMaxWidth().frameAlign(.leading);
+    try render(&c, tree, root, &canvas);
+    // Press at the far left, drag past the end: the whole text.
+    try testing.expect(dispatchTap(c.hit_regions.items, .{ .x = 1, .y = 20 }));
+    dispatchDrag(c.hit_regions.items, .{ .x = 399, .y = 20 });
+    endDrag();
+    try render(&c, tree, root, &canvas); // paints the highlight, refreshes the text
+    try testing.expectEqualStrings("hello world", selectedText().?);
+    // A press elsewhere clears it.
+    _ = dispatchTap(&.{}, .{ .x = 500, .y = 500 });
+    try testing.expect(selectedText() == null);
+}
+
+test "view: dragging the scrollbar thumb scrolls the content" {
+    var ss = ScrollState{ .content_h = 1000, .viewport_h = 100, .viewport_y = 0 };
+    const t0 = scrollThumb(&ss, 0).?;
+    // Press on the thumb, drag it all the way down: the content reaches its end.
+    g_press = .{ .x = 95, .y = t0.y + 1 };
+    scrollbarPress(&ss);
+    try std.testing.expectEqual(@as(f32, 0), ss.offset);
+    scrollbarDrag(&ss, 0, t0.travel);
+    try std.testing.expectEqual(ss.maxOffset(), ss.offset);
+    endDrag();
+    // A press low on the track, off the thumb, jumps there.
+    ss.offset = 0;
+    g_press = .{ .x = 95, .y = 90 };
+    scrollbarPress(&ss);
+    try std.testing.expect(ss.offset > ss.maxOffset() * 0.8);
+    endDrag();
+}
+
+test "view: a Drawing paints into its frame" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const Box = struct {
+        color: Color,
+        fn draw(self: *const @This(), pen: *Pen, r: Rect) Allocator.Error!void {
+            try pen.fill(.{ .x = r.x, .y = r.y, .width = r.width / 2, .height = r.height }, 0, self.color);
+        }
+    };
+    const box = Box{ .color = Color.blue };
+    try render(&c, Drawing(Box, &box, Box.draw).frame(40, 20), .{ .x = 0, .y = 0, .width = 40, .height = 20 }, &canvas);
+    var fb = try raster.Framebuffer.init(testing.allocator, 40, 20);
+    defer fb.deinit();
+    fb.clear(Color.white);
+    try raster.render(testing.allocator, &fb, canvas.commands.items);
+    try testing.expect(fb.at(5, 10).b > 0.9 and fb.at(5, 10).r < 0.1);
+    try testing.expect(fb.at(35, 10).r > 0.9);
 }
 
 test "view: popover content is positioned near its (top) anchor" {

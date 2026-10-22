@@ -401,11 +401,19 @@ pub const Gpu = struct {
 
     /// Stage instance data and pending atlas uploads through the (grown as
     /// needed) transfer buffer, recording the copy commands on `cmdbuf`.
+    /// An atlas entry with its 1px border (`Atlas.pad`), RGBA8.
+    fn paddedBytes(p: scene_mod.Upload) u32 {
+        return (p.w + 2) * (p.h + 2) * 4;
+    }
+
     fn upload(self: *Gpu, cmdbuf: *c.SDL_GPUCommandBuffer, scene: scene_mod.Scene) bool {
         const pending = self.atlas.pendingUploads();
         const inst_bytes: u32 = @intCast(scene.instances.len * @sizeOf(Instance));
+        // Each entry goes up with its 1px border zeroed: the atlas texture's
+        // contents are undefined after a reset or regrow, and glyph quads
+        // sample that border, so stale pixels there drew stray lines.
         var total: u32 = inst_bytes;
-        for (pending) |p| total += @intCast(p.pixels.len);
+        for (pending) |p| total += paddedBytes(p);
         if (total == 0) return true;
 
         if (self.transfer == null or self.transfer_cap < total) {
@@ -431,8 +439,12 @@ pub const Gpu = struct {
         if (inst_bytes > 0) @memcpy(mapped[0..inst_bytes], std.mem.sliceAsBytes(scene.instances));
         var off: u32 = inst_bytes;
         for (pending) |p| {
-            @memcpy(mapped[off..][0..p.pixels.len], p.pixels);
-            off += @intCast(p.pixels.len);
+            const n = paddedBytes(p);
+            const dst = mapped[off..][0..n];
+            @memset(dst, 0);
+            const row = (p.w + 2) * 4;
+            for (0..p.h) |y| @memcpy(dst[(y + 1) * row + 4 ..][0 .. p.w * 4], p.pixels[y * p.w * 4 ..][0 .. p.w * 4]);
+            off += n;
         }
         c.SDL_UnmapGPUTransferBuffer(self.device, self.transfer);
 
@@ -449,11 +461,11 @@ pub const Gpu = struct {
         for (pending) |p| {
             c.SDL_UploadToGPUTexture(
                 copy,
-                &.{ .transfer_buffer = self.transfer, .offset = off, .pixels_per_row = p.w, .rows_per_layer = p.h },
-                &.{ .texture = self.atlas_tex, .x = p.x, .y = p.y, .w = p.w, .h = p.h, .d = 1 },
+                &.{ .transfer_buffer = self.transfer, .offset = off, .pixels_per_row = p.w + 2, .rows_per_layer = p.h + 2 },
+                &.{ .texture = self.atlas_tex, .x = p.x - 1, .y = p.y - 1, .w = p.w + 2, .h = p.h + 2, .d = 1 },
                 false, // preserve the rest of the atlas
             );
-            off += @intCast(p.pixels.len);
+            off += paddedBytes(p);
         }
         c.SDL_EndGPUCopyPass(copy);
         self.atlas.clearPending();

@@ -21,6 +21,24 @@ pub const Color = struct {
     pub fn fromRgb8(r: u8, g: u8, b: u8) Color {
         return fromRgba8(r, g, b, 255);
     }
+    /// Opaque color from hue, saturation and value, each 0...1.
+    pub fn fromHsv(h: f32, s: f32, v: f32) Color {
+        const hh = (h - @floor(h)) * 6;
+        const i: u32 = @intFromFloat(@floor(hh));
+        const f = hh - @floor(hh);
+        const p = v * (1 - s);
+        const q = v * (1 - s * f);
+        const t = v * (1 - s * (1 - f));
+        const out: [3]f32 = switch (i % 6) {
+            0 => .{ v, t, p },
+            1 => .{ q, v, p },
+            2 => .{ p, v, t },
+            3 => .{ p, q, v },
+            4 => .{ t, p, v },
+            else => .{ v, p, q },
+        };
+        return .{ .r = out[0], .g = out[1], .b = out[2], .a = 1 };
+    }
     pub fn fromRgba8(r: u8, g: u8, b: u8, a: u8) Color {
         return .{
             .r = @as(f32, @floatFromInt(r)) / 255.0,
@@ -168,6 +186,13 @@ fn nibble(c: u8) !u8 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "fromHsv: primaries land where they should" {
+    const red = Color.fromHsv(0, 1, 1);
+    try std.testing.expect(red.r == 1 and red.g == 0 and red.b == 0);
+    const green = Color.fromHsv(1.0 / 3.0, 1, 1);
+    try std.testing.expect(green.g > 0.99 and green.r < 0.01);
+}
 
 test "Color: rgba8 round trip" {
     const c = Color.fromRgba8(255, 128, 0, 255);

@@ -70,6 +70,8 @@ pub const Picker = view.Picker;
 
 // Shapes & gradients
 pub const Rectangle = view.Rectangle;
+pub const Drawing = view.Drawing;
+pub const Pen = view.Pen;
 pub const RoundedRectangle = view.RoundedRectangle;
 pub const Circle = view.Circle;
 pub const Capsule = view.Capsule;

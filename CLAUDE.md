@@ -132,6 +132,15 @@ app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → prese
   This is why overlays/modals work: append their regions last.
 - **Paint inherits environment** via a copied `child_ctx` (foreground, font_size,
   opacity, disabled). Add new inherited properties there.
+- **Layout measurement is memoized per frame** (`engine.beginMeasureCache`,
+  opened by `render`). A stack measures each child up to three times and nested
+  stacks multiply that, so uncached layout is exponential in depth. The memo
+  keys on node identity (children slice / child pointer / measured ctx) +
+  proposal: never mutate a lowered `Node` after building it.
+- **Paint never allocates from the build arena** — it is gone by then. Use
+  `ctx.arena` (or `Pen.fmt` inside a `Drawing`).
+- **Scroll views cull**: views wholly outside the viewport (`Context.visible`)
+  skip painting, hit regions included; a view presenting an overlay still paints.
 
 ## Recipe: add a component
 
@@ -568,6 +577,20 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
   refusal on every key-down so an app can grab ⌘-shortcuts/clipboard; `examples/
   edit` uses it for ⌘S/O/N/F/A and ⌘C/X/V (SDL clipboard) and ⌘±/0 zoom.
   `setFocus` is now exported so an app can focus the editor at launch.
+
+### Added for MLX-Serve (serve-app)
+- `Drawing(T, ctx, fn)` + `Pen` (line/fill/vGradient/text/fmt): a view that
+  paints itself — charts and one-off graphics.
+- `.selectable()` on rich text: press-drag selection inside that one view,
+  `selectedText()` for ⌘C (the app loop copies it), `textCursorAt` for the
+  I-beam (app.zig sets the system cursor).
+- `.placeholder(s)` on `TextEditor`: the hint drawn where typed text starts.
+- `tapCount()`: the click count of the tap being dispatched (double-click rows).
+- Caret blink (`setCaretVisible`, driven by app.zig's idle wait), draggable
+  overlay scrollbars, popovers cut to the window and scrolled, rich-text layout
+  cached across frames (`WrapCache.rich`), atlas uploads with a zeroed border.
+- app.zig on macOS: unified titlebar + drag band, a native menu bar
+  (`Config.menus`), template tray icons — via the Objective-C runtime (`objc`).
 
 ## Coding conventions
 - Readability over cleverness (it's an open-source teaching codebase). Match the

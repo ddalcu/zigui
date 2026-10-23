@@ -65,6 +65,12 @@ pub const FontSet = struct {
         self.alloc.destroy(self);
     }
 
+    /// Put `face` (e.g. a system CJK font) behind the emoji face, so every style
+    /// reaches it for codepoints the bundled faces lack. It must outlive the set.
+    pub fn setFallback(self: *FontSet, face: *const ttf.Font) void {
+        self.faces[@intFromEnum(Slot.emoji)].fallback = face;
+    }
+
     pub fn cache(self: *FontSet, s: Style) *atlas.GlyphCache {
         return &self.caches[@intFromEnum(slotFor(s))];
     }
@@ -74,6 +80,28 @@ test "fontset: every bundled face parses and resolves ASCII" {
     const fs = try FontSet.create(std.testing.allocator);
     defer fs.destroy();
     for (fs.faces[0 .. slot_count - 1]) |f| try std.testing.expect(f.glyphIndex('A') != 0);
+}
+
+test "fontset: an attached fallback face serves every style for codepoints the bundled faces lack" {
+    const fs = try FontSet.create(std.testing.allocator);
+    defer fs.destroy();
+    const Fake = struct {
+        fn glyph(_: *const anyopaque, cp: u21) u16 {
+            return if (cp == 0x4E2D) 3 else 0;
+        }
+        fn adv(_: *const anyopaque, _: u16) u16 {
+            return 1000;
+        }
+        fn raster(_: *const anyopaque, _: std.mem.Allocator, _: u16, _: f32) std.mem.Allocator.Error!ttf.RasterGlyph {
+            return .{ .width = 0, .height = 0, .data = &.{}, .left = 0, .top = 0, .advance = 0 };
+        }
+        const ext = ttf.External{ .ctx = undefined, .glyph_index = glyph, .advance_width = adv, .rasterize = raster };
+    };
+    const cjk = ttf.Font.fromExternal(&Fake.ext, 1000, 880, -120, 0);
+    fs.setFallback(&cjk);
+    for ([_]Style{ .{}, .{ .weight = .bold }, .{ .italic = true }, .{ .mono = true } }) |s| {
+        try std.testing.expect(fs.cache(s).face.resolve(0x4E2D).face == &cjk);
+    }
 }
 
 test "fontset: style to slot mapping" {

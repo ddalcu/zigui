@@ -51,6 +51,17 @@ pub const RasterGlyph = struct {
     }
 };
 
+/// A face whose outlines another engine reads (the app layer's system fonts via
+/// stb_truetype, which handles CFF and collections): `Font.fromExternal` routes
+/// glyph lookup, advances and rasterizing here, so the core stays C-free.
+pub const External = struct {
+    ctx: *const anyopaque,
+    glyph_index: *const fn (ctx: *const anyopaque, codepoint: u21) u16,
+    /// Advance in font units.
+    advance_width: *const fn (ctx: *const anyopaque, glyph: u16) u16,
+    rasterize: *const fn (ctx: *const anyopaque, allocator: Allocator, glyph: u16, scale: f32) Allocator.Error!RasterGlyph,
+};
+
 pub const Font = struct {
     data: []const u8,
     units_per_em: u16,
@@ -71,6 +82,27 @@ pub const Font = struct {
     /// must outlive this font. Glyph indices are per-face, so callers must
     /// rasterize each glyph from the face `resolve` returns — not this one.
     fallback: ?*const Font = null,
+    external: ?*const External = null,
+
+    /// A face backed by `ext`; vertical metrics in font units.
+    pub fn fromExternal(ext: *const External, units_per_em: u16, ascent: i16, descent: i16, line_gap: i16) Font {
+        return .{
+            .data = &.{},
+            .units_per_em = units_per_em,
+            .num_glyphs = 0,
+            .long_loca = false,
+            .loca_off = 0,
+            .glyf_off = 0,
+            .hmtx_off = 0,
+            .num_h_metrics = 0,
+            .cmap_sub_off = 0,
+            .cmap_format = 0,
+            .ascent = ascent,
+            .descent = descent,
+            .line_gap = line_gap,
+            .external = ext,
+        };
+    }
 
     pub fn parse(data: []const u8) ParseError!Font {
         if (data.len < 12) return error.InvalidFont;
@@ -164,15 +196,17 @@ pub const Font = struct {
     pub fn resolve(self: *const Font, codepoint: u21) Resolved {
         const g = self.glyphIndex(codepoint);
         if (g != 0) return .{ .face = self, .glyph = g };
-        if (self.fallback) |fb| {
-            const fg = fb.glyphIndex(codepoint);
-            if (fg != 0) return .{ .face = fb, .glyph = fg };
+        var fb = self.fallback;
+        while (fb) |f| : (fb = f.fallback) {
+            const fg = f.glyphIndex(codepoint);
+            if (fg != 0) return .{ .face = f, .glyph = fg };
         }
         return .{ .face = self, .glyph = g };
     }
 
     /// Map a Unicode codepoint to a glyph index (0 = .notdef / missing).
     pub fn glyphIndex(self: Font, codepoint: u21) u16 {
+        if (self.external) |e| return e.glyph_index(e.ctx, codepoint);
         const be = Be{ .data = self.data };
         return switch (self.cmap_format) {
             4 => self.cmapFormat4(be, codepoint),
@@ -231,6 +265,7 @@ pub const Font = struct {
 
     /// Horizontal advance for a glyph in font units.
     pub fn advanceWidth(self: Font, glyph: u16) u16 {
+        if (self.external) |e| return e.advance_width(e.ctx, glyph);
         const be = Be{ .data = self.data };
         const idx = if (glyph < self.num_h_metrics) glyph else self.num_h_metrics - 1;
         return be.rdU16(self.hmtx_off + idx * 4);
@@ -256,6 +291,7 @@ pub const Font = struct {
 
     /// Rasterize a glyph to a coverage bitmap at `scale` (font units → pixels).
     pub fn rasterizeGlyph(self: Font, allocator: Allocator, glyph: u16, scale: f32) !RasterGlyph {
+        if (self.external) |e| return e.rasterize(e.ctx, allocator, glyph, scale);
         const advance = @as(f32, @floatFromInt(self.advanceWidth(glyph))) * scale;
 
         var edges: std.ArrayList(Edge) = .empty;
@@ -643,6 +679,42 @@ test "ttf: emoji font parses and resolves via fallback chain" {
     defer g.deinit(testing.allocator);
     try testing.expect(g.width > 5 and g.height > 5);
     try testing.expect(coverageSum(g) > 0);
+}
+
+/// A stand-in external face: maps 'あ' to glyph 7, 1000 units per em, a 2x3 ink block.
+const FakeExternal = struct {
+    fn fakeGlyph(_: *const anyopaque, cp: u21) u16 {
+        return if (cp == 0x3042) 7 else 0;
+    }
+    fn fakeAdvance(_: *const anyopaque, glyph: u16) u16 {
+        return if (glyph == 7) 1000 else 0;
+    }
+    fn fakeRasterize(_: *const anyopaque, allocator: Allocator, glyph: u16, scale: f32) Allocator.Error!RasterGlyph {
+        const data = try allocator.alloc(u8, 6);
+        @memset(data, 255);
+        return .{ .width = 2, .height = 3, .data = data, .left = 1, .top = 3, .advance = @as(f32, @floatFromInt(fakeAdvance(undefined, glyph))) * scale };
+    }
+    const ext = External{ .ctx = undefined, .glyph_index = fakeGlyph, .advance_width = fakeAdvance, .rasterize = fakeRasterize };
+};
+
+test "ttf: a codepoint past the emoji face resolves to an external face, which metrics and rasterizes it" {
+    var inter = try Font.parse(inter_ttf);
+    var emoji = try Font.parse(emoji_ttf);
+    const cjk = Font.fromExternal(&FakeExternal.ext, 1000, 880, -120, 0);
+    inter.fallback = &emoji;
+    emoji.fallback = &cjk;
+
+    const r = inter.resolve(0x3042);
+    try testing.expect(r.face == &cjk);
+    try testing.expectEqual(@as(u16, 7), r.glyph);
+    try testing.expectEqual(@as(u16, 1000), r.face.advanceWidth(r.glyph));
+    const g = try r.face.rasterizeGlyph(testing.allocator, r.glyph, r.face.scaleForPixelSize(20));
+    defer g.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 2), g.width);
+    try testing.expectEqual(@as(f32, 20), g.advance);
+    // A codepoint nobody has stays the primary face's .notdef.
+    const miss = inter.resolve(0x10FFFF);
+    try testing.expect(miss.face == &inter and miss.glyph == 0);
 }
 
 test "ttf: cmap maps ASCII letters to nonzero glyphs" {

@@ -60,6 +60,9 @@ pub const Config = struct {
     /// macOS menu bar menus, after the application menu (ignored elsewhere:
     /// there is no menu bar to put them in).
     menus: []const Menu = &.{},
+    /// A face behind the bundled emoji font for codepoints no bundled face has
+    /// (a system CJK font, `zigui.Font.fromExternal`). Must outlive `run`.
+    fallback_font: ?*const zigui.ttf.Font = null,
 };
 
 /// One menu-bar entry. An empty title is a separator. `action` runs on the UI
@@ -572,6 +575,8 @@ pub const Tray = struct {
         _ = c.SDL_Init(c.SDL_INIT_VIDEO);
         const surf = makeSurface(rgba, w, h) orelse return Error.TrayInit;
         const handle = c.SDL_CreateTray(surf, tooltip.ptr) orelse {
+            // On Linux this is usually a missing libayatana-appindicator3 / libappindicator3.
+            std.log.warn("SDL_CreateTray failed: {s}", .{c.SDL_GetError()});
             c.SDL_DestroySurface(surf);
             return Error.TrayInit;
         };
@@ -697,6 +702,7 @@ pub fn run(
     // lacks (emoji, etc.) still render. Lives for the whole loop, so the
     // `&emoji_font.face` pointer stays valid.
     var emoji_font = zigui.Font.emoji();
+    emoji_font.face.fallback = cfg.fallback_font;
     font.face.fallback = &emoji_font.face;
     var cache = zigui.GlyphCache.init(gpa, &font.face);
     defer cache.deinit();
@@ -707,6 +713,7 @@ pub fn run(
 
     const fonts = try zigui.FontSet.create(gpa);
     defer fonts.destroy();
+    if (cfg.fallback_font) |f| fonts.setFallback(f);
     g_fonts = fonts;
     defer g_fonts = null;
 

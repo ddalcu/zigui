@@ -1905,7 +1905,11 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
         .alert => .{ .width = @min(root.width - 80, 320), .height = null },
         .popover => .unspecified,
     };
-    const size = measure(ctx, req.content, prop) catch Size{};
+    var size = measure(ctx, req.content, prop) catch Size{};
+    // A popover wider than the window is narrowed to fit (its rows truncate),
+    // not pushed past the edge.
+    const max_w = root.width - 2 * popover_margin;
+    if (req.style == .popover and size.width > max_w) size = measure(ctx, req.content, .{ .width = max_w, .height = null }) catch size;
     const target = switch (req.style) {
         .sheet, .alert => centerRect(root, size),
         .popover => anchoredRect(root, req.anchor, size),
@@ -1958,12 +1962,15 @@ fn centerRect(root: Rect, size: Size) Rect {
 /// there and not below. When it fits neither side it takes the roomier one and
 /// is cut to the space left (the caller scrolls it): it never covers its anchor
 /// or leaves `root`.
+/// Space kept between a popover and the window edge.
+const popover_margin: f32 = 8;
+
 fn anchoredRect(root: Rect, anchor: Rect, size: Size) Rect {
     const gap: f32 = 4;
-    const margin: f32 = 8;
+    const margin = popover_margin;
     var x = anchor.x;
-    if (x + size.width > root.maxX()) x = root.maxX() - size.width;
-    if (x < root.x) x = root.x;
+    if (x + size.width > root.maxX() - margin) x = root.maxX() - margin - size.width;
+    if (x < root.x + margin) x = root.x + margin;
     const below = root.maxY() - margin - (anchor.maxY() + gap);
     const above = anchor.y - gap - (root.y + margin);
     var h = size.height;
@@ -1980,6 +1987,13 @@ fn anchoredRect(root: Rect, anchor: Rect, size: Size) Rect {
         y = anchor.y - gap - h;
     }
     return .{ .x = x, .y = y, .width = size.width, .height = h };
+}
+
+test "popover: kept inside the window's side margins" {
+    const root = Rect{ .x = 0, .y = 0, .width = 340, .height = 600 };
+    const r = anchoredRect(root, .{ .x = 14, .y = 100, .width = 300, .height = 30 }, .{ .width = 324, .height = 100 });
+    try std.testing.expectEqual(@as(f32, 8), r.x);
+    try std.testing.expect(r.maxX() <= 332);
 }
 
 test "popover: below when it fits, above when only that fits, else cut to the roomier side" {

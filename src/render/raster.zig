@@ -148,42 +148,66 @@ fn blurRect(
     const ew: usize = @intCast(ex1 - ex0);
     const eh: usize = @intCast(ey1 - ey0);
 
-    const src = try allocator.alloc(Color, ew * eh);
+    // A wide blur is smooth, so run it on a copy shrunk by `f` per axis (≤ 4)
+    // and upsample bilinearly; narrow blurs (f == 1) stay exact.
+    const f: usize = @intCast(std.math.clamp(@divTrunc(br, 8), 1, 4));
+    const sw = (ew + f - 1) / f;
+    const sh = (eh + f - 1) / f;
+    const src = try allocator.alloc(Color, sw * sh);
     defer allocator.free(src);
-    const tmp = try allocator.alloc(Color, ew * eh);
+    const tmp = try allocator.alloc(Color, sw * sh);
     defer allocator.free(tmp);
 
+    // Snapshot: the mean of each f×f block of the framebuffer.
     var yy: usize = 0;
-    while (yy < eh) : (yy += 1) {
-        const fy: usize = @intCast(ey0 + @as(i64, @intCast(yy)));
+    while (yy < sh) : (yy += 1) {
         var xx: usize = 0;
-        while (xx < ew) : (xx += 1) {
-            const fx: usize = @intCast(ex0 + @as(i64, @intCast(xx)));
-            src[yy * ew + xx] = fb.pixels[fy * fb.width + fx];
+        while (xx < sw) : (xx += 1) {
+            var r: f32 = 0;
+            var g: f32 = 0;
+            var bch: f32 = 0;
+            var a: f32 = 0;
+            var cnt: f32 = 0;
+            var dy: usize = 0;
+            while (dy < f and yy * f + dy < eh) : (dy += 1) {
+                const row = (@as(usize, @intCast(ey0)) + yy * f + dy) * fb.width + @as(usize, @intCast(ex0));
+                var dx: usize = 0;
+                while (dx < f and xx * f + dx < ew) : (dx += 1) {
+                    const px = fb.pixels[row + xx * f + dx];
+                    r += px.r;
+                    g += px.g;
+                    bch += px.b;
+                    a += px.a;
+                    cnt += 1;
+                }
+            }
+            src[yy * sw + xx] = .{ .r = r / cnt, .g = g / cnt, .b = bch / cnt, .a = a / cnt };
         }
     }
 
-    // Horizontal box pass: src -> tmp.
+    // Horizontal box pass: src -> tmp, one running sum per row.
+    const sbr: i64 = @max(1, @divTrunc(br + @as(i64, @intCast(f / 2)), @as(i64, @intCast(f))));
     yy = 0;
-    while (yy < eh) : (yy += 1) {
-        var xx: usize = 0;
-        while (xx < ew) : (xx += 1) {
-            tmp[yy * ew + xx] = boxAverage(src, ew, eh, @intCast(xx), @intCast(yy), br, true);
-        }
-    }
+    while (yy < sh) : (yy += 1) boxLine(src, tmp, yy * sw, 1, sw, sbr);
 
-    // Vertical box pass over tmp, then composite tint and write back masked.
+    // Vertical box pass tmp -> src, only for the columns that get written back
+    // (src is free again once the horizontal pass has read it).
+    var c0: usize = @intCast(@divTrunc(@as(i64, b.x0) - ex0, @as(i64, @intCast(f))));
+    const c1: usize = @min(sw, @as(usize, @intCast(@divTrunc(@as(i64, b.x1) - ex0 - 1, @as(i64, @intCast(f))))) + 2);
+    while (c0 < c1) : (c0 += 1) boxLine(tmp, src, c0, sw, sh, sbr);
+
+    // Composite the tint and write back masked.
     var py: u32 = b.y0;
     while (py < b.y1) : (py += 1) {
-        const ly: i64 = @as(i64, py) - ey0;
+        const ly: usize = @intCast(@as(i64, py) - ey0);
         var px: u32 = b.x0;
         while (px < b.x1) : (px += 1) {
-            const lx: i64 = @as(i64, px) - ex0;
-            const blurred = boxAverage(tmp, ew, eh, lx, ly, br, false);
+            const lx: usize = @intCast(@as(i64, px) - ex0);
             const cx = @as(f32, @floatFromInt(px)) + 0.5;
             const cy = @as(f32, @floatFromInt(py)) + 0.5;
             const cov = fillCoverage(cx, cy, rect, radius) * clipCoverage(clips, cx, cy);
             if (cov <= 0) continue;
+            const blurred = if (f == 1) src[ly * sw + lx] else sampleBilinear(src, sw, sh, (@as(f32, @floatFromInt(lx)) + 0.5) / @as(f32, @floatFromInt(f)) - 0.5, (@as(f32, @floatFromInt(ly)) + 0.5) / @as(f32, @floatFromInt(f)) - 0.5);
             const result = tint.over(blurred);
             const i = py * fb.width + px;
             fb.pixels[i] = fb.pixels[i].lerp(result, cov);
@@ -191,28 +215,51 @@ fn blurRect(
     }
 }
 
-/// Average a `2*br+1` box of `buf` centred at (x,y), along the horizontal axis
-/// when `horizontal` else the vertical axis, clamping the window to the region.
-fn boxAverage(buf: []const Color, w: usize, h: usize, x: i64, y: i64, br: i64, horizontal: bool) Color {
+fn sampleBilinear(buf: []const Color, w: usize, h: usize, x: f32, y: f32) Color {
+    const fx = std.math.clamp(x, 0, @as(f32, @floatFromInt(w - 1)));
+    const fy = std.math.clamp(y, 0, @as(f32, @floatFromInt(h - 1)));
+    const x0: usize = @intFromFloat(fx);
+    const y0: usize = @intFromFloat(fy);
+    const x1 = @min(x0 + 1, w - 1);
+    const y1 = @min(y0 + 1, h - 1);
+    const tx = fx - @as(f32, @floatFromInt(x0));
+    const ty = fy - @as(f32, @floatFromInt(y0));
+    const top = buf[y0 * w + x0].lerp(buf[y0 * w + x1], tx);
+    const bot = buf[y1 * w + x0].lerp(buf[y1 * w + x1], tx);
+    return top.lerp(bot, ty);
+}
+
+/// Box-average along one line of `n` pixels (`start`, `start+step`, ...) of
+/// `src` into `dst`: each output is the mean of the `2*br+1` window around it,
+/// clamped to the line. A running sum makes it O(n) however wide the window.
+fn boxLine(src: []const Color, dst: []Color, start: usize, step: usize, n: usize, br: i64) void {
     var r: f32 = 0;
     var g: f32 = 0;
     var bch: f32 = 0;
     var a: f32 = 0;
-    var cnt: f32 = 0;
-    var k: i64 = -br;
-    while (k <= br) : (k += 1) {
-        const sx = if (horizontal) x + k else x;
-        const sy = if (horizontal) y else y + k;
-        if (sx < 0 or sy < 0 or sx >= @as(i64, @intCast(w)) or sy >= @as(i64, @intCast(h))) continue;
-        const p = buf[@as(usize, @intCast(sy)) * w + @as(usize, @intCast(sx))];
-        r += p.r;
-        g += p.g;
-        bch += p.b;
-        a += p.a;
-        cnt += 1;
+    var hi: usize = 0; // next pixel to enter the window
+    var lo: usize = 0; // next pixel to leave it
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const last: i64 = @as(i64, @intCast(i)) + br;
+        while (hi < n and @as(i64, @intCast(hi)) <= last) : (hi += 1) {
+            const p = src[start + hi * step];
+            r += p.r;
+            g += p.g;
+            bch += p.b;
+            a += p.a;
+        }
+        const first: i64 = @as(i64, @intCast(i)) - br;
+        while (@as(i64, @intCast(lo)) < first) : (lo += 1) {
+            const p = src[start + lo * step];
+            r -= p.r;
+            g -= p.g;
+            bch -= p.b;
+            a -= p.a;
+        }
+        const cnt: f32 = @floatFromInt(hi - lo);
+        dst[start + i * step] = .{ .r = r / cnt, .g = g / cnt, .b = bch / cnt, .a = a / cnt };
     }
-    if (cnt == 0) return Color.transparent;
-    return .{ .r = r / cnt, .g = g / cnt, .b = bch / cnt, .a = a / cnt };
 }
 
 const Paint = union(enum) {
@@ -730,4 +777,25 @@ test "raster: toRgba8Alloc exports packed bytes" {
     try testing.expectEqual(@as(u8, 255), bytes[0]); // R
     try testing.expectEqual(@as(u8, 0), bytes[1]); // G
     try testing.expectEqual(@as(u8, 255), bytes[3]); // A
+}
+
+test "raster: boxLine's running sum matches a brute-force clamped window" {
+    var src: [11]Color = undefined;
+    for (&src, 0..) |*p, i| p.* = .{ .r = @as(f32, @floatFromInt(i)) / 10, .g = 1 - @as(f32, @floatFromInt(i)) / 10, .b = 0.5, .a = 1 };
+    for ([_]i64{ 1, 3, 20 }) |br| {
+        var dst: [11]Color = undefined;
+        boxLine(&src, &dst, 0, 1, src.len, br);
+        for (dst, 0..) |got, i| {
+            var sum: f32 = 0;
+            var cnt: f32 = 0;
+            for (src, 0..) |p, k| {
+                const d = @as(i64, @intCast(k)) - @as(i64, @intCast(i));
+                if (d >= -br and d <= br) {
+                    sum += p.r;
+                    cnt += 1;
+                }
+            }
+            try std.testing.expectApproxEqAbs(sum / cnt, got.r, 1e-5);
+        }
+    }
 }

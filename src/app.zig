@@ -81,6 +81,21 @@ pub const MenuItem = struct {
 
 pub const Menu = struct { title: [:0]const u8, items: []const MenuItem };
 
+/// A secondary, borderless window that hosts a view tree — the custom tray
+/// popover (Swift's `MenuBarExtra(.window)` panel). Created hidden; the app
+/// shows it under the pointer via `showPanel()` (typically from a status-item
+/// click). Drawn with the software rasterizer so it never competes with the
+/// main window's GPU swapchain.
+pub fn PanelSpec(comptime AppState: type) type {
+    return struct {
+        /// Builds the panel's view tree, once per frame while it is visible.
+        body: *const fn (*AppState) zigui.View,
+        /// Logical (point) size. HiDPI backing is handled like the main window.
+        width: u32 = 340,
+        height: u32 = 620,
+    };
+}
+
 pub const Error = error{ SdlInit, TrayInit };
 
 // The running window + loop flag, exposed so tray callbacks (and the window
@@ -89,6 +104,97 @@ pub const Error = error{ SdlInit, TrayInit };
 var g_window: ?*c.SDL_Window = null;
 var g_running: ?*bool = null;
 var g_hide_on_close: bool = false;
+
+// The popover panel (see `PanelSpec`): created hidden at startup and toggled by
+// a status-item click. Its hit regions live in their own lists so clicks on the
+// panel never resolve against the main window's tree.
+var g_panel_window: ?*c.SDL_Window = null;
+var g_panel_id: c.SDL_WindowID = 0;
+var g_panel_shown: bool = false;
+var g_panel_hits: []const zigui.HitRegion = &.{};
+var g_panel_scrolls: []const zigui.ScrollRegion = &.{};
+var g_panel_hover: ?zigui.geometry.Point = null;
+/// Size key of the frame already written by ZIGUI_PANEL_DUMP (see drawFrame).
+var g_dump_written: u64 = 0;
+
+pub fn panelVisible() bool {
+    return g_panel_shown;
+}
+
+/// Position the panel under the pointer (a tray click leaves the cursor on the
+/// icon), clamped to the screen's usable area, then show and focus it.
+pub fn showPanel() void {
+    const w = g_panel_window orelse return;
+    var lw: c_int = 0;
+    var lh: c_int = 0;
+    _ = c.SDL_GetWindowSize(w, &lw, &lh);
+    var mx: f32 = 0;
+    var my: f32 = 0;
+    _ = c.SDL_GetGlobalMouseState(&mx, &my);
+    var x: c_int = @intFromFloat(@as(f32, mx) - @as(f32, @floatFromInt(lw)) / 2);
+    var y: c_int = @intFromFloat(my + 10);
+    var pt = c.SDL_Point{ .x = @intFromFloat(mx), .y = @intFromFloat(my) };
+    const disp = c.SDL_GetDisplayForPoint(&pt);
+    var bounds: c.SDL_Rect = undefined;
+    if (c.SDL_GetDisplayUsableBounds(disp, &bounds)) {
+        const max_x = bounds.x + bounds.w - lw;
+        const max_y = bounds.y + bounds.h - lh;
+        if (max_y < bounds.y) y = bounds.y else if (y > max_y) y = max_y;
+        if (x < bounds.x) x = bounds.x else if (x > max_x) x = max_x;
+    }
+    _ = c.SDL_SetWindowPosition(w, x, y);
+    _ = c.SDL_ShowWindow(w);
+    _ = c.SDL_RaiseWindow(w);
+    _ = c.SDL_StartTextInput(w);
+    g_panel_shown = true;
+    wake();
+}
+
+/// Resize the panel window without showing it (the launcher restores the tray
+/// size before hiding, so the next tray click anchors correctly).
+pub fn setPanelSize(width: u32, height: u32) void {
+    const w = g_panel_window orelse return;
+    _ = c.SDL_SetWindowSize(w, @intCast(width), @intCast(height));
+}
+
+/// Spotlight-style placement for the Quick Launcher: centered horizontally on
+/// the primary display, top edge 25% down, wherever the pointer is. `height` is
+/// the content's fixed size; the auto-height frame can grow it when a
+/// conversation starts without moving the top edge.
+pub fn showPanelCentered(width: u32, height: u32) void {
+    const w = g_panel_window orelse return;
+    _ = c.SDL_SetWindowSize(w, @intCast(width), @intCast(height));
+    var bounds: c.SDL_Rect = undefined;
+    var x: c_int = 0;
+    var y: c_int = 0;
+    if (c.SDL_GetDisplayUsableBounds(c.SDL_GetPrimaryDisplay(), &bounds)) {
+        x = bounds.x + @divTrunc(bounds.w - @as(c_int, @intCast(width)), 2);
+        y = bounds.y + @as(c_int, @intFromFloat(@as(f32, @floatFromInt(bounds.h)) * 0.25));
+        const max_y = bounds.y + bounds.h - @as(c_int, @intCast(height));
+        if (y > max_y) y = @max(bounds.y, max_y);
+    }
+    _ = c.SDL_SetWindowPosition(w, x, y);
+    _ = c.SDL_ShowWindow(w);
+    _ = c.SDL_RaiseWindow(w);
+    _ = c.SDL_StartTextInput(w);
+    g_panel_shown = true;
+    wake();
+}
+
+pub fn hidePanel() void {
+    if (!g_panel_shown) return;
+    g_panel_shown = false;
+    if (g_panel_window) |w| {
+        _ = c.SDL_StopTextInput(w);
+        _ = c.SDL_HideWindow(w);
+    }
+    if (zigui.focusedField() != null) zigui.clearFocus();
+    wake();
+}
+
+pub fn togglePanel() void {
+    if (g_panel_shown) hidePanel() else showPanel();
+}
 
 /// Show and raise the window (e.g. from a tray "Open" entry).
 pub fn showWindow() void {
@@ -169,7 +275,7 @@ pub fn setBusyInterval(f: ?*const fn () u32) void {
 /// redraw on a timeout (nothing changed), so this stays ~free — measured <0.5%
 /// CPU idle — while bounding worst-case tray-action latency to this interval
 /// instead of "until the next incidental event".
-const idle_wake_ms: c_int = 250;
+const idle_wake_ms: c_int = 1000;
 
 /// The caret blinks ~530 ms per phase (the macOS default); any key or click
 /// restarts the cycle solid, so the caret never vanishes while typing.
@@ -637,16 +743,37 @@ pub const Tray = struct {
     }
 };
 
+/// macOS: a plain NSStatusItem whose click runs `on_click` (no menu attached),
+/// so the app can open its own popover panel. Returns false on other platforms
+/// and when AppKit can't be reached — callers fall back to `Tray`.
+/// `rgba` is the HiDPI (2x) bitmap; the icon shows at half its pixel size in
+/// points (36 px → 18 pt, the usual menu-bar glyph).
+pub fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
+    if (builtin.os.tag != .macos) return false;
+    _ = c.SDL_Init(c.SDL_INIT_VIDEO);
+    return cocoa.createStatusItem(rgba, w, h, tooltip, on_click);
+}
+
+pub fn destroyStatusItem() void {
+    if (builtin.os.tag == .macos) cocoa.destroyStatusItem();
+}
+
 /// Run the app. `body` is invoked each frame to (re)build the view tree from the
 /// current application state; state mutations triggered by events cause the next
-/// frame to reflect the change.
+/// frame to reflect the change. When `panel` is non-null, a hidden borderless
+/// window hosting `panel.body` is created too; `showPanel()` opens it under the
+/// pointer (a status-item click is the usual trigger).
 pub fn run(
     gpa: std.mem.Allocator,
     comptime AppState: type,
     st: *AppState,
     cfg: Config,
     comptime body: fn (*AppState) zigui.View,
+    comptime panel: ?PanelSpec(AppState),
 ) !void {
+    // A hide-to-tray app must not quit when its last visible window is closed:
+    // SDL would send SDL_EVENT_QUIT itself, before our close handler hides it.
+    if (cfg.hide_on_close) _ = c.SDL_SetHint(c.SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
         return Error.SdlInit;
@@ -694,6 +821,57 @@ pub fn run(
         return Error.SdlInit;
     };
     defer if (renderer) |r| c.SDL_DestroyRenderer(r);
+
+    // A second, hidden window for the custom tray popover (PanelSpec). It uses
+    // its own SDL_Renderer + CPU raster path, so the main window's GPU backend
+    // and swapchain stay untouched.
+    var panel_win: ?*c.SDL_Window = null;
+    var panel_renderer: ?*c.SDL_Renderer = null;
+    var panel_texture: ?*c.SDL_Texture = null;
+    var panel_tex_w: c_int = 0;
+    var panel_tex_h: c_int = 0;
+    var panel_fb: zigui.Framebuffer = .empty;
+    var panel_rgba: []u8 = &.{};
+    var panel_arena = std.heap.ArenaAllocator.init(gpa);
+    // Panel teardown in dependency order: texture → renderer → window.
+    defer {
+        if (panel_texture) |t| c.SDL_DestroyTexture(t);
+        if (panel_renderer) |r| c.SDL_DestroyRenderer(r);
+        if (panel_win) |w| {
+            g_panel_window = null;
+            g_panel_id = 0;
+            g_panel_shown = false;
+            c.SDL_DestroyWindow(w);
+        }
+        if (panel_rgba.len > 0) gpa.free(panel_rgba);
+        panel_fb.deinit();
+        panel_arena.deinit();
+    }
+    if (panel) |ps| blk: {
+        const w = c.SDL_CreateWindow(
+            "MLX-Serve",
+            @intCast(ps.width),
+            @intCast(ps.height),
+            c.SDL_WINDOW_BORDERLESS | c.SDL_WINDOW_UTILITY | c.SDL_WINDOW_ALWAYS_ON_TOP | c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_TRANSPARENT,
+        ) orelse {
+            std.log.warn("zigui: panel window failed: {s}", .{c.SDL_GetError()});
+            break :blk;
+        };
+        panel_win = w;
+        g_panel_window = w;
+        g_panel_id = c.SDL_GetWindowID(w);
+        panel_renderer = c.SDL_CreateRenderer(w, null) orelse c.SDL_CreateRenderer(w, "software") orelse {
+            std.log.warn("zigui: panel renderer failed: {s}", .{c.SDL_GetError()});
+            c.SDL_DestroyWindow(w);
+            panel_win = null;
+            g_panel_window = null;
+            g_panel_id = 0;
+            break :blk;
+        };
+        // Debug: ZIGUI_NO_FROST=1 leaves the glass off (for bisecting compositing artifacts).
+        if (builtin.os.tag == .macos and c.SDL_getenv("ZIGUI_NO_FROST") == null) cocoa.frostWindow(w, 12);
+        _ = c.SDL_HideWindow(w);
+    }
 
     _ = c.SDL_StartTextInput(window);
 
@@ -784,6 +962,16 @@ pub fn run(
         icon_cache: *zigui.GlyphCache,
         cfg: Config,
         st: *AppState,
+        /// Non-null for a panel frame: that body replaces the main window's.
+        view_fn: ?*const fn (*AppState) zigui.View = null,
+        /// Where this frame's hover point lives (main window or panel).
+        hover: ?*?zigui.geometry.Point = null,
+        /// Resize the window to the view tree's content height each frame
+        /// (the tray popover: no scrollbars, like Swift's auto-sizing panel).
+        auto_height: bool = false,
+        /// Transparent panel frame: clear to alpha 0 and paint a translucent
+        /// rounded background, so corners reveal the desktop behind it.
+        transparent: bool = false,
         texture: *?*c.SDL_Texture,
         tex_w: *c_int,
         tex_h: *c_int,
@@ -842,7 +1030,8 @@ pub fn run(
             // regions and event mapping are unaffected by `ss`.
             const scale: f32 = base_scale * ss;
             const point_w = fpw / base_scale;
-            const point_h = fph / base_scale;
+            const point_h_in = fph / base_scale;
+            var point_h = point_h_in;
             // SDL mouse events arrive in logical window points; hit regions live
             // in design points. Convert by pixel_density / display_scale (== 1 on
             // macOS); `ss` cancels out since it doesn't change the design space.
@@ -850,8 +1039,8 @@ pub fn run(
             g_event_scale = pixel_density / base_scale;
             // The framebuffer/scene is the oversampled device size; present
             // downscales it to the window's actual pixel size (pw×ph).
-            const uw: u32 = @intFromFloat(@round(fpw * ss));
-            const uh: u32 = @intFromFloat(@round(fph * ss));
+            var uw: u32 = @intFromFloat(@round(fpw * ss));
+            var uh: u32 = @intFromFloat(@round(fph * ss));
 
             // Frame clock for time-based UI (auto-hiding scrollbars, etc.).
             zigui.setFrameTime(c.SDL_GetTicks());
@@ -869,7 +1058,7 @@ pub fn run(
             g_caret_drawn = caretPhaseOn(c.SDL_GetTicks());
             zigui.setCaretVisible(g_caret_drawn);
             zigui.beginBuild(arena);
-            const root = body(fr.st);
+            const root = if (fr.view_fn) |vf| vf(fr.st) else body(fr.st);
             zigui.endBuild();
 
             // Reset to empty (not clearRetainingCapacity): the previous buffer was
@@ -882,7 +1071,38 @@ pub fn run(
             ctx.scroll_regions = scrolls;
             ctx.icon_cache = fr.icon_cache;
             ctx.fonts = g_fonts;
-            ctx.hover_point = g_hover_point;
+            ctx.hover_point = if (fr.hover) |h| h.* else null;
+
+            // Auto-height panel: measure the tree and resize the window to it,
+            // clamped to the screen's usable height. Swift's MenuBarExtra panel
+            // sizes itself to its content; matching that keeps the footer
+            // visible instead of scrolling inside a fixed frame.
+            if (fr.auto_height) autoHeight: {
+                const m = zigui.measureView(&ctx, root, .{ .width = point_w, .height = null }) catch break :autoHeight;
+                var want: f32 = @max(m.height, 60);
+                var bounds: c.SDL_Rect = undefined;
+                const disp = c.SDL_GetDisplayForWindow(fr.window);
+                if (c.SDL_GetDisplayUsableBounds(disp, &bounds)) want = @min(want, @as(f32, @floatFromInt(bounds.h)));
+                const want_i: c_int = @intFromFloat(@round(want));
+                if (want_i == lh) break :autoHeight;
+                _ = c.SDL_SetWindowSize(fr.window, lw, want_i);
+                var pw2: c_int = 0;
+                var ph2: c_int = 0;
+                _ = c.SDL_GetWindowSizeInPixels(fr.window, &pw2, &ph2);
+                if (pw2 <= 0 or ph2 <= 0) break :autoHeight;
+                point_h = @as(f32, @floatFromInt(ph2)) / base_scale;
+                uw = @intFromFloat(@round(@as(f32, @floatFromInt(pw2)) * ss));
+                uh = @intFromFloat(@round(@as(f32, @floatFromInt(ph2)) * ss));
+                // Keep the bottom edge on screen when the panel grew.
+                if (c.SDL_GetDisplayUsableBounds(disp, &bounds)) {
+                    var wx: c_int = 0;
+                    var wy: c_int = 0;
+                    if (c.SDL_GetWindowPosition(fr.window, &wx, &wy)) {
+                        const max_y = bounds.y + bounds.h - want_i;
+                        if (wy > max_y) _ = c.SDL_SetWindowPosition(fr.window, wx, if (max_y < bounds.y) bounds.y else max_y);
+                    }
+                }
+            }
 
             // Coverage gamma for text: a straight sRGB alpha-blend renders the
             // anti-aliased edge of light glyphs on a dark background too thin
@@ -895,23 +1115,35 @@ pub fn run(
             zigui.setTextGamma(if (dark_ui) 0.6 else 1.0);
 
             var canvas = zigui.Canvas.init(arena);
-            // No background fill command here: the framebuffer's `clear` below paints
-            // the window background with a fast @memset, so emitting a full-window
-            // fill_rrect would just re-rasterize every pixel through the SDF path.
+            if (fr.transparent) {
+                // The frosted NSVisualEffectView behind the SDL content view is
+                // the panel's own chrome (Swift's MenuBarExtra popover). Painting
+                // an opaque-ish window-background fill here would cover that
+                // frost with a flat gray rectangle, so only the hairline rim is
+                // drawn: every other pixel stays transparent and lets the
+                // material show through.
+                // Appended before renderScaled, which scales only the view's commands, so scale it here.
+                canvas.strokeRoundedRect(.{ .x = 0.5 * scale, .y = 0.5 * scale, .width = (point_w - 1) * scale, .height = (point_h - 1) * scale }, 12 * scale, scale, theme.colors.separator) catch {};
+            } else {
+                // No background fill command here: the framebuffer's `clear` below paints
+                // the window background with a fast @memset, so emitting a full-window
+                // fill_rrect would just re-rasterize every pixel through the SDF path.
+            }
             zigui.renderScaled(&ctx, root, .{ .x = 0, .y = 0, .width = point_w, .height = point_h }, scale, &canvas) catch {};
 
             if (fr.gpu_backend) |g| {
                 // GPU backend: translate + replay the command list on the GPU.
                 // `ss` makes it render the scene oversampled and downscale on the
                 // final blit (SSAA), mirroring the software texture path below.
-                if (!g.frame(arena, canvas.commands.items, theme.colors.window_background, ss)) return false;
+                const clear = if (fr.transparent) zigui.Color.transparent else theme.colors.window_background;
+                if (!g.frame(arena, canvas.commands.items, clear, ss)) return false;
             } else {
                 // Software backend. Persistent framebuffer + RGBA buffer:
                 // reallocated only when the pixel size changes, so a
                 // steady-state frame does zero pixel-buffer allocation.
                 const rend = fr.renderer.?;
                 fr.fb.ensureSize(fr.gpa, uw, uh) catch return false;
-                fr.fb.clear(theme.colors.window_background);
+                fr.fb.clear(if (fr.transparent) zigui.Color.transparent else theme.colors.window_background);
                 zigui.raster.render(arena, fr.fb, canvas.commands.items) catch return false;
                 const need: usize = @as(usize, uw) * @as(usize, uh) * 4;
                 if (fr.rgba.*.len != need) {
@@ -919,6 +1151,30 @@ pub fn run(
                     fr.rgba.* = fr.gpa.alloc(u8, need) catch return false;
                 }
                 fr.fb.toRgba8(fr.rgba.*);
+
+                // Debug: ZIGUI_PANEL_DUMP=<path> writes the transparent (panel)
+                // frame's RGBA buffer once per size: u32 w, u32 h, then w*h*4
+                // bytes. For offline analysis of what the app actually drew.
+                if (fr.transparent) {
+                    if (c.SDL_getenv("ZIGUI_PANEL_DUMP")) |pathz| {
+                        const key: u64 = @as(u64, @intCast(uw)) << 32 | @as(u64, @intCast(uh));
+                        if (g_dump_written != key) {
+                            g_dump_written = key;
+                            const path = std.mem.span(@as([*:0]const u8, @ptrCast(pathz)));
+                            var threaded = std.Io.Threaded.init(fr.gpa, .{});
+                            defer threaded.deinit();
+                            const io = threaded.io();
+                            if (std.Io.Dir.createFileAbsolute(io, path, .{})) |f| {
+                                var hdr: [8]u8 = undefined;
+                                std.mem.writeInt(u32, hdr[0..4], @intCast(uw), .little);
+                                std.mem.writeInt(u32, hdr[4..8], @intCast(uh), .little);
+                                f.writeStreamingAll(io, hdr[0..]) catch {};
+                                f.writeStreamingAll(io, fr.rgba.*) catch {};
+                                f.close(io);
+                            } else |_| {}
+                        }
+                    }
+                }
 
                 // The texture is the oversampled (uw×uh) size; `SDL_RenderTexture`
                 // with a null dst stretches it to the window's pixel size, and the
@@ -931,6 +1187,10 @@ pub fn run(
                     if (fr.texture.*) |t| _ = c.SDL_SetTextureScaleMode(t, c.SDL_SCALEMODE_LINEAR);
                     fr.tex_w.* = iuw;
                     fr.tex_h.* = iuh;
+                }
+                if (fr.transparent) {
+                    if (fr.texture.*) |t| _ = c.SDL_SetTextureBlendMode(t, c.SDL_BLENDMODE_BLEND);
+                    _ = c.SDL_SetRenderDrawColor(rend, 0, 0, 0, 0);
                 }
                 _ = c.SDL_UpdateTexture(fr.texture.*, null, fr.rgba.*.ptr, @intCast(uw * 4));
                 _ = c.SDL_RenderClear(rend);
@@ -972,6 +1232,7 @@ pub fn run(
         .icon_cache = &icon_cache,
         .cfg = cfg,
         .st = st,
+        .hover = &g_hover_point,
         .texture = &texture,
         .tex_w = &tex_w,
         .tex_h = &tex_h,
@@ -986,57 +1247,70 @@ pub fn run(
     _ = c.SDL_AddEventWatch(Render.resizeWatch, &frame);
     defer c.SDL_RemoveEventWatch(Render.resizeWatch, &frame);
 
+    var panel_frame: ?Frame = null;
+    if (panel) |ps| {
+        if (panel_win) |pw| panel_frame = Frame{
+            .gpa = gpa,
+            .window = pw,
+            .renderer = panel_renderer,
+            .gpu_backend = null,
+            .cache = &cache,
+            .icon_cache = &icon_cache,
+            .cfg = cfg,
+            .st = st,
+            .view_fn = ps.body,
+            .hover = &g_panel_hover,
+            .auto_height = true,
+            .transparent = true,
+            .texture = &panel_texture,
+            .tex_w = &panel_tex_w,
+            .tex_h = &panel_tex_h,
+            .fb = &panel_fb,
+            .rgba = &panel_rgba,
+            .perf_freq = perf_freq,
+            .stats = &stats,
+            .resize_arena = &resize_arena,
+            .resize_hits = &resize_hits,
+            .resize_scrolls = &resize_scrolls,
+        };
+    }
+    var panel_hits: std.ArrayList(zigui.HitRegion) = .empty;
+    var panel_scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
+
     while (running) {
         // Per-frame hook (e.g. refresh the system-tray menu). Runs whether or not
         // the window is visible, so the tray tracks status even when hidden.
         if (g_frame_fn) |f| f();
 
-        // When hidden (e.g. closed-to-tray), don't render — just pump events so
-        // tray entries and a re-open still work, and block efficiently. While a
-        // busy predicate is set (e.g. a generation in flight), wake on a ~60fps
-        // timeout so the frame hook keeps the tray status live.
-        if ((c.SDL_GetWindowFlags(window) & c.SDL_WINDOW_HIDDEN) != 0) {
-            const no_hits: []const zigui.HitRegion = &.{};
-            const no_scrolls: []const zigui.ScrollRegion = &.{};
+        // Fresh per-frame region lists (arena-backed via drawFrame); discarded at
+        // the next arena reset, exactly like the pre-refactor loop. The main
+        // window is skipped while hidden-to-tray; the panel draws on its own
+        // arena/renderer whenever it is shown.
+        var hits: std.ArrayList(zigui.HitRegion) = .empty;
+        var scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
+        const main_hidden = (c.SDL_GetWindowFlags(window) & c.SDL_WINDOW_HIDDEN) != 0;
+        const drew_main = if (main_hidden) false else Render.drawFrame(&frame, &arena_state, &hits, &scrolls);
+        g_band_hits = if (drew_main) hits.items else &.{};
+
+        panel_hits = .empty;
+        panel_scrolls = .empty;
+        const drew_panel = if (panel_frame != null and g_panel_shown)
+            Render.drawFrame(&panel_frame.?, &panel_arena, &panel_hits, &panel_scrolls)
+        else
+            false;
+        g_panel_hits = if (drew_panel) panel_hits.items else &.{};
+        g_panel_scrolls = if (drew_panel) panel_scrolls.items else &.{};
+
+        if (!drew_main and !drew_panel) {
+            // Nothing drew: pump events and block efficiently. While a busy
+            // predicate is set (e.g. a generation in flight), wake on a ~60fps
+            // timeout so the frame hook keeps the tray status live.
             const busy_ms = busyIntervalMs();
             var ev: c.SDL_Event = undefined;
             // Cap the idle wait (`idle_wake_ms`): a hidden-to-tray window can't
             // receive an event to observe a tray callback's `running = false`,
             // so a blocking wait here hangs Quit forever.
-            if (c.SDL_WaitEventTimeout(&ev, if (busy_ms != 0) @intCast(busy_ms) else idle_wake_ms)) handleEvent(&ev, &running, no_hits, no_scrolls);
-            while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, no_hits, no_scrolls);
-            continue;
-        }
-
-        // Fresh per-frame region lists (arena-backed via drawFrame); discarded at
-        // the next arena reset, exactly like the pre-refactor loop.
-        var hits: std.ArrayList(zigui.HitRegion) = .empty;
-        var scrolls: std.ArrayList(zigui.ScrollRegion) = .empty;
-        const drew = Render.drawFrame(&frame, &arena_state, &hits, &scrolls);
-        // The regions SDL's hit test sees while this frame waits for input.
-        g_band_hits = hits.items;
-        if (!drew) {
-            // Frame skipped. On the congested-swapchain path, drawFrame has
-            // already rebuilt the tree and filled `hits`/`scrolls` before the
-            // GPU acquire failed, so these regions describe the CURRENT frame
-            // and their `Callback.ctx` pointers target the current frame
-            // arena — valid until the next drawFrame resets it. Dispatching
-            // against them is therefore safe. A snapshot of a *previous*
-            // frame's regions never is: ctx pointers may be frame-arena-owned,
-            // and that arena was reset (and reused) by the rebuild above —
-            // dispatching a stale snapshot is a use-after-reset (observed as a
-            // sidebar-tap segfault during video generation). The pre-build
-            // early returns (hidden/degenerate window) leave the lists empty,
-            // which just makes dispatch a harmless no-op.
-            // While busy, wake on a short timeout so the next present retries
-            // promptly instead of stalling until the next input event.
-            var ev: c.SDL_Event = undefined;
-            const ms = busyIntervalMs();
-            if (ms != 0) {
-                if (c.SDL_WaitEventTimeout(&ev, @intCast(@min(ms, 16)))) handleEvent(&ev, &running, hits.items, scrolls.items);
-            } else {
-                if (c.SDL_WaitEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
-            }
+            if (c.SDL_WaitEventTimeout(&ev, if (busy_ms != 0) @intCast(busy_ms) else idle_wake_ms)) handleEvent(&ev, &running, hits.items, scrolls.items);
             while (c.SDL_PollEvent(&ev)) handleEvent(&ev, &running, hits.items, scrolls.items);
             continue;
         }
@@ -1200,6 +1474,112 @@ const cocoa = struct {
         return send(Id, cls, "new", .{});
     }
 
+    // ---- status item (a plain menu-bar icon whose click opens the app's own
+    // popover panel, not a native menu) --------------------------------------
+
+    const NSSize = extern struct { width: f64, height: f64 };
+    const NSPoint = extern struct { x: f64, y: f64 };
+    const NSRect = extern struct { origin: NSPoint, size: NSSize };
+    var status_item: Id = null;
+    var status_target: Id = null;
+    var status_cb: ?zigui.Callback = null;
+
+    fn statusClick(_: Id, _: Id, _: Id) callconv(.c) void {
+        if (status_cb) |cb| cb.call();
+        wake();
+    }
+
+    /// `initWithBitmapDataPlanes:...` takes ten arguments; the generic `send`
+    /// helper only covers zero/one/three, so it gets its own signature.
+    fn repInit(target: Id, planes: ?*anyopaque, w: i64, h: i64, bps: i64, spp: i64, alpha: u8, planar: u8, cs: Id, fmt: u64, bpr: i64, bpp: i64) Id {
+        const Fn = fn (Id, Id, ?*anyopaque, i64, i64, i64, i64, u8, u8, Id, u64, i64, i64) callconv(.c) Id;
+        const f: *const Fn = @ptrCast(&objc_msgSend);
+        return @call(.auto, f, .{
+            target,
+            sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:"),
+            planes, w, h, bps, spp, alpha, planar, cs, fmt, bpr, bpp,
+        });
+    }
+
+    fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
+        const iw: i64 = w;
+        const ih: i64 = h;
+        // Alpha last, straight (non-premultiplied): our RGBA buffer's layout
+        // (NSAlphaNonpremultipliedBitmapFormat).
+        const rep = repInit(send(Id, objc_getClass("NSBitmapImageRep"), "alloc", .{}), null, iw, ih, 8, 4, 1, 0, nsString("NSCalibratedRGBColorSpace"), 2, iw * 4, 32) orelse return false;
+        const raw = send([*c]u8, rep, "bitmapData", .{});
+        if (raw == null) return false;
+        const dst: [*]u8 = @ptrCast(raw);
+        @memcpy(dst[0 .. @as(usize, @intCast(iw * ih)) * 4], rgba);
+        // The bitmap is a 2x backing store, so the image's point size is half
+        // its pixel size. Sized in pixels instead, a 36 px icon would sit in
+        // the menu bar as a 36 pt image — twice the bar's height, dwarfing
+        // every native status item.
+        const size = NSSize{ .width = @as(f64, @floatFromInt(w)) / 2.0, .height = @as(f64, @floatFromInt(h)) / 2.0 };
+        const img = send(Id, send(Id, objc_getClass("NSImage"), "alloc", .{}), "initWithSize:", .{size});
+        if (img == null) return false;
+        send(void, img, "addRepresentation:", .{rep});
+        send(void, img, "setTemplate:", .{@as(u8, 1)});
+        const bar = send(Id, objc_getClass("NSStatusBar"), "systemStatusBar", .{});
+        const item = send(Id, bar, "statusItemWithLength:", .{@as(f64, -1)}); // NSVariableStatusItemLength
+        if (item == null) return false;
+        const button = send(Id, item, "button", .{});
+        if (button == null) return false;
+        send(void, button, "setImage:", .{img});
+        if (tooltip.len > 0) send(void, button, "setToolTip:", .{nsString(tooltip)});
+        const cls = objc_allocateClassPair(objc_getClass("NSObject"), "ZiguiStatusItemTarget", 0) orelse return false;
+        _ = class_addMethod(cls, sel_registerName("click:"), @ptrCast(&statusClick), "v@:@");
+        objc_registerClassPair(cls);
+        const tgt = send(Id, cls, "new", .{});
+        send(void, button, "setTarget:", .{tgt});
+        send(void, button, "setAction:", .{sel_registerName("click:")});
+        status_item = item;
+        status_target = tgt;
+        status_cb = on_click;
+        return true;
+    }
+
+    /// Put a frosted NSVisualEffectView behind SDL's content view, so the tray
+    /// panel reads as translucent glass over the desktop (Swift's
+    /// MenuBarExtra window) instead of a flat translucent rectangle. The
+    /// container layer clips everything to the panel's rounded corners.
+    fn frostWindow(window: *c.SDL_Window, radius: f64) void {
+        const win: Id = c.SDL_GetPointerProperty(c.SDL_GetWindowProperties(window), c.SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, null);
+        if (win == null) return;
+        send(void, win, "setOpaque:", .{@as(u8, 0)});
+        send(void, win, "setBackgroundColor:", .{send(Id, objc_getClass("NSColor"), "clearColor", .{})});
+        const view = send(Id, win, "contentView", .{}) orelse return;
+        const bounds = send(NSRect, view, "bounds", .{});
+
+        const container = send(Id, send(Id, objc_getClass("NSView"), "alloc", .{}), "initWithFrame:", .{bounds});
+        send(void, container, "setWantsLayer:", .{@as(u8, 1)});
+        const layer = send(Id, container, "layer", .{});
+        if (layer != null) {
+            send(void, layer, "setCornerRadius:", .{radius});
+            send(void, layer, "setMasksToBounds:", .{@as(u8, 1)});
+        }
+        const effect = send(Id, send(Id, objc_getClass("NSVisualEffectView"), "alloc", .{}), "initWithFrame:", .{bounds});
+        send(void, effect, "setMaterial:", .{@as(i64, 6)}); // NSVisualEffectMaterialPopover
+        send(void, effect, "setBlendingMode:", .{@as(i64, 0)}); // behindWindow
+        send(void, effect, "setState:", .{@as(i64, 1)}); // active
+        send(void, effect, "setAutoresizingMask:", .{@as(u64, 18)}); // width|height sizable
+        send(void, container, "addSubview:", .{effect});
+        send(void, view, "removeFromSuperview", .{});
+        send(void, view, "setAutoresizingMask:", .{@as(u64, 18)});
+        send(void, container, "addSubview:", .{view});
+        send(void, win, "setContentView:", .{container});
+    }
+
+    fn destroyStatusItem() void {
+        if (status_item) |it| {
+            const bar = send(Id, objc_getClass("NSStatusBar"), "systemStatusBar", .{});
+            send(void, bar, "removeStatusItem:", .{it});
+        }
+        status_item = null;
+        status_target = null;
+        status_cb = null;
+    }
+
     /// Keep SDL's application menu (About / Hide / Quit) and replace the rest.
     fn setMenuBar(menus: []const Menu) void {
         const ns_app = send(Id, objc_getClass("NSApplication"), "sharedApplication", .{});
@@ -1246,15 +1626,30 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
     // With frame logging on, also log which events wake the loop (each wake
     // costs a full rebuild+raster) so redraw storms can be attributed.
     if (g_frame_log) std.debug.print("[zigui] event 0x{x}\n", .{ev.type});
+    const on_panel = g_panel_id != 0 and switch (ev.type) {
+        c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_MOTION, c.SDL_EVENT_MOUSE_WHEEL, c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT => switch (ev.type) {
+            c.SDL_EVENT_MOUSE_BUTTON_DOWN => ev.button.windowID == g_panel_id,
+            c.SDL_EVENT_MOUSE_MOTION => ev.motion.windowID == g_panel_id,
+            c.SDL_EVENT_MOUSE_WHEEL => ev.wheel.windowID == g_panel_id,
+            c.SDL_EVENT_KEY_DOWN => ev.key.windowID == g_panel_id,
+            else => ev.text.windowID == g_panel_id,
+        },
+        c.SDL_EVENT_WINDOW_FOCUS_LOST, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED, c.SDL_EVENT_WINDOW_MOUSE_LEAVE => ev.window.windowID == g_panel_id,
+        else => false,
+    };
+    const h: []const zigui.HitRegion = if (on_panel) g_panel_hits else hits;
+    const sc: []const zigui.ScrollRegion = if (on_panel) g_panel_scrolls else scrolls;
     switch (ev.type) {
         c.SDL_EVENT_KEY_DOWN, c.SDL_EVENT_TEXT_INPUT, c.SDL_EVENT_MOUSE_BUTTON_DOWN => g_blink_epoch = c.SDL_GetTicks(),
         else => {},
     }
     switch (ev.type) {
         c.SDL_EVENT_QUIT => running.* = false,
+        // Clicking anywhere else dismisses the popover, like a native panel.
+        c.SDL_EVENT_WINDOW_FOCUS_LOST => if (on_panel) hidePanel(),
         // The close button: hide-to-tray when configured, else quit. (⌘Q still
         // sends SDL_EVENT_QUIT.)
-        c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => if (g_hide_on_close) hideWindow() else {
+        c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => if (on_panel) hidePanel() else if (g_hide_on_close) hideWindow() else {
             running.* = false;
         },
         c.SDL_EVENT_MOUSE_BUTTON_DOWN => {
@@ -1262,9 +1657,9 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             if (ev.button.button == c.SDL_BUTTON_RIGHT) {
                 // Right-click pops the text context menu when over an editable
                 // field; elsewhere it just dismisses any open menu.
-                if (zigui.fieldAt(hits, p)) |field| {
+                if (zigui.fieldAt(h, p)) |field| {
                     zigui.openContextMenu(field, p);
-                } else if (!zigui.dispatchSecondaryTap(hits, p)) {
+                } else if (!zigui.dispatchSecondaryTap(h, p)) {
                     zigui.closeContextMenu();
                 }
             } else if (blk: {
@@ -1274,41 +1669,42 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             }) {
                 // A left-click while the menu is open routes to the menu (an item
                 // or the dismiss region) without disturbing focus.
-                _ = zigui.dispatchTap(hits, p);
+                _ = zigui.dispatchTap(h, p);
             } else {
                 zigui.clearFocus(); // a click defocuses; dispatch may refocus a field
                 zigui.endDrag(); // reset any stale drag; dispatchTap re-arms over an editor
                 // In a text field, double-click selects the word and triple-click
                 // selects all; any other target falls back to a normal tap.
-                if (ev.button.clicks >= 3 and zigui.dispatchTripleClick(hits, p)) {} else if (ev.button.clicks == 2 and zigui.dispatchDoubleClick(hits, p)) {} else {
+                if (ev.button.clicks >= 3 and zigui.dispatchTripleClick(h, p)) {} else if (ev.button.clicks == 2 and zigui.dispatchDoubleClick(h, p)) {} else {
                     zigui.setTapCount(ev.button.clicks);
                     defer zigui.setTapCount(1);
-                    _ = zigui.dispatchTap(hits, p);
+                    _ = zigui.dispatchTap(h, p);
                 }
             }
         },
         // Drag the mouse with the left button held to extend a text selection.
         c.SDL_EVENT_MOUSE_MOTION => {
             const mp = eventPoint(ev.motion.x, ev.motion.y);
-            g_hover_point = mp; // drives Modifiers.hover_fill highlights
+            if (on_panel) g_panel_hover = mp else g_hover_point = mp; // drives Modifiers.hover_fill highlights
             // Track the hovered context-menu item (the loop redraws after this
             // event, so the highlight follows the cursor).
-            if (zigui.contextMenuOpen()) zigui.hoverContextMenu(hits, mp);
+            if (zigui.contextMenuOpen()) zigui.hoverContextMenu(h, mp);
             if ((ev.motion.state & c.SDL_BUTTON_LMASK) != 0) {
-                zigui.dispatchDrag(hits, mp);
+                zigui.dispatchDrag(h, mp);
             }
-            setTextCursor(zigui.textCursorAt(hits, mp));
+            setTextCursor(zigui.textCursorAt(h, mp));
         },
         c.SDL_EVENT_MOUSE_BUTTON_UP => zigui.endDrag(),
-        c.SDL_EVENT_WINDOW_MOUSE_LEAVE => g_hover_point = null,
+        c.SDL_EVENT_WINDOW_MOUSE_LEAVE => if (on_panel) {
+            g_panel_hover = null;
+        } else {
+            g_hover_point = null;
+        },
         c.SDL_EVENT_DROP_FILE => {
             if (g_drop_fn) |f| if (ev.drop.data != null) f(std.mem.span(ev.drop.data));
         },
         c.SDL_EVENT_MOUSE_WHEEL => {
-            var mx: f32 = 0;
-            var my: f32 = 0;
-            _ = c.SDL_GetMouseState(&mx, &my);
-            _ = zigui.dispatchScroll(scrolls, eventPoint(mx, my), ev.wheel.y);
+            _ = zigui.dispatchScroll(sc, eventPoint(ev.wheel.mouse_x, ev.wheel.mouse_y), ev.wheel.y);
         },
         c.SDL_EVENT_TEXT_INPUT => {
             if (zigui.focusedField()) |f| {
@@ -1317,6 +1713,11 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             }
         },
         c.SDL_EVENT_KEY_DOWN => {
+            // Escape dismisses the popover before anything else sees the key.
+            if (on_panel and ev.key.key == c.SDLK_ESCAPE) {
+                hidePanel();
+                return;
+            }
             // App shortcuts/clipboard get first refusal; a true return consumes
             // the key so default editing below is skipped.
             if (g_key_fn) |kf| {

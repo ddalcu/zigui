@@ -1123,6 +1123,8 @@ pub fn run(
                 // drawn: every other pixel stays transparent and lets the
                 // material show through.
                 // Appended before renderScaled, which scales only the view's commands, so scale it here.
+                // Only macOS has glass behind the window; elsewhere the panel is a solid card.
+                if (builtin.os.tag != .macos) canvas.fillRoundedRect(.{ .x = 0, .y = 0, .width = point_w * scale, .height = point_h * scale }, 12 * scale, theme.colors.window_background) catch {};
                 canvas.strokeRoundedRect(.{ .x = 0.5 * scale, .y = 0.5 * scale, .width = (point_w - 1) * scale, .height = (point_h - 1) * scale }, 12 * scale, scale, theme.colors.separator) catch {};
             } else {
                 // No background fill command here: the framebuffer's `clear` below paints

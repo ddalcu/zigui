@@ -122,7 +122,7 @@ fn load() bool {
     const lib = std.c.dlopen("libdbus-1.so.3", .{ .LAZY = true }) orelse return false;
     inline for (symbols) |s| {
         const p = std.c.dlsym(lib, s[1]) orelse return false;
-        @field(api, s[0]) = @ptrCast(p);
+        @field(api, s[0]) = @ptrCast(@alignCast(p));
     }
     return true;
 }

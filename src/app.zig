@@ -185,7 +185,7 @@ fn x11Focus(w: *c.SDL_Window) void {
     if (xwin == 0) return;
     const lib = std.c.dlopen("libX11.so.6", .{ .LAZY = true }) orelse return;
     const XSetInputFocus = *const fn (?*anyopaque, c_ulong, c_int, c_ulong) callconv(.c) c_int;
-    const set_focus: XSetInputFocus = @ptrCast(std.c.dlsym(lib, "XSetInputFocus") orelse return);
+    const set_focus: XSetInputFocus = @ptrCast(@alignCast(std.c.dlsym(lib, "XSetInputFocus") orelse return));
     _ = set_focus(display, @intCast(xwin), 1, 0); // RevertToPointerRoot, CurrentTime
 }
 

@@ -397,6 +397,58 @@ pub fn setKeyHandler(f: ?*const fn (key: u32, mods: u16) bool) void {
     g_key_fn = f;
 }
 
+/// An optional handler for typed text (after IME composition), called before
+/// the focused field gets it. Return true to consume it — a terminal view
+/// takes typing this way while it has the keyboard.
+var g_text_fn: ?*const fn (text: []const u8) bool = null;
+pub fn setTextHandler(f: ?*const fn (text: []const u8) bool) void {
+    g_text_fn = f;
+}
+
+/// A mouse event in the main window, in logical points (see `setMouseHandler`).
+pub const MouseEvent = struct {
+    kind: enum { down, up, motion, wheel },
+    x: f32,
+    y: f32,
+    /// 1 left, 2 middle, 3 right (down/up only).
+    button: u8 = 0,
+    /// 2 for a double click, 3 for a triple (down only).
+    clicks: u8 = 1,
+    /// The left button is held (motion only).
+    held: bool = false,
+    /// Wheel lines, positive = away from the user (wheel only).
+    dy: f32 = 0,
+    /// `SDL_KMOD_*` mask.
+    mods: u16 = 0,
+};
+
+/// An optional handler that sees main-window mouse events first; return true
+/// to consume one (the default hit-testing then skips it). A terminal view
+/// uses it for selection, the wheel and the program's own mouse reporting.
+var g_mouse_fn: ?*const fn (ev: MouseEvent) bool = null;
+pub fn setMouseHandler(f: ?*const fn (ev: MouseEvent) bool) void {
+    g_mouse_fn = f;
+}
+
+fn mouseEvent(ev: *const c.SDL_Event) ?MouseEvent {
+    const mods: u16 = @intCast(c.SDL_GetModState());
+    return switch (ev.type) {
+        c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP => blk: {
+            const p = eventPoint(ev.button.x, ev.button.y);
+            break :blk .{ .kind = if (ev.type == c.SDL_EVENT_MOUSE_BUTTON_DOWN) .down else .up, .x = p.x, .y = p.y, .button = ev.button.button, .clicks = ev.button.clicks, .mods = mods };
+        },
+        c.SDL_EVENT_MOUSE_MOTION => blk: {
+            const p = eventPoint(ev.motion.x, ev.motion.y);
+            break :blk .{ .kind = .motion, .x = p.x, .y = p.y, .held = (ev.motion.state & c.SDL_BUTTON_LMASK) != 0, .mods = mods };
+        },
+        c.SDL_EVENT_MOUSE_WHEEL => blk: {
+            const p = eventPoint(ev.wheel.mouse_x, ev.wheel.mouse_y);
+            break :blk .{ .kind = .wheel, .x = p.x, .y = p.y, .dy = ev.wheel.y, .mods = mods };
+        },
+        else => null,
+    };
+}
+
 /// Called with the path of each file dropped onto the window.
 var g_drop_fn: ?*const fn (path: []const u8) void = null;
 pub fn setDropHandler(f: ?*const fn (path: []const u8) void) void {
@@ -1879,6 +1931,7 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
         c.SDL_EVENT_WINDOW_FOCUS_LOST, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED, c.SDL_EVENT_WINDOW_MOUSE_LEAVE => ev.window.windowID == g_panel_id,
         else => false,
     };
+    if (!on_panel and !zigui.contextMenuOpen()) if (g_mouse_fn) |mf| if (mouseEvent(ev)) |me| if (mf(me)) return;
     const h: []const zigui.HitRegion = if (on_panel) g_panel_hits else hits;
     const sc: []const zigui.ScrollRegion = if (on_panel) g_panel_scrolls else scrolls;
     switch (ev.type) {
@@ -1949,8 +2002,9 @@ fn handleEvent(ev: *c.SDL_Event, running: *bool, hits: []const zigui.HitRegion, 
             _ = zigui.dispatchScroll(sc, eventPoint(ev.wheel.mouse_x, ev.wheel.mouse_y), ev.wheel.y);
         },
         c.SDL_EVENT_TEXT_INPUT => {
+            const s = std.mem.span(ev.text.text);
+            if (g_text_fn) |tf| if (tf(s)) return;
             if (zigui.focusedField()) |f| {
-                const s = std.mem.span(ev.text.text);
                 f.insert(s) catch {};
             }
         },

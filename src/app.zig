@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 pub const c = @import("sdl_c");
 
 pub const gpu = @import("gpu/gpu.zig");
+const sni = @import("sni.zig");
 
 /// Row-major RGBA8 window icon (`rgba` is `w*h*4` bytes). See `Config.icon`.
 pub const WindowIcon = struct { rgba: []const u8, w: c_int, h: c_int };
@@ -114,6 +115,14 @@ var g_panel_shown: bool = false;
 var g_panel_hits: []const zigui.HitRegion = &.{};
 var g_panel_scrolls: []const zigui.ScrollRegion = &.{};
 var g_panel_hover: ?zigui.geometry.Point = null;
+/// When the panel last hid (SDL ticks). A tray click on an open panel first
+/// takes its focus, hiding it, so the click that follows must not reopen it.
+var g_panel_hidden_ms: u64 = 0;
+
+/// False for the status-item click that just closed the panel by taking its focus.
+fn statusClickCounts() bool {
+    return g_panel_shown or c.SDL_GetTicks() - g_panel_hidden_ms >= 300;
+}
 /// Size key of the frame already written by ZIGUI_PANEL_DUMP (see drawFrame).
 var g_dump_written: u64 = 0;
 
@@ -122,7 +131,10 @@ pub fn panelVisible() bool {
 }
 
 /// Position the panel under the pointer (a tray click leaves the cursor on the
-/// icon), clamped to the screen's usable area, then show and focus it.
+/// icon), clamped to the screen's usable area, then show and focus it. A Linux
+/// status-item click anchors at the position its host reported instead (KDE
+/// and Xfce send one); a host that reports none (COSMIC sends 0, 0) gets the
+/// primary display's top-right corner, where its tray sits.
 pub fn showPanel() void {
     const w = g_panel_window orelse return;
     var lw: c_int = 0;
@@ -131,11 +143,24 @@ pub fn showPanel() void {
     var mx: f32 = 0;
     var my: f32 = 0;
     _ = c.SDL_GetGlobalMouseState(&mx, &my);
+    const corner = if (g_click_at) |at| at[0] == 0 and at[1] == 0 else false;
+    if (g_click_at) |at| if (!corner) {
+        mx = @floatFromInt(at[0]);
+        my = @floatFromInt(at[1]);
+    };
     var x: c_int = @intFromFloat(@as(f32, mx) - @as(f32, @floatFromInt(lw)) / 2);
     var y: c_int = @intFromFloat(my + 10);
     var pt = c.SDL_Point{ .x = @intFromFloat(mx), .y = @intFromFloat(my) };
-    const disp = c.SDL_GetDisplayForPoint(&pt);
+    const disp = if (corner) c.SDL_GetPrimaryDisplay() else c.SDL_GetDisplayForPoint(&pt);
     var bounds: c.SDL_Rect = undefined;
+    if (corner and c.SDL_GetDisplayUsableBounds(disp, &bounds)) {
+        // XWayland reports no work area, so the usable bounds still cover the
+        // top bar: step below it.
+        var full: c.SDL_Rect = undefined;
+        const bar: c_int = if (c.SDL_GetDisplayBounds(disp, &full) and full.y == bounds.y and full.h == bounds.h) 40 else 0;
+        x = bounds.x + bounds.w - lw - 48;
+        y = bounds.y + bar + 8;
+    }
     if (c.SDL_GetDisplayUsableBounds(disp, &bounds)) {
         const max_x = bounds.x + bounds.w - lw;
         const max_y = bounds.y + bounds.h - lh;
@@ -145,9 +170,23 @@ pub fn showPanel() void {
     _ = c.SDL_SetWindowPosition(w, x, y);
     _ = c.SDL_ShowWindow(w);
     _ = c.SDL_RaiseWindow(w);
+    if (builtin.os.tag == .linux) x11Focus(w);
     _ = c.SDL_StartTextInput(w);
     g_panel_shown = true;
     wake();
+}
+
+/// Give an override-redirect X11 window input focus (no window manager does),
+/// so a click elsewhere takes it away again and closes the panel. A no-op off X11.
+fn x11Focus(w: *c.SDL_Window) void {
+    const props = c.SDL_GetWindowProperties(w);
+    const display = c.SDL_GetPointerProperty(props, c.SDL_PROP_WINDOW_X11_DISPLAY_POINTER, null) orelse return;
+    const xwin = c.SDL_GetNumberProperty(props, c.SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+    if (xwin == 0) return;
+    const lib = std.c.dlopen("libX11.so.6", .{ .LAZY = true }) orelse return;
+    const XSetInputFocus = *const fn (?*anyopaque, c_ulong, c_int, c_ulong) callconv(.c) c_int;
+    const set_focus: XSetInputFocus = @ptrCast(std.c.dlsym(lib, "XSetInputFocus") orelse return);
+    _ = set_focus(display, @intCast(xwin), 1, 0); // RevertToPointerRoot, CurrentTime
 }
 
 /// Resize the panel window without showing it (the launcher restores the tray
@@ -184,6 +223,7 @@ pub fn showPanelCentered(width: u32, height: u32) void {
 pub fn hidePanel() void {
     if (!g_panel_shown) return;
     g_panel_shown = false;
+    g_panel_hidden_ms = c.SDL_GetTicks();
     if (g_panel_window) |w| {
         _ = c.SDL_StopTextInput(w);
         _ = c.SDL_HideWindow(w);
@@ -743,19 +783,50 @@ pub const Tray = struct {
     }
 };
 
-/// macOS: a plain NSStatusItem whose click runs `on_click` (no menu attached),
-/// so the app can open its own popover panel. Returns false on other platforms
-/// and when AppKit can't be reached — callers fall back to `Tray`.
-/// `rgba` is the HiDPI (2x) bitmap; the icon shows at half its pixel size in
-/// points (36 px → 18 pt, the usual menu-bar glyph).
+/// A plain status icon whose click runs `on_click` (no menu attached), so the
+/// app can open its own popover panel: an NSStatusItem on macOS, a
+/// notification-area icon on Windows and a StatusNotifierItem on Linux (either
+/// button). Returns false on other platforms and when the OS has no tray to
+/// reach — callers fall back to `Tray`. `rgba` is the HiDPI (2x) bitmap; on
+/// macOS the icon shows at half its pixel size in points (36 px → 18 pt, the
+/// usual menu-bar glyph).
 pub fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
-    if (builtin.os.tag != .macos) return false;
     _ = c.SDL_Init(c.SDL_INIT_VIDEO);
-    return cocoa.createStatusItem(rgba, w, h, tooltip, on_click);
+    switch (builtin.os.tag) {
+        .macos => return cocoa.createStatusItem(rgba, w, h, tooltip, on_click),
+        .windows => return win32.createStatusItem(rgba, w, h, tooltip, on_click),
+        .linux => {
+            if (!sni.create(std.heap.c_allocator, rgba, w, h, tooltip, wake)) return false;
+            g_sni_cb = on_click;
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Linux: the status item's click callback, run on the UI loop by `takeSniClick`.
+var g_sni_cb: ?zigui.Callback = null;
+/// Where the status-item click being handled happened (screen coordinates);
+/// `showPanel` anchors there instead of the pointer unless it is (0, 0), what
+/// a host that sends no position reports.
+var g_click_at: ?[2]i32 = null;
+
+fn takeSniClick() void {
+    if (builtin.os.tag != .linux) return;
+    const at = sni.takeClick() orelse return;
+    const cb = g_sni_cb orelse return;
+    if (!statusClickCounts()) return;
+    g_click_at = at;
+    defer g_click_at = null;
+    cb.call();
 }
 
 pub fn destroyStatusItem() void {
-    if (builtin.os.tag == .macos) cocoa.destroyStatusItem();
+    switch (builtin.os.tag) {
+        .macos => cocoa.destroyStatusItem(),
+        .windows => win32.destroyStatusItem(),
+        else => {},
+    }
 }
 
 /// Run the app. `body` is invoked each frame to (re)build the view tree from the
@@ -848,6 +919,14 @@ pub fn run(
         panel_arena.deinit();
     }
     if (panel) |ps| blk: {
+        // X11: compositors such as COSMIC place managed windows themselves and
+        // ignore the position asked for; an override-redirect window goes
+        // where `showPanel` puts it. The window manager then never focuses
+        // it, so `showPanel` does (see `x11Focus`).
+        if (builtin.os.tag == .linux) _ = c.SDL_SetHint(c.SDL_HINT_X11_FORCE_OVERRIDE_REDIRECT, "1");
+        defer if (builtin.os.tag == .linux) {
+            _ = c.SDL_ResetHint(c.SDL_HINT_X11_FORCE_OVERRIDE_REDIRECT);
+        };
         const w = c.SDL_CreateWindow(
             "MLX-Serve",
             @intCast(ps.width),
@@ -1283,6 +1362,7 @@ pub fn run(
         // Per-frame hook (e.g. refresh the system-tray menu). Runs whether or not
         // the window is visible, so the tray tracks status even when hidden.
         if (g_frame_fn) |f| f();
+        takeSniClick();
 
         // Fresh per-frame region lists (arena-backed via drawFrame); discarded at
         // the next arena reset, exactly like the pre-refactor loop. The main
@@ -1615,6 +1695,166 @@ const cocoa = struct {
             send(void, holder, "setSubmenu:", .{sub});
             send(void, bar, "addItem:", .{holder});
         }
+    }
+};
+
+/// Windows notification-area icon whose click runs a callback, the counterpart
+/// of the macOS status item. SDL's tray opens its menu on either button and
+/// offers no click callback, hence this. The icon talks to a message-only
+/// window on the UI thread; SDL's event pump dispatches its messages.
+const win32 = struct {
+    const HWND = ?*anyopaque;
+    const WPARAM = usize;
+    const LPARAM = isize;
+    const LRESULT = isize;
+    const WndProc = *const fn (HWND, u32, WPARAM, LPARAM) callconv(.winapi) LRESULT;
+
+    const WNDCLASSEXW = extern struct {
+        cbSize: u32 = @sizeOf(WNDCLASSEXW),
+        style: u32 = 0,
+        lpfnWndProc: WndProc,
+        cbClsExtra: i32 = 0,
+        cbWndExtra: i32 = 0,
+        hInstance: ?*anyopaque,
+        hIcon: ?*anyopaque = null,
+        hCursor: ?*anyopaque = null,
+        hbrBackground: ?*anyopaque = null,
+        lpszMenuName: ?[*:0]const u16 = null,
+        lpszClassName: [*:0]const u16,
+        hIconSm: ?*anyopaque = null,
+    };
+    const NOTIFYICONDATAW = extern struct {
+        cbSize: u32 = @sizeOf(NOTIFYICONDATAW),
+        hWnd: HWND = null,
+        uID: u32 = 1,
+        uFlags: u32 = 0,
+        uCallbackMessage: u32 = 0,
+        hIcon: ?*anyopaque = null,
+        szTip: [128]u16 = @splat(0),
+        dwState: u32 = 0,
+        dwStateMask: u32 = 0,
+        szInfo: [256]u16 = @splat(0),
+        uVersion: u32 = 0,
+        szInfoTitle: [64]u16 = @splat(0),
+        dwInfoFlags: u32 = 0,
+        guidItem: [16]u8 = @splat(0),
+        hBalloonIcon: ?*anyopaque = null,
+    };
+    const BITMAPINFOHEADER = extern struct {
+        biSize: u32 = @sizeOf(BITMAPINFOHEADER),
+        biWidth: i32,
+        biHeight: i32,
+        biPlanes: u16 = 1,
+        biBitCount: u16 = 32,
+        biCompression: u32 = 0, // BI_RGB
+        biSizeImage: u32 = 0,
+        biXPelsPerMeter: i32 = 0,
+        biYPelsPerMeter: i32 = 0,
+        biClrUsed: u32 = 0,
+        biClrImportant: u32 = 0,
+    };
+    const ICONINFO = extern struct { fIcon: i32 = 1, xHotspot: u32 = 0, yHotspot: u32 = 0, hbmMask: ?*anyopaque, hbmColor: ?*anyopaque };
+
+    const NIM_ADD = 0;
+    const NIM_DELETE = 2;
+    const NIM_SETVERSION = 4;
+    const NIF_MESSAGE = 0x1;
+    const NIF_ICON = 0x2;
+    const NIF_TIP = 0x4;
+    const NIF_SHOWTIP = 0x80;
+    const NOTIFYICON_VERSION_4 = 4;
+    const NIN_SELECT = 0x400;
+    const NIN_KEYSELECT = 0x401;
+    const WM_CONTEXTMENU = 0x7B;
+    const WM_TRAYICON = 0x8000 + 1; // WM_APP + 1
+    const HWND_MESSAGE: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))));
+
+    extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn RegisterClassExW(wc: *const WNDCLASSEXW) callconv(.winapi) u16;
+    extern "user32" fn CreateWindowExW(ex: u32, class: [*:0]const u16, title: [*:0]const u16, style: u32, x: i32, y: i32, w: i32, h: i32, parent: HWND, menu: ?*anyopaque, inst: ?*anyopaque, param: ?*anyopaque) callconv(.winapi) HWND;
+    extern "user32" fn DestroyWindow(hwnd: HWND) callconv(.winapi) i32;
+    extern "user32" fn DefWindowProcW(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT;
+    extern "user32" fn RegisterWindowMessageW(name: [*:0]const u16) callconv(.winapi) u32;
+    extern "user32" fn CreateIconIndirect(info: *const ICONINFO) callconv(.winapi) ?*anyopaque;
+    extern "user32" fn DestroyIcon(icon: ?*anyopaque) callconv(.winapi) i32;
+    extern "gdi32" fn CreateDIBSection(hdc: ?*anyopaque, bmi: *const BITMAPINFOHEADER, usage: u32, bits: *?*anyopaque, section: ?*anyopaque, offset: u32) callconv(.winapi) ?*anyopaque;
+    extern "gdi32" fn CreateBitmap(w: i32, h: i32, planes: u32, bpp: u32, bits: ?*const anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "gdi32" fn DeleteObject(obj: ?*anyopaque) callconv(.winapi) i32;
+    extern "shell32" fn Shell_NotifyIconW(msg: u32, data: *NOTIFYICONDATAW) callconv(.winapi) i32;
+
+    var nid: NOTIFYICONDATAW = .{};
+    var status_cb: ?zigui.Callback = null;
+    /// Explorer broadcasts this after it restarts; the icon must be added again.
+    var taskbar_created: u32 = 0;
+
+    fn wndProc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) callconv(.winapi) LRESULT {
+        if (msg == WM_TRAYICON) {
+            // Version 4: the event is in the low word of lParam. Either button
+            // opens the panel, which carries everything the menu did.
+            switch (@as(u16, @truncate(@as(usize, @bitCast(lp))))) {
+                NIN_SELECT, NIN_KEYSELECT, WM_CONTEXTMENU => if (status_cb) |cb| {
+                    if (!statusClickCounts()) return 0;
+                    cb.call();
+                    wake();
+                },
+                else => {},
+            }
+            return 0;
+        }
+        if (msg == taskbar_created and taskbar_created != 0) add();
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+
+    fn add() void {
+        _ = Shell_NotifyIconW(NIM_ADD, &nid);
+        nid.uVersion = NOTIFYICON_VERSION_4;
+        _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    }
+
+    /// An HICON from straight-alpha RGBA: a top-down 32-bit BGRA DIB (its
+    /// alpha is the icon's transparency) plus the mask CreateIconIndirect requires.
+    fn makeIcon(rgba: []const u8, w: c_int, h: c_int) ?*anyopaque {
+        var bits: ?*anyopaque = null;
+        const color = CreateDIBSection(null, &.{ .biWidth = w, .biHeight = -h }, 0, &bits, null, 0) orelse return null;
+        defer _ = DeleteObject(color);
+        const dst: [*]u8 = @ptrCast(bits orelse return null);
+        var i: usize = 0;
+        while (i + 3 < rgba.len) : (i += 4) {
+            dst[i] = rgba[i + 2];
+            dst[i + 1] = rgba[i + 1];
+            dst[i + 2] = rgba[i];
+            dst[i + 3] = rgba[i + 3];
+        }
+        const mask = CreateBitmap(w, h, 1, 1, null) orelse return null;
+        defer _ = DeleteObject(mask);
+        return CreateIconIndirect(&.{ .hbmMask = mask, .hbmColor = color });
+    }
+
+    fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
+        const class = std.unicode.utf8ToUtf16LeStringLiteral("ZiguiStatusItem");
+        const inst = GetModuleHandleW(null);
+        if (RegisterClassExW(&.{ .lpfnWndProc = wndProc, .hInstance = inst, .lpszClassName = class }) == 0) return false;
+        const hwnd = CreateWindowExW(0, class, class, 0, 0, 0, 0, 0, HWND_MESSAGE, null, inst, null) orelse return false;
+        const icon = makeIcon(rgba, w, h) orelse {
+            _ = DestroyWindow(hwnd);
+            return false;
+        };
+        taskbar_created = RegisterWindowMessageW(std.unicode.utf8ToUtf16LeStringLiteral("TaskbarCreated"));
+        nid = .{ .hWnd = hwnd, .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP, .uCallbackMessage = WM_TRAYICON, .hIcon = icon };
+        // ASCII tooltips are all callers pass; widen byte by byte.
+        for (tooltip[0..@min(tooltip.len, nid.szTip.len - 1)], 0..) |ch, k| nid.szTip[k] = ch;
+        status_cb = on_click;
+        add();
+        return true;
+    }
+
+    fn destroyStatusItem() void {
+        if (nid.hWnd == null) return;
+        _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        _ = DestroyIcon(nid.hIcon);
+        _ = DestroyWindow(nid.hWnd);
+        nid = .{};
+        status_cb = null;
     }
 };
 

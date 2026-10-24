@@ -632,5 +632,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .title = "zigui — Editor",
         .width = 880,
         .height = 600,
-    }, body);
+    }, body, null);
 }

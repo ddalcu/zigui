@@ -870,5 +870,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return screenshot(alloc, &st, out, bench, use_gpu);
     }
 
-    try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660 }, body);
+    try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660 }, body, null);
 }

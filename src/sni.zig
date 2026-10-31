@@ -294,7 +294,7 @@ fn appendProp(it: *Iter, name: []const u8) void {
     if (std.mem.eql(u8, name, "Category")) {
         appendString(&v, "ApplicationStatus");
     } else if (std.mem.eql(u8, name, "Id")) {
-        appendString(&v, "serve-app");
+        appendString(&v, std.mem.sliceTo(&title, 0));
     } else if (std.mem.eql(u8, name, "Title")) {
         appendString(&v, std.mem.sliceTo(&title, 0));
     } else if (std.mem.eql(u8, name, "Status")) {

@@ -980,7 +980,7 @@ pub fn run(
             _ = c.SDL_ResetHint(c.SDL_HINT_X11_FORCE_OVERRIDE_REDIRECT);
         };
         const w = c.SDL_CreateWindow(
-            "MLX-Serve",
+            cfg.title.ptr,
             @intCast(ps.width),
             @intCast(ps.height),
             c.SDL_WINDOW_BORDERLESS | c.SDL_WINDOW_UTILITY | c.SDL_WINDOW_ALWAYS_ON_TOP | c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_TRANSPARENT,

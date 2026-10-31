@@ -2050,7 +2050,7 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
     }
 
     // Background fill (behind content, spanning the padded frame).
-    if (v.mods.background) |fill| try paintFill(canvas, outer, v.mods.corner_radius, fill, op, &child_ctx.theme.colors);
+    if (v.mods.background) |fill| try paintFill(canvas, outer, child_ctx.theme.metrics.radius(v.mods.corner_radius), fill, op, &child_ctx.theme.colors);
 
     // Hover highlight: painted over the background while the cursor is inside
     // this view (and it isn't disabled). Cheap point-in-rect test per frame.
@@ -2058,7 +2058,7 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
         if (!child_ctx.disabled) {
             if (ctx.hover_point) |hp| {
                 if (outer.contains(hp))
-                    try paintFill(canvas, outer, v.mods.corner_radius, .{ .color = hc }, op, &child_ctx.theme.colors);
+                    try paintFill(canvas, outer, child_ctx.theme.metrics.radius(v.mods.corner_radius), .{ .color = hc }, op, &child_ctx.theme.colors);
             }
         }
     }
@@ -2084,7 +2084,9 @@ fn paint(ctx: *const Context, v: View, lr: engine.LayoutResult, canvas: *Canvas)
 
     // Border (in front of content).
     if (v.mods.border_color) |bc| {
-        try canvas.strokeRoundedRect(outer, v.mods.corner_radius, v.mods.border_width, bc.multiplyAlpha(op));
+        if (child_ctx.theme.metrics.chiseled) {
+            try child_ctx.surface(canvas).bevel(outer, false);
+        } else try canvas.strokeRoundedRect(outer, v.mods.corner_radius, v.mods.border_width, bc.multiplyAlpha(op));
     }
 
     // A presented overlay is not drawn inline — it is enqueued for the drain
@@ -2228,7 +2230,7 @@ fn paintShape(ctx: *const Context, sh: ShapeData, rect: Rect, op: f32, canvas: *
     const palette = &ctx.theme.colors;
     switch (sh.shape) {
         .rect => try paintFill(canvas, rect, 0, sh.fill, op, palette),
-        .rounded_rect => try paintFill(canvas, rect, sh.corner_radius, sh.fill, op, palette),
+        .rounded_rect => try paintFill(canvas, rect, ctx.theme.metrics.radius(sh.corner_radius), sh.fill, op, palette),
         .capsule => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op, palette),
         .ellipse => try paintFill(canvas, rect, @min(rect.width, rect.height) / 2, sh.fill, op, palette),
         .circle => {

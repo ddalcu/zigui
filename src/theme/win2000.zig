@@ -1,8 +1,8 @@
 //! Windows 2000 theme: the classic "Luna-less" chiseled look — silver 3D-face
 //! controls with raised/sunken bevels drawn from four edge colors, a navy
-//! selection highlight, and square corners. Light-only (Windows 2000 had no
-//! dark mode), so `registry.zig` keeps it on the light palette regardless of the
-//! OS appearance.
+//! selection highlight, and square corners. Windows 2000 had no dark mode; the
+//! `dark` palette is the same chiseled look on charcoal, for apps that follow
+//! the OS appearance.
 
 const std = @import("std");
 const theme = @import("theme.zig");
@@ -42,32 +42,17 @@ const metrics = Metrics{
     .window_corner_radius = 0,
     .control_height = 23,
     .hairline = 1,
+    .chiseled = true,
 };
 
 // ---------------------------------------------------------------------------
 // Bevels — the heart of the chiseled look
 // ---------------------------------------------------------------------------
 
-/// Draw one 1px ring: top & left edges in `tl`, bottom & right edges in `br`.
-fn ring(s: Surface, r: Rect, tl: Color, br: Color) Err!void {
-    try s.fill(.{ .x = r.x, .y = r.y, .width = r.width, .height = 1 }, 0, tl); // top
-    try s.fill(.{ .x = r.x, .y = r.y, .width = 1, .height = r.height }, 0, tl); // left
-    try s.fill(.{ .x = r.x, .y = r.maxY() - 1, .width = r.width, .height = 1 }, 0, br); // bottom
-    try s.fill(.{ .x = r.maxX() - 1, .y = r.y, .width = 1, .height = r.height }, 0, br); // right
-}
-
-/// A two-ring 3D bevel. `raised` (a button at rest) lights the top-left and
-/// shadows the bottom-right; sunken (a pressed button, or an input well) swaps
-/// them so the surface reads as pushed in.
+/// A two-ring 3D bevel (`Surface.bevel`): `raised` for a button at rest, sunken
+/// for a pressed button or an input well.
 fn bevel(s: Surface, rect: Rect, raised: bool) Err!void {
-    const p = s.palette;
-    if (raised) {
-        try ring(s, rect, p.control_highlight, p.control_dark_shadow);
-        try ring(s, rect.insetBy(1, 1), p.control_light, p.control_shadow);
-    } else {
-        try ring(s, rect, p.control_shadow, p.control_highlight);
-        try ring(s, rect.insetBy(1, 1), p.control_dark_shadow, p.control_light);
-    }
+    try s.bevel(rect, raised);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,8 +193,38 @@ pub const light = Theme{
     },
 };
 
-// Windows 2000 had no dark mode; the registry maps any scheme to `light`.
-pub const dark = light;
+/// The same chiseled scheme colors on charcoal: edges run from a lit top-left
+/// to a near-black bottom-right, and the navy selection is lifted to stay legible.
+pub const dark = Theme{
+    .name = "Windows 2000",
+    .scheme = .dark,
+    .typography = typography,
+    .metrics = metrics,
+    .painter = painter,
+    .colors = .{
+        .accent = Color.fromRgb8(70, 110, 215),
+        .label = Color.fromRgb8(235, 235, 235),
+        .secondary_label = Color.fromRgb8(190, 190, 190),
+        .tertiary_label = Color.fromRgb8(130, 130, 130),
+        .on_accent = Color.white,
+        .window_background = Color.fromRgb8(56, 56, 56),
+        .secondary_background = Color.fromRgb8(56, 56, 56),
+        .control_background = Color.fromRgb8(28, 28, 28),
+        .separator = Color.fromRgb8(24, 24, 24),
+        .selection = Color.fromRgb8(70, 110, 215),
+        .destructive = Color.fromRgb8(230, 80, 80),
+        .hover = Color.fromRgb8(70, 110, 215).withAlpha(0.25),
+        .control_border = Color.fromRgb8(24, 24, 24),
+        .glass = Color.fromRgb8(56, 56, 56).withAlpha(0.95),
+        .control_track = Color.fromRgb8(56, 56, 56),
+        .control_face = Color.fromRgb8(56, 56, 56),
+        .control_highlight = Color.fromRgb8(110, 110, 110),
+        .control_light = Color.fromRgb8(82, 82, 82),
+        .control_shadow = Color.fromRgb8(30, 30, 30),
+        .control_dark_shadow = Color.fromRgb8(8, 8, 8),
+        .on_control = Color.fromRgb8(235, 235, 235),
+    },
+};
 
 const testing = std.testing;
 
@@ -221,4 +236,10 @@ test "win2000: square corners and silver face" {
 test "win2000: selection is navy" {
     const a = light.colors.accent;
     try testing.expect(a.b > a.r and a.b > a.g and a.isDark());
+}
+
+test "win2000: dark is charcoal with the same square metrics" {
+    try testing.expectEqual(theme.ColorScheme.dark, dark.scheme);
+    try testing.expect(dark.colors.window_background.isDark());
+    try testing.expect(dark.metrics.chiseled);
 }

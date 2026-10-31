@@ -164,6 +164,15 @@ pub const Metrics = struct {
     window_corner_radius: f32 = 10,
     /// Hairline thickness for separators/borders at 1x.
     hairline: f32 = 1,
+    /// The chiseled look (Windows 2000): a view's own `.cornerRadius(r)` squares
+    /// off and its `.border(...)` becomes a sunken bevel, so an app's cards,
+    /// wells and pills match the painter's controls.
+    chiseled: bool = false,
+
+    /// A view's requested corner radius, squared off in a chiseled theme.
+    pub fn radius(m: Metrics, r: f32) f32 {
+        return if (m.chiseled) 0 else r;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +202,22 @@ pub const Surface = struct {
     scheme: ColorScheme,
     opacity: f32 = 1,
 
+    /// A two-ring 3D bevel from the palette's four edge colors. `raised` lights
+    /// the top-left and shadows the bottom-right; sunken swaps them.
+    pub fn bevel(s: Surface, rect: Rect, raised: bool) Allocator.Error!void {
+        const p = s.palette;
+        const outer = if (raised) .{ p.control_highlight, p.control_dark_shadow } else .{ p.control_shadow, p.control_highlight };
+        const inner = if (raised) .{ p.control_light, p.control_shadow } else .{ p.control_dark_shadow, p.control_light };
+        try s.ring(rect, outer[0], outer[1]);
+        try s.ring(rect.insetBy(1, 1), inner[0], inner[1]);
+    }
+    /// One 1px ring: top and left edges in `tl`, bottom and right in `br`.
+    fn ring(s: Surface, r: Rect, tl: Color, br: Color) Allocator.Error!void {
+        try s.fill(.{ .x = r.x, .y = r.y, .width = r.width, .height = 1 }, 0, tl);
+        try s.fill(.{ .x = r.x, .y = r.y, .width = 1, .height = r.height }, 0, tl);
+        try s.fill(.{ .x = r.x, .y = r.maxY() - 1, .width = r.width, .height = 1 }, 0, br);
+        try s.fill(.{ .x = r.maxX() - 1, .y = r.y, .width = 1, .height = r.height }, 0, br);
+    }
     pub fn fill(s: Surface, rect: Rect, radius: f32, c: Color) Allocator.Error!void {
         try s.canvas.fillRoundedRect(rect, radius, c.multiplyAlpha(s.opacity));
     }

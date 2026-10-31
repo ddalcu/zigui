@@ -1,10 +1,9 @@
 //! Theme registry: the catalog of built-in theme families and the logic that
 //! resolves one to a concrete `Theme` for the current OS color scheme.
 //!
-//! A *family* (macOS, Windows 10, …) ships a light palette and, when the era
-//! supports it, a dark one. `forScheme` picks the right palette — falling back
-//! to light for families with no dark mode (Windows 2000) — so the app can wire
-//! the OS appearance (`app.systemTheme()`) straight through.
+//! A *family* (macOS, Windows 10, …) ships a light and a dark palette.
+//! `forScheme` picks the right one, so the app can wire the OS appearance
+//! (`app.systemTheme()`) straight through.
 
 const std = @import("std");
 const theme = @import("theme.zig");
@@ -35,21 +34,15 @@ pub const Family = enum {
             .mui => "Material",
         };
     }
-
-    /// Whether this family has a dark palette (vs. light-only).
-    pub fn supportsDark(self: Family) bool {
-        return self != .win2000;
-    }
 };
 
-/// Resolve a family to a concrete `Theme` for `scheme`. Families without a dark
-/// mode ignore a `.dark` request and stay on their light palette.
+/// Resolve a family to a concrete `Theme` for `scheme`.
 pub fn forScheme(family: Family, scheme: ColorScheme) Theme {
-    const dark = scheme == .dark and family.supportsDark();
+    const dark = scheme == .dark;
     return switch (family) {
         .macos => if (dark) macos.dark else macos.light,
         .windows10 => if (dark) windows10.dark else windows10.light,
-        .win2000 => win2000.light,
+        .win2000 => if (dark) win2000.dark else win2000.light,
         .kde => if (dark) kde.dark else kde.light,
         .mui => if (dark) mui.dark else mui.light,
     };
@@ -60,10 +53,8 @@ pub const all = [_]Family{ .macos, .windows10, .win2000, .kde, .mui };
 
 const testing = std.testing;
 
-test "registry: win2000 stays light even in dark mode" {
-    const t = forScheme(.win2000, .dark);
-    try testing.expectEqual(ColorScheme.light, t.scheme);
-    try testing.expect(!Family.win2000.supportsDark());
+test "registry: every family has a dark palette" {
+    for (all) |f| try testing.expectEqual(ColorScheme.dark, forScheme(f, .dark).scheme);
 }
 
 test "registry: macOS follows the requested scheme" {

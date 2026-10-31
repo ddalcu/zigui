@@ -114,7 +114,7 @@ app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → prese
 | `src/text/*` | `ttf` (parser+rasterizer), `atlas` (`GlyphCache`), `shape` (measure/wrap), `font` (`drawText`). |
 | `src/theme/theme.zig` | `Theme`, `Palette`, `Metrics`, `Typography`, and the **`Painter`** vtable + `Surface`/`ControlState`/`Role`. The color-scheme/painter vocabulary. |
 | `src/theme/{macos,win2000,windows10,kde,mui}.zig` | The five built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (liquid glass / bevels / flat / Breeze / Material). |
-| `src/theme/registry.zig` | `Family` enum + `forScheme(family, scheme)` — picks a `Theme` for the OS appearance (light-only families ignore dark). |
+| `src/theme/registry.zig` | `Family` enum + `forScheme(family, scheme)` — picks a `Theme` for the OS appearance |
 | `src/state/*` | `State(T)`, `Binding(T)`, `Observer`. |
 | `src/app.zig` | SDL3 window/event loop. Links C (the only other C file is `src/gpu/gpu.zig`, which it owns). Where overlays, animation ticking, HiDPI scale, key routing, GPU-vs-software backend selection, and `systemTheme()`/`colorScheme()` (OS dark/light) get wired. |
 | `src/components.zig`, `src/zigui.zig` | Public re-exports. |
@@ -292,7 +292,7 @@ background the blur is a no-op and the flat translucent fill + rim + soft
 fake drop shadow carry the look), built from two shared treatments in
 `macos.zig` (`clearGlass` neutral — near-white in light, a *lightening* white
 wash in dark; `tintedGlass` flat accent/destructive with a 1px top specular);
-Win2000 = 2-ring raised/sunken bevels + silver `control_face`, **light-only**;
+Win2000 = 2-ring raised/sunken bevels + silver `control_face` (light) / charcoal (dark), square corners via `Metrics.radius_scale = 0`;
 Windows 10 = flat fills + 1px borders; KDE/Breeze = subtle gradients + thin
 borders + 3px corners; Material = flat primary fills + state overlays.
 
@@ -344,8 +344,7 @@ Recording permission for the terminal; in-process captures render glass blank).
 The macOS theme's colors/metrics were extracted by pixel-sampling those
 captures with PIL — when touching the macOS look, re-capture and compare
 side-by-side against `showcase --screenshot` output rather than eyeballing.
-`theme/registry.zig` exposes `Family` + `forScheme(family, scheme)` (light-only
-families ignore a dark request). `app.systemTheme()`/`app.colorScheme()` read the
+`theme/registry.zig` exposes `Family` + `forScheme(family, scheme)`. `app.systemTheme()`/`app.colorScheme()` read the
 OS preference (SDL3) so an app/theme-provider follows dark/light live; the
 `showcase` footer has a theme-family **`RadioGroup`** and seeds dark mode from the
 OS on the first frame. Headless: `showcase --screenshot <out.bmp> --theme N
@@ -578,7 +577,7 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
   edit` uses it for ⌘S/O/N/F/A and ⌘C/X/V (SDL clipboard) and ⌘±/0 zoom.
   `setFocus` is now exported so an app can focus the editor at launch.
 
-### Added for MLX-Serve (serve-app)
+### Added for the first apps built on it
 - `Drawing(T, ctx, fn)` + `Pen` (line/fill/vGradient/text/fmt): a view that
   paints itself — charts and one-off graphics.
 - `.selectable()` on rich text: press-drag selection inside that one view,

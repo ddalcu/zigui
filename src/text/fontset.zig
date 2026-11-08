@@ -54,7 +54,7 @@ pub const FontSet = struct {
         self.alloc = alloc;
         for (blobs, 0..) |b, i| self.faces[i] = try ttf.Font.parse(b);
         // Text faces fall back to the emoji font for codepoints they lack.
-        const emoji = &self.faces[@intFromEnum(Slot.emoji)];
+        const emoji = &self.faces[@backingInt(Slot.emoji)];
         for (0..slot_count - 1) |i| self.faces[i].fallback = emoji;
         for (0..slot_count) |i| self.caches[i] = atlas.GlyphCache.init(alloc, &self.faces[i]);
         return self;
@@ -68,11 +68,11 @@ pub const FontSet = struct {
     /// Put `face` (e.g. a system CJK font) behind the emoji face, so every style
     /// reaches it for codepoints the bundled faces lack. It must outlive the set.
     pub fn setFallback(self: *FontSet, face: *const ttf.Font) void {
-        self.faces[@intFromEnum(Slot.emoji)].fallback = face;
+        self.faces[@backingInt(Slot.emoji)].fallback = face;
     }
 
     pub fn cache(self: *FontSet, s: Style) *atlas.GlyphCache {
-        return &self.caches[@intFromEnum(slotFor(s))];
+        return &self.caches[@backingInt(slotFor(s))];
     }
 };
 

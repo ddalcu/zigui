@@ -1,5 +1,5 @@
 //! SDL_GPU backend: renders a `Canvas` command list on the GPU (Metal on
-//! macOS, Vulkan on Linux/Windows, D3D12 once DXIL blobs are added) through
+//! macOS, Direct3D 12 or Vulkan on Windows, Vulkan on Linux) through
 //! SDL3's GPU API — no dependencies beyond the SDL3 the runtime already links.
 //!
 //! All the interesting decisions are made headlessly in
@@ -19,7 +19,9 @@
 //!
 //! The frame is rendered into an offscreen scene texture (so blur can sample
 //! it) and blitted to the swapchain. Shaders ship as committed SPIR-V blobs
-//! (see shaders/compile.sh) plus MSL sources Metal compiles at runtime.
+//! (see shaders/compile.sh) plus MSL sources Metal compiles at runtime and
+//! HLSL sources compiled at runtime to DXBC for Direct3D 12 (Windows only,
+//! via the system's d3dcompiler_47.dll).
 //!
 //! Output matches the software rasterizer to within 1 LSB per channel, with
 //! one caveat: GPU rasterizers snap vertex edges to a fixed subpixel grid
@@ -32,6 +34,7 @@
 //! never compiled into the core library or its test suite.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zigui = @import("zigui");
 const scene_mod = zigui.gpu_scene;
 
@@ -48,6 +51,97 @@ const blur_h_frag_spv = @embedFile("shaders/blur_h.frag.spv");
 const blur_v_frag_spv = @embedFile("shaders/blur_v.frag.spv");
 const prim_msl = @embedFile("shaders/prim.metal");
 const blur_msl = @embedFile("shaders/blur.metal");
+const prim_hlsl = @embedFile("shaders/prim.hlsl");
+const blur_hlsl = @embedFile("shaders/blur.hlsl");
+
+const is_windows = builtin.os.tag == .windows;
+/// COM/Win32 calling convention; plain C elsewhere so the (Windows-only)
+/// D3DCompile types still compile on every target.
+const winapi: std.builtin.CallingConvention = if (is_windows) .winapi else .c;
+
+/// The shader formats we can supply. SDL picks the first backend (Metal,
+/// then D3D12, then Vulkan) that accepts one of them, so on Windows D3D12 is
+/// preferred and Vulkan is the fallback.
+const shader_formats: c.SDL_GPUShaderFormat = c.SDL_GPU_SHADERFORMAT_SPIRV |
+    c.SDL_GPU_SHADERFORMAT_MSL |
+    (if (is_windows) c.SDL_GPU_SHADERFORMAT_DXBC else 0);
+
+/// Runtime HLSL → DXBC (shader model 5.1) compiler for SDL's Direct3D 12
+/// backend: `D3DCompile` from d3dcompiler_47.dll, which ships with Windows 10+
+/// — the D3D12 equivalent of Metal compiling the .metal sources at runtime.
+/// Loaded dynamically so there is no import-library dependency.
+const HlslCompiler = struct {
+    lib: *c.SDL_SharedObject,
+    compile: D3DCompileFn,
+
+    /// ID3DBlob: only the IUnknown + buffer accessors we call.
+    const Blob = extern struct {
+        vtbl: *const extern struct {
+            QueryInterface: *const anyopaque,
+            AddRef: *const fn (*Blob) callconv(winapi) u32,
+            Release: *const fn (*Blob) callconv(winapi) u32,
+            GetBufferPointer: *const fn (*Blob) callconv(winapi) [*]const u8,
+            GetBufferSize: *const fn (*Blob) callconv(winapi) usize,
+        },
+
+        fn bytes(self: *Blob) []const u8 {
+            return self.vtbl.GetBufferPointer(self)[0..self.vtbl.GetBufferSize(self)];
+        }
+        fn release(self: *Blob) void {
+            _ = self.vtbl.Release(self);
+        }
+    };
+
+    const D3DCompileFn = *const fn (
+        src: [*]const u8,
+        src_len: usize,
+        source_name: ?[*:0]const u8,
+        defines: ?*const anyopaque,
+        include: ?*anyopaque,
+        entry: [*:0]const u8,
+        target: [*:0]const u8,
+        flags1: u32,
+        flags2: u32,
+        code: *?*Blob,
+        errors: *?*Blob,
+    ) callconv(winapi) i32;
+
+    const D3DCOMPILE_OPTIMIZATION_LEVEL3: u32 = 1 << 15;
+
+    fn load() ?HlslCompiler {
+        const lib = c.SDL_LoadObject("d3dcompiler_47.dll") orelse {
+            std.log.info("zigui: d3dcompiler_47.dll not found ({s})", .{c.SDL_GetError()});
+            return null;
+        };
+        const f = c.SDL_LoadFunction(lib, "D3DCompile") orelse {
+            c.SDL_UnloadObject(lib);
+            return null;
+        };
+        return .{ .lib = lib, .compile = @ptrCast(@alignCast(f)) };
+    }
+
+    fn unload(self: HlslCompiler) void {
+        c.SDL_UnloadObject(self.lib);
+    }
+
+    /// Compile one entry point; the caller releases the returned blob after
+    /// handing its bytes to SDL (which copies them).
+    fn compileEntry(self: HlslCompiler, src: []const u8, entry: [:0]const u8, stage: c.SDL_GPUShaderStage) ?*Blob {
+        const target: [*:0]const u8 = if (stage == c.SDL_GPU_SHADERSTAGE_VERTEX) "vs_5_1" else "ps_5_1";
+        var code: ?*Blob = null;
+        var errors: ?*Blob = null;
+        const hr = self.compile(src.ptr, src.len, entry.ptr, null, null, entry.ptr, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+        if (errors) |e| {
+            if (hr < 0) std.log.err("zigui: HLSL {s}: {s}", .{ entry, e.bytes() });
+            e.release();
+        }
+        if (hr < 0) {
+            if (code) |b| b.release();
+            return null;
+        }
+        return code;
+    }
+};
 
 /// Uniform block for both blur fragment shaders; layout must match the `Blur`
 /// block in blur_h.frag / blur_v.frag / blur.metal (seven float4s, std140).
@@ -99,11 +193,19 @@ pub const Gpu = struct {
     /// suitable GPU backend exists — the caller falls back to the software
     /// rasterizer.
     pub fn init(gpa: Allocator, window: ?*c.SDL_Window) ?Gpu {
-        const device = c.SDL_CreateGPUDevice(
-            c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_MSL,
-            false,
-            null,
-        ) orelse {
+        if (initWith(gpa, window, shader_formats)) |g| return g;
+        // If D3D12 was chosen but couldn't build its pipelines (say, HLSL
+        // failed to compile on this machine), try again without DXBC so a
+        // working Vulkan driver still gets used before the software fallback.
+        if (is_windows) {
+            std.log.info("zigui: retrying the GPU backend without Direct3D 12", .{});
+            return initWith(gpa, window, shader_formats & ~@as(c.SDL_GPUShaderFormat, c.SDL_GPU_SHADERFORMAT_DXBC));
+        }
+        return null;
+    }
+
+    fn initWith(gpa: Allocator, window: ?*c.SDL_Window, formats: c.SDL_GPUShaderFormat) ?Gpu {
+        const device = c.SDL_CreateGPUDevice(formats, false, null) orelse {
             std.log.info("zigui: no GPU backend ({s}); using the software rasterizer", .{c.SDL_GetError()});
             return null;
         };
@@ -164,13 +266,16 @@ pub const Gpu = struct {
     const ShaderDesc = struct {
         spv: []const u8,
         msl: []const u8,
-        msl_entry: [:0]const u8,
+        hlsl: []const u8,
+        /// The entry point name, shared by the MSL and HLSL sources (SPIR-V
+        /// always uses "main").
+        entry: [:0]const u8,
         stage: c.SDL_GPUShaderStage,
         num_samplers: u32 = 0,
         num_uniform_buffers: u32 = 0,
     };
 
-    fn createShader(self: *Gpu, desc: ShaderDesc) ?*c.SDL_GPUShader {
+    fn createShader(self: *Gpu, desc: ShaderDesc, hlsl: ?HlslCompiler) ?*c.SDL_GPUShader {
         const formats = c.SDL_GetGPUShaderFormats(self.device);
         var info = c.SDL_GPUShaderCreateInfo{
             .stage = desc.stage,
@@ -185,11 +290,21 @@ pub const Gpu = struct {
             info.code = desc.spv.ptr;
             info.code_size = desc.spv.len;
             info.entrypoint = "main";
+        } else if (formats & c.SDL_GPU_SHADERFORMAT_DXBC != 0) {
+            const compiler = hlsl orelse return null;
+            const blob = compiler.compileEntry(desc.hlsl, desc.entry, desc.stage) orelse return null;
+            defer blob.release();
+            const bytes = blob.bytes();
+            info.format = c.SDL_GPU_SHADERFORMAT_DXBC;
+            info.code = bytes.ptr;
+            info.code_size = bytes.len;
+            info.entrypoint = desc.entry.ptr;
+            return c.SDL_CreateGPUShader(self.device, &info);
         } else {
             info.format = c.SDL_GPU_SHADERFORMAT_MSL;
             info.code = desc.msl.ptr;
             info.code_size = desc.msl.len;
-            info.entrypoint = desc.msl_entry.ptr;
+            info.entrypoint = desc.entry.ptr;
         }
         return c.SDL_CreateGPUShader(self.device, &info);
     }
@@ -210,47 +325,56 @@ pub const Gpu = struct {
 
     fn createPipelines(self: *Gpu) bool {
         const d = self.device;
+        // D3D12 only: load the HLSL compiler for the duration of shader setup.
+        const hlsl: ?HlslCompiler = if (is_windows and
+            c.SDL_GetGPUShaderFormats(d) & c.SDL_GPU_SHADERFORMAT_DXBC != 0) HlslCompiler.load() else null;
+        defer if (hlsl) |h| h.unload();
         const prim_vert = self.createShader(.{
             .spv = prim_vert_spv,
             .msl = prim_msl,
-            .msl_entry = "prim_vertex",
+            .hlsl = prim_hlsl,
+            .entry = "prim_vertex",
             .stage = c.SDL_GPU_SHADERSTAGE_VERTEX,
             .num_uniform_buffers = 1,
-        }) orelse return false;
+        }, hlsl) orelse return false;
         defer c.SDL_ReleaseGPUShader(d, prim_vert);
         const prim_frag = self.createShader(.{
             .spv = prim_frag_spv,
             .msl = prim_msl,
-            .msl_entry = "prim_fragment",
+            .hlsl = prim_hlsl,
+            .entry = "prim_fragment",
             .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT,
             .num_samplers = 1,
-        }) orelse return false;
+        }, hlsl) orelse return false;
         defer c.SDL_ReleaseGPUShader(d, prim_frag);
         const quad_vert = self.createShader(.{
             .spv = quad_vert_spv,
             .msl = blur_msl,
-            .msl_entry = "quad_vertex",
+            .hlsl = blur_hlsl,
+            .entry = "quad_vertex",
             .stage = c.SDL_GPU_SHADERSTAGE_VERTEX,
             .num_uniform_buffers = 1,
-        }) orelse return false;
+        }, hlsl) orelse return false;
         defer c.SDL_ReleaseGPUShader(d, quad_vert);
         const blur_h_frag = self.createShader(.{
             .spv = blur_h_frag_spv,
             .msl = blur_msl,
-            .msl_entry = "blur_h_fragment",
+            .hlsl = blur_hlsl,
+            .entry = "blur_h_fragment",
             .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT,
             .num_samplers = 1,
             .num_uniform_buffers = 1,
-        }) orelse return false;
+        }, hlsl) orelse return false;
         defer c.SDL_ReleaseGPUShader(d, blur_h_frag);
         const blur_v_frag = self.createShader(.{
             .spv = blur_v_frag_spv,
             .msl = blur_msl,
-            .msl_entry = "blur_v_fragment",
+            .hlsl = blur_hlsl,
+            .entry = "blur_v_fragment",
             .stage = c.SDL_GPU_SHADERSTAGE_FRAGMENT,
             .num_samplers = 1,
             .num_uniform_buffers = 1,
-        }) orelse return false;
+        }, hlsl) orelse return false;
         defer c.SDL_ReleaseGPUShader(d, blur_v_frag);
 
         // Nine float4 per-instance attributes; one buffer at instance rate.

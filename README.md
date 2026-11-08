@@ -151,8 +151,9 @@ zig build test --summary all
 zig build docs            # API docs into zig-out/docs
 ```
 
-Run the demo apps (require SDL3 — `brew install sdl3` on macOS,
-`apt install libsdl3-dev` on Linux):
+Run the demo apps. SDL3 is a Zig package dependency (castholm/SDL), fetched and
+compiled from source on first build and linked statically — nothing to install
+but Zig. (`-Dsdl3-prefix=<dir>` links a prebuilt SDL3 instead.)
 
 ```sh
 zig build run-showcase               # the kitchen-sink gallery: every component,
@@ -163,6 +164,21 @@ zig build showcase edit              # build the examples without running them
 # Render one frame to a BMP without a window (great for screenshots / CI);
 # add --gpu to render it through the real GPU pipeline instead:
 ./zig-out/bin/showcase --screenshot out.bmp [section] [--dark] [--accent N] [--gpu]
+```
+
+The Makefile provides optional convenience targets that wrap `zig build` for each
+supported target triple. `zig build` remains the primary build interface.
+
+```sh
+make demo                            # build (ReleaseFast) + launch the showcase
+make windows | linux | linux-arm64 | macos-arm64   # cross-build both examples
+                                     # into zig-out/<target>/bin (`make cross` = all)
+                                     # Windows builds are GUI apps (no console);
+                                     # add -Dwindows-console=true to see logs
+                                     # App icon: assets/icon/zigz.svg; regenerate the
+                                     # .ico/.png with tools/icon/mkico.py
+                                     # Linux: run `showcase --install-desktop` once so
+                                     # GNOME/Wayland shows the icon (adds a .desktop entry)
 ```
 
 > If the software fallback is in use, run with `-Doptimize=ReleaseFast` for

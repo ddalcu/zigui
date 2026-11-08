@@ -5,3 +5,4 @@ zig-out/
 *.a
 .DS_Store
 tools/parity/refgallery
+zig-pkg/

@@ -885,10 +885,10 @@ fn richCached(arena: Allocator, spans: []const richtext.Span, faces: richtext.Fa
     var h = std.hash.Wyhash.init(0x51c4);
     for (spans) |sp| {
         h.update(sp.text);
-        const style = [_]u32{ if (sp.weight) |w| @intFromEnum(w) + 1 else 0, @intFromBool(sp.italic), @intFromBool(sp.mono), @bitCast(sp.size_scale), @intCast(sp.text.len) };
+        const style = [_]u32{ if (sp.weight) |w| @backingInt(w) + 1 else 0, @intFromBool(sp.italic), @intFromBool(sp.mono), @bitCast(sp.size_scale), @intCast(sp.text.len) };
         h.update(std.mem.asBytes(&style));
     }
-    const rest = [_]u32{ @bitCast(px), @bitCast(mult), @intFromFloat(@max(0, @min(1.0e9, @round(max_w)))), @intFromBool(pre), @intFromEnum(faces.base_weight), @intFromBool(faces.fonts != null) };
+    const rest = [_]u32{ @bitCast(px), @bitCast(mult), @intFromFloat(@max(0, @min(1.0e9, @round(max_w)))), @intFromBool(pre), @backingInt(faces.base_weight), @intFromBool(faces.fonts != null) };
     h.update(std.mem.asBytes(&rest));
     const k = h.final();
     if (wc.rich.get(k)) |e| {

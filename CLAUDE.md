@@ -11,7 +11,9 @@ implemented. User-facing docs live in [README.md](README.md); design rationale i
 `zigui` is a SwiftUI-like UI library in **pure Zig 0.17**. The core (geometry,
 color, state, layout, theme, text, canvas, software rasterizer, GPU scene
 translation, view layer, components) has **no C dependencies** and is fully
-unit-tested headlessly. SDL3 links only into example executables (`src/app.zig`
+unit-tested headlessly. SDL3 is a **lazy Zig package** (castholm/SDL in
+`build.zig.zon`, built from source and statically linked — no system install;
+`-Dsdl3-prefix` overrides) and links only into example executables (`src/app.zig`
 + `src/gpu/gpu.zig`). On screen, rendering is **GPU-accelerated via SDL_GPU**
 (Metal on macOS, Vulkan on Linux/Windows) with an automatic fallback to the
 **CPU software rasterizer** presented through an SDL streaming texture — both
@@ -30,6 +32,8 @@ seams each one uses.
 zig build test --summary all                # 169 tests, headless. THIS is the inner loop.
 zig build showcase edit                      # build the two examples (does NOT run them)
 zig build run-showcase                       # opens a window — blocks on the event loop
+make demo                                    # same, ReleaseFast (SDL3 fetched/built by Zig)
+make windows|linux|linux-arm64|macos-arm64   # cross-build examples → zig-out/<target>/bin
 docker build -t zigui-test .                 # run the full suite on Linux
 
 # Headless UI iteration (renders one frame to a BMP, no window):
@@ -110,7 +114,7 @@ app.zig (SDL3): build → render → (GPU encode | framebuffer upload) → prese
 | `src/render/canvas.zig` | `DrawCommand` union + `Canvas` builder. The renderer-agnostic seam. |
 | `src/render/raster.zig` | `Framebuffer` + software rasterizer (SDF AA). Where new draw primitives get pixels. |
 | `src/render/gpu_scene.zig` | Pure GPU scene translation: `DrawCommand`s → packed `Instance` array + shelf-packed glyph/image `Atlas` + `Step` list (draw runs split at blurs). Headless-tested; no C. |
-| `src/gpu/gpu.zig` | The SDL_GPU shell (app layer, links C like `app.zig`): device/pipelines/textures, replays a translated `Scene`, offscreen `renderToRgba` for verification. Shaders in `src/gpu/shaders/` (GLSL→committed SPIR-V via `compile.sh`, plus runtime-compiled MSL twins). |
+| `src/gpu/gpu.zig` | The SDL_GPU shell (app layer, links C like `app.zig`): device/pipelines/textures, replays a translated `Scene`, offscreen `renderToRgba` for verification. Shaders in `src/gpu/shaders/` (GLSL→committed SPIR-V via `compile.sh`, plus runtime-compiled MSL and HLSL twins). |
 | `src/text/*` | `ttf` (parser+rasterizer), `atlas` (`GlyphCache`), `shape` (measure/wrap), `font` (`drawText`). |
 | `src/theme/theme.zig` | `Theme`, `Palette`, `Metrics`, `Typography`, and the **`Painter`** vtable + `Surface`/`ControlState`/`Role`. The color-scheme/painter vocabulary. |
 | `src/theme/{macos,win2000,windows10,kde,mui}.zig` | The five built-in theme families: each exports `light`/`dark` `Theme` values and a `Painter` impl drawing that family's chrome (liquid glass / bevels / flat / Breeze / Material). |
@@ -179,10 +183,9 @@ exercises nav + tabs + sheet + material + a11y together; `examples/showcase`
 demos them in a real window. Notes below record *how* each is wired and the
 deliberate deviations from the original plan, so you can extend safely.
 
-### GPU backend — SDL_GPU (Metal/Vulkan) with software fallback
-On-screen rendering now goes through **SDL3's GPU API** (Metal on macOS, Vulkan
-on Linux/Windows; D3D12 needs DXIL blobs, a follow-up — Windows uses its Vulkan
-driver meanwhile), replacing the framebuffer-upload present path while keeping
+### GPU backend — SDL_GPU (Metal/D3D12/Vulkan) with software fallback
+On-screen rendering now goes through **SDL3's GPU API** (Metal on macOS,
+Direct3D 12 on Windows with Vulkan as its fallback, Vulkan on Linux), replacing the framebuffer-upload present path while keeping
 it as the automatic fallback (`Config.gpu = false` or `ZIGUI_SOFTWARE=1` forces
 it; device/swapchain failure falls back silently). No new dependencies: the C
 surface is `src/gpu/gpu.zig`, owned by `app.zig`, sharing its `@cImport`.
@@ -213,11 +216,20 @@ The split keeps the repo's testing philosophy intact:
   scene texture, then `SDL_BlitGPUTexture` to the swapchain.
 - **Shaders** in `src/gpu/shaders/`: GLSL sources compiled to **committed
   SPIR-V blobs** by `compile.sh` (needs `glslc`; only when shaders change) and
-  hand-written **MSL twins** compiled by Metal at runtime — keep both in sync.
+  hand-written **MSL twins** compiled by Metal at runtime, and **HLSL twins**
+  (`prim.hlsl`/`blur.hlsl`) compiled on Windows at runtime to DXBC SM5.1 via
+  `D3DCompile` from the system's `d3dcompiler_47.dll` (loaded with
+  `SDL_LoadObject`; no build-time toolchain) — keep all three in sync.
   SDL_GPU binding conventions: SPIR-V vertex uniforms `set=1`, fragment
   textures `set=2`, fragment uniforms `set=3`; MSL uses `[[stage_in]]` +
-  `[[buffer(0)]]`/`[[texture(0)]]`. NDC is +Y-up on **all** backends (SDL
-  converts for Vulkan), so both sources share the same `-ndc.y` flip.
+  `[[buffer(0)]]`/`[[texture(0)]]`; HLSL uses vertex inputs `TEXCOORD<location>`,
+  vertex cbuffer `(b0, space1)`, pixel `t0`/`s0` in `space2`, pixel cbuffer
+  `(b0, space3)`, and `SampleLevel(…, 0)` (legal in divergent branches/loops).
+  NDC is +Y-up on **all** backends (SDL converts for Vulkan), so every source
+  shares the same `-ndc.y` flip. SDL tries Metal → D3D12 → Vulkan; if D3D12's
+  pipelines fail to build, `Gpu.init` retries without DXBC (Vulkan) before
+  falling back to software. Verify D3D12 on a Windows box with
+  `showcase.exe --gpu --screenshot` (cross-build: `make windows`).
 
 Output parity: verified pixel-identical to the rasterizer (max 1 LSB/channel)
 across every showcase section, dark mode, all theme families, sheets/alerts,
@@ -597,7 +609,7 @@ Powers `examples/edit` (a TextEdit/gedit-like editor); all headless-tested.
 - Colors always go through `multiplyAlpha(ctx.opacity)` when painting.
 - New shapes/effects: add a `DrawCommand` and handle it in **both** backends —
   the software rasterizer (`render/raster.zig`) and the GPU path
-  (`render/gpu_scene.zig` + the shaders in `src/gpu/shaders/`, GLSL **and** MSL,
+  (`render/gpu_scene.zig` + the shaders in `src/gpu/shaders/`, GLSL, MSL **and** HLSL,
   then re-run `compile.sh`) — keeping command semantics backend-neutral. Verify
   with `showcase --screenshot --gpu` diffed against the software BMP.
 - Run `zig build test` after every change; keep it green.

@@ -1,0 +1,4 @@
+// The app icon, embedded into the Windows examples by build.zig
+// (addWin32ResourceFile). SDL also picks it up for the window class icon.
+// Regenerate zigz.ico with tools/icon/mkico.py after editing zigz.svg.
+1 ICON "zigz.ico"

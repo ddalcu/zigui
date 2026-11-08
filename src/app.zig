@@ -43,6 +43,13 @@ pub const Config = struct {
     /// is created. `rgba` is row-major RGBA8 (`w*h*4` bytes); the surface is
     /// copied by SDL, so the caller may free `rgba` after `run` sets it.
     icon: ?WindowIcon = null,
+    /// Optional window/taskbar icon as PNG bytes (e.g. `@embedFile` of a
+    /// 256 px PNG), decoded with SDL's built-in loader — the icon on macOS
+    /// (the Dock) and Linux (X11 / Wayland window icon). On Windows an icon
+    /// resource embedded in the .exe wins, since it carries every size and
+    /// SDL already uses it for the window; `icon_png` is the fallback there.
+    /// Ignored when `icon` is set.
+    icon_png: ?[]const u8 = null,
     /// Supersampling factor: the UI is rendered into a framebuffer this many
     /// times larger per axis, then downscaled on present (SSAA). On a low-DPI
     /// (100%) display this is what makes text crisp — gamma adds weight, but
@@ -689,6 +696,104 @@ fn trayThunk(userdata: ?*anyopaque, entry: ?*c.SDL_TrayEntry) callconv(.c) void 
 
 /// Build an `SDL_Surface` from row-major RGBA8 pixels (the format zigui's
 /// `Framebuffer.toRgba8Alloc` produces). Returns null on failure.
+/// Give the C library a UTF-8 character-type locale before SDL talks to the
+/// display. Unix processes start in the "C" locale, and on X11 (which SDL
+/// also picks under GNOME/XWayland) the legacy WM_NAME title goes through
+/// Xlib's locale conversion: in "C" the UTF-8 bytes of "zigui — Showcase" are
+/// stored as Latin-1 and the title bar shows "zigui â\u{80}\u{94} Showcase".
+/// Only LC_CTYPE is touched (as GTK/Qt apps do), so number formatting and
+/// collation stay "C". Uses the user's locale, else C.UTF-8. No-op off
+/// Linux/BSD.
+fn useUtf8Locale() void {
+    switch (builtin.os.tag) {
+        .linux, .freebsd, .openbsd, .netbsd, .dragonfly => {},
+        else => return,
+    }
+    if (std.c.setlocale(.CTYPE, "")) |name| {
+        const n = std.mem.span(name);
+        if (std.ascii.findIgnoreCase(n, "utf-8") != null or std.ascii.findIgnoreCase(n, "utf8") != null) return;
+    }
+    _ = std.c.setlocale(.CTYPE, "C.UTF-8");
+}
+
+/// Linux desktop integration: install a freedesktop entry for the running
+/// executable — `$XDG_DATA_HOME/applications/<exe>.desktop` (default
+/// `~/.local/share`) plus the icon at `icons/hicolor/256x256/apps/<exe>.png`.
+///
+/// Why: on Wayland a runtime window icon (`Config.icon_png`) needs the
+/// `xdg_toplevel_icon_v1` protocol, which KDE Plasma supports but GNOME does
+/// not; GNOME instead matches the window's app ID — SDL uses the executable
+/// name — to a .desktop file and shows *its* icon (Dock, Activities, Alt-Tab).
+/// The entry also puts the app in the launcher. Returns false off Linux or on
+/// any I/O failure (logged). Re-run after moving the executable.
+pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
+    if (builtin.os.tag != .linux) return false;
+    var exe_buf: [4096]u8 = undefined;
+    const n = std.c.readlink("/proc/self/exe", &exe_buf, exe_buf.len);
+    if (n <= 0) return false;
+    const exe = exe_buf[0..@intCast(n)];
+    // SDL's default app ID is the executable's basename; match it.
+    const id = exe[(std.mem.lastIndexOfScalar(u8, exe, '/') orelse return false) + 1 ..];
+
+    var data_buf: [4096]u8 = undefined;
+    const data_dir: []const u8 = if (c.SDL_getenv("XDG_DATA_HOME")) |x|
+        std.mem.span(x)
+    else if (c.SDL_getenv("HOME")) |h|
+        std.fmt.bufPrint(&data_buf, "{s}/.local/share", .{std.mem.span(h)}) catch return false
+    else
+        return false;
+
+    var path_buf: [4096]u8 = undefined;
+    var icon_buf: [4096]u8 = undefined;
+    const icon_dir = std.fmt.bufPrintSentinel(&path_buf, "{s}/icons/hicolor/256x256/apps", .{data_dir}, 0) catch return false;
+    if (!c.SDL_CreateDirectory(icon_dir.ptr)) return logInstallError(icon_dir);
+    const icon_path = std.fmt.bufPrintSentinel(&icon_buf, "{s}/{s}.png", .{ icon_dir, id }, 0) catch return false;
+    if (!c.SDL_SaveFile(icon_path.ptr, icon_png.ptr, icon_png.len)) return logInstallError(icon_path);
+
+    const app_dir = std.fmt.bufPrintSentinel(&path_buf, "{s}/applications", .{data_dir}, 0) catch return false;
+    if (!c.SDL_CreateDirectory(app_dir.ptr)) return logInstallError(app_dir);
+    var entry_buf: [8192]u8 = undefined;
+    // Exec is quoted so paths with spaces work; Icon is the absolute path so
+    // no icon-theme cache refresh is needed. StartupWMClass ties X11 windows
+    // to the entry too (Wayland matches by file name = app ID).
+    const entry = std.fmt.bufPrint(&entry_buf,
+        \\[Desktop Entry]
+        \\Type=Application
+        \\Name={s}
+        \\Exec="{s}"
+        \\Icon={s}
+        \\StartupWMClass={s}
+        \\Terminal=false
+        \\Categories=Utility;
+        \\
+    , .{ name, exe, icon_path, id }) catch return false;
+    var desk_buf: [4096]u8 = undefined;
+    const desk_path = std.fmt.bufPrintSentinel(&desk_buf, "{s}/{s}.desktop", .{ app_dir, id }, 0) catch return false;
+    if (!c.SDL_SaveFile(desk_path.ptr, entry.ptr, entry.len)) return logInstallError(desk_path);
+    std.log.info("zigui: installed {s} (icon {s})", .{ desk_path, icon_path });
+    return true;
+}
+
+fn logInstallError(path: []const u8) bool {
+    std.log.err("zigui: cannot write {s} ({s})", .{ path, c.SDL_GetError() });
+    return false;
+}
+
+/// Whether this Windows .exe embeds an icon resource (RT_GROUP_ICON id 1, as
+/// assets/icon/zigui.rc declares). SDL registers its window class with that
+/// icon at every size, so a single-image `SDL_SetWindowIcon` would only make
+/// it worse. Always false elsewhere.
+fn hasIconResource() bool {
+    if (builtin.os.tag != .windows) return false;
+    const k32 = struct {
+        // Resource names/types are passed as MAKEINTRESOURCE integers.
+        extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn FindResourceW(module: ?*anyopaque, name: usize, kind: usize) callconv(.winapi) ?*anyopaque;
+    };
+    const rt_group_icon: usize = 14;
+    return k32.FindResourceW(k32.GetModuleHandleW(null), 1, rt_group_icon) != null;
+}
+
 fn makeSurface(rgba: []const u8, w: c_int, h: c_int) ?*c.SDL_Surface {
     const surf = c.SDL_CreateSurface(w, h, c.SDL_PIXELFORMAT_ABGR8888) orelse return null;
     const uw: usize = @intCast(w);
@@ -770,6 +875,7 @@ pub const Tray = struct {
     /// initialized if it isn't already (idempotent), so this may be called
     /// before `run`.
     pub fn create(gpa: std.mem.Allocator, rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8) !Tray {
+        useUtf8Locale();
         _ = c.SDL_Init(c.SDL_INIT_VIDEO);
         const surf = makeSurface(rgba, w, h) orelse return Error.TrayInit;
         const handle = c.SDL_CreateTray(surf, tooltip.ptr) orelse {
@@ -843,6 +949,7 @@ pub const Tray = struct {
 /// macOS the icon shows at half its pixel size in points (36 px → 18 pt, the
 /// usual menu-bar glyph).
 pub fn createStatusItem(rgba: []const u8, w: c_int, h: c_int, tooltip: [:0]const u8, on_click: zigui.Callback) bool {
+    useUtf8Locale();
     _ = c.SDL_Init(c.SDL_INIT_VIDEO);
     switch (builtin.os.tag) {
         .macos => return cocoa.createStatusItem(rgba, w, h, tooltip, on_click),
@@ -897,6 +1004,7 @@ pub fn run(
     // A hide-to-tray app must not quit when its last visible window is closed:
     // SDL would send SDL_EVENT_QUIT itself, before our close handler hides it.
     if (cfg.hide_on_close) _ = c.SDL_SetHint(c.SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+    useUtf8Locale();
     if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
         std.log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
         return Error.SdlInit;
@@ -928,6 +1036,14 @@ pub fn run(
         if (makeSurface(ic.rgba, ic.w, ic.h)) |surf| {
             _ = c.SDL_SetWindowIcon(window, surf);
             c.SDL_DestroySurface(surf);
+        }
+    } else if (cfg.icon_png) |bytes| {
+        if (!hasIconResource()) {
+            const io = c.SDL_IOFromConstMem(bytes.ptr, bytes.len);
+            if (c.SDL_LoadPNG_IO(io, true)) |surf| {
+                _ = c.SDL_SetWindowIcon(window, surf);
+                c.SDL_DestroySurface(surf);
+            } else std.log.info("zigui: icon_png not loaded ({s})", .{c.SDL_GetError()});
         }
     }
 
@@ -1631,7 +1747,17 @@ const cocoa = struct {
         return @call(.auto, f, .{
             target,
             sel_registerName("initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bitmapFormat:bytesPerRow:bitsPerPixel:"),
-            planes, w, h, bps, spp, alpha, planar, cs, fmt, bpr, bpp,
+            planes,
+            w,
+            h,
+            bps,
+            spp,
+            alpha,
+            planar,
+            cs,
+            fmt,
+            bpr,
+            bpp,
         });
     }
 

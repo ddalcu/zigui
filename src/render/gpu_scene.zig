@@ -293,14 +293,14 @@ pub fn translate(
                         inst.pos = paddedQuad(f.rect, 1);
                         inst.shape = rectArr(f.rect);
                         inst.color0 = colorArr(f.color);
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.fill));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.fill));
                         inst.params[1] = f.radius;
                     },
                     .stroke_rrect => |s| {
                         inst.pos = paddedQuad(s.rect, s.width / 2 + 1);
                         inst.shape = rectArr(s.rect);
                         inst.color0 = colorArr(s.color);
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.stroke));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.stroke));
                         inst.params[1] = s.radius;
                         inst.params[2] = s.width / 2;
                     },
@@ -310,7 +310,7 @@ pub fn translate(
                         inst.color0 = colorArr(g.c0);
                         inst.color1 = colorArr(g.c1);
                         inst.ab = .{ g.start.x, g.start.y, g.end.x, g.end.y };
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.gradient));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.gradient));
                         inst.params[1] = g.radius;
                     },
                     .line => |l| {
@@ -323,7 +323,7 @@ pub fn translate(
                         inst.pos = paddedQuad(bb, l.width / 2 + 1);
                         inst.color0 = colorArr(l.color);
                         inst.ab = .{ l.a.x, l.a.y, l.b.x, l.b.y };
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.line));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.line));
                         inst.params[2] = l.width / 2;
                     },
                     .glyph => |g| {
@@ -336,7 +336,7 @@ pub fn translate(
                             g.coverage.height,
                             try coverageToRgba(arena, g.coverage),
                         );
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.glyph));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.glyph));
                         // params[1] (unused by glyphs — no corner radius) carries
                         // the coverage gamma the fragment shader applies, matching
                         // the software rasterizer's `drawGlyph`.
@@ -351,7 +351,7 @@ pub fn translate(
                             im.image.height,
                             im.image.pixels,
                         );
-                        inst.params[0] = @floatFromInt(@intFromEnum(Kind.image));
+                        inst.params[0] = @floatFromInt(@backingInt(Kind.image));
                     },
                     else => unreachable,
                 }
@@ -409,7 +409,7 @@ test "gpu_scene: fill becomes one padded instance and one draw step" {
     const i = scene.instances[0];
     try testing.expectEqual([4]f32{ 9, 19, 32, 42 }, i.pos); // padded by 1
     try testing.expectEqual([4]f32{ 10, 20, 30, 40 }, i.shape);
-    try testing.expectEqual(@as(f32, @floatFromInt(@intFromEnum(Kind.fill))), i.params[0]);
+    try testing.expectEqual(@as(f32, @floatFromInt(@backingInt(Kind.fill))), i.params[0]);
     try testing.expectEqual(@as(f32, 5), i.params[1]);
     try testing.expectEqual(@as(usize, 1), scene.steps.len);
     try testing.expectEqual(@as(u32, 1), scene.steps[0].draw.count);

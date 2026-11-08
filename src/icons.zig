@@ -1881,7 +1881,7 @@ pub const Icon = enum(u21) {
     zoom_out = 0xE1B7,
 
     pub fn codepoint(self: Icon) u21 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

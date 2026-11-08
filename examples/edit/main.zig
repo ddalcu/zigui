@@ -587,6 +587,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             demo_drag = true;
         } else if (std.mem.eql(u8, a, "--dark")) {
             force_dark = true;
+        } else if (std.mem.eql(u8, a, "--install-desktop")) {
+            // Linux: add a launcher entry + icon (see app.installDesktopEntry).
+            if (!app.installDesktopEntry("zigui Editor", @embedFile("app_icon"))) return error.InstallFailed;
+            return;
         } else if (!std.mem.startsWith(u8, a, "-")) {
             open_path = a;
         }
@@ -632,5 +636,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .title = "zigui — Editor",
         .width = 880,
         .height = 600,
+        .icon_png = @embedFile("app_icon"),
     }, body, null);
 }

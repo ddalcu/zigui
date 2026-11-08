@@ -7,6 +7,7 @@
 //!
 //! Build with `zig build showcase` (run with `zig build run-showcase`).
 //! Headless: `showcase --screenshot <out.bmp> [section]` renders one frame.
+//! Linux: `showcase --install-desktop` adds a launcher entry with the icon.
 
 const std = @import("std");
 const zigui = @import("zigui");
@@ -858,6 +859,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
             st.show_popover.set(true);
         } else if (std.mem.eql(u8, a, "--menu")) {
             st.menu_open.set(true);
+        } else if (std.mem.eql(u8, a, "--install-desktop")) {
+            // Linux: add a launcher entry + icon (GNOME/Wayland shows the
+            // icon only through one). See app.installDesktopEntry.
+            if (!app.installDesktopEntry("zigui Showcase", @embedFile("app_icon"))) return error.InstallFailed;
+            return;
         } else {
             section = std.fmt.parseInt(i64, a, 10) catch section;
         }
@@ -870,5 +876,5 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return screenshot(alloc, &st, out, bench, use_gpu);
     }
 
-    try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660 }, body, null);
+    try app.run(alloc, AppState, &st, .{ .title = "zigui — Showcase", .width = 980, .height = 660, .icon_png = @embedFile("app_icon") }, body, null);
 }

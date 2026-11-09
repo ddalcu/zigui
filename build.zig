@@ -107,31 +107,47 @@ pub const AppOptions = struct {
 /// SDL3 (fetched lazily, on first use), libc and, on macOS, the Objective-C
 /// runtime. On the first configure SDL may not be fetched yet: the module is
 /// returned unlinked and the build reruns once the package is there.
+/// Pass `b.dependency("zigui", …)` the same target and optimize mode as
+/// `opts`: the core module is built for those, and the runtime for `opts`.
 ///
 ///     const zigui_dep = b.dependency("zigui", .{ .target = target, .optimize = optimize });
 ///     const app_mod = @import("zigui").linkApp(zigui_dep, .{ .target = target, .optimize = optimize });
 ///     exe.root_module.addImport("zigui", zigui_dep.module("zigui"));
 ///     exe.root_module.addImport("zigui_app", app_mod);
 pub fn linkApp(dep: *std.Build.Dependency, opts: AppOptions) *std.Build.Module {
-    const b = dep.builder;
+    const sdl: SdlConfig = .{ .prefix = opts.sdl3_prefix, .macos_sdk = opts.macos_sdk, .windows_console = false };
+    return appModule(dep.builder, dep.module("zigui"), opts.target, opts.optimize, sdl);
+}
+
+/// The SDL-linking runtime module (`src/app.zig`) over `zigui_mod`, shared by
+/// the examples and `linkApp`. SDL's headers come in through translate-c
+/// (`@cImport` is gone in Zig 0.17), importable as `sdl_c`.
+fn appModule(
+    b: *std.Build,
+    zigui_mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sdl: SdlConfig,
+) *std.Build.Module {
     const sdl_c = b.addTranslateC(.{
         .root_source_file = b.path("src/sdl_c.h"),
-        .target = opts.target,
-        .optimize = opts.optimize,
+        .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     const app_mod = b.createModule(.{
         .root_source_file = b.path("src/app.zig"),
-        .target = opts.target,
-        .optimize = opts.optimize,
+        .target = target,
+        .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "zigui", .module = dep.module("zigui") }},
+        .imports = &.{.{ .name = "zigui", .module = zigui_mod }},
     });
     app_mod.addImport("sdl_c", sdl_c.createModule());
-    const sdl: SdlConfig = .{ .prefix = opts.sdl3_prefix, .macos_sdk = opts.macos_sdk, .windows_console = false };
-    linkSdl3(b, app_mod, sdl_c, opts.target, opts.optimize, sdl);
-    if (opts.target.result.os.tag == .macos) {
-        if (opts.macos_sdk) |sdk| addMacosSdk(b, app_mod, sdk);
+    linkSdl3(b, app_mod, sdl_c, target, optimize, sdl);
+    // app.zig reaches AppKit (unified titlebar, menu bar, template tray icons)
+    // through the Objective-C runtime.
+    if (target.result.os.tag == .macos) {
+        if (sdl.macos_sdk) |sdk| addMacosSdk(b, app_mod, sdk);
         app_mod.linkSystemLibrary("objc", .{});
     }
     return app_mod;
@@ -154,29 +170,7 @@ fn addExample(
     name: []const u8,
     root_path: []const u8,
 ) void {
-    // The SDL-linking runtime module. SDL's headers come in through translate-c
-    // (`@cImport` is gone in Zig 0.17), importable as `sdl_c`.
-    const sdl_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/sdl_c.h"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const app_mod = b.createModule(.{
-        .root_source_file = b.path("src/app.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "zigui", .module = zigui_mod }},
-    });
-    app_mod.addImport("sdl_c", sdl_c.createModule());
-    linkSdl3(b, app_mod, sdl_c, target, optimize, sdl);
-    // app.zig reaches AppKit (unified titlebar, menu bar, template tray icons)
-    // through the Objective-C runtime.
-    if (target.result.os.tag == .macos) {
-        if (sdl.macos_sdk) |sdk| addMacosSdk(b, app_mod, sdk);
-        app_mod.linkSystemLibrary("objc", .{});
-    }
+    const app_mod = appModule(b, zigui_mod, target, optimize, sdl);
 
     // libc headers the examples use (stdio/time), via translate-c as `cstdio`.
     const cstdio = b.addTranslateC(.{

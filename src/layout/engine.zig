@@ -158,16 +158,15 @@ pub fn measure(node: Node, prop: Proposal) Size {
 /// minimum, a horizontal stack's children and gaps summed, the widest child
 /// of any other stack, padding added, and a fixed frame's width. A frame that
 /// only caps or fills the width does not lower its child's minimum (`arrange`
-/// still gives the child that much), and a measured leaf answers for a
-/// proposed width of zero (wrapped text: its longest word).
+/// still gives the child that much), and a measured leaf (wrapped text) is
+/// zero: it wraps, and reports no wider than it is offered.
 ///
 /// - `node`: the tree.
 /// - Returns: the width.
 pub fn minWidth(node: Node) f32 {
     return switch (node) {
         .leaf => |h| h.min.width,
-        .spacer => 0,
-        .measured => |m| m.measureFn(m.ctx, .{ .width = 0, .height = null }).width,
+        .spacer, .measured => 0,
         .padding => |p| minWidth(p.child.*) + p.insets.horizontal(),
         .frame => |f| f.width orelse @max(f.min_width orelse 0, minWidth(f.child.*)),
         .stack => |s| blk: {

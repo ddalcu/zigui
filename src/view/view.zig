@@ -1908,15 +1908,16 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
     // A sheet or alert whose content cannot be narrower than its usual width
     // (a wide segmented `Picker`) widens to it, as far as the window allows,
     // rather than being clipped at both edges.
+    const node = try buildNode(ctx, req.content);
     if (prop.width) |usual| {
-        const least = if (buildNode(ctx, req.content)) |node| engine.minWidth(node) else |_| 0;
+        const least = engine.minWidth(node);
         if (least > usual) prop.width = @max(usual, @min(least, root.width - 2 * popover_margin));
     }
-    var size = measure(ctx, req.content, prop) catch Size{};
+    var size = engine.measure(node, prop);
     // A popover wider than the window is narrowed to fit (its rows truncate),
     // not pushed past the edge.
     const max_w = root.width - 2 * popover_margin;
-    if (req.style == .popover and size.width > max_w) size = measure(ctx, req.content, .{ .width = max_w, .height = null }) catch size;
+    if (req.style == .popover and size.width > max_w) size = engine.measure(node, .{ .width = max_w, .height = null });
     const target = switch (req.style) {
         .sheet, .alert => centerRect(root, size),
         .popover => anchoredRect(root, req.anchor, size),

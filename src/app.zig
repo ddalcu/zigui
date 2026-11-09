@@ -786,8 +786,14 @@ pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
     return true;
 }
 
+/// Logs why `value` cannot go in a desktop entry. The value itself is left
+/// out: a control character in it would be written to the log raw.
 fn logUnwritable(what: []const u8, value: []const u8) bool {
-    std.log.err("zigui: no desktop entry: its {s} has a control character ({s})", .{ what, value });
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) {
+        std.log.err("zigui: no desktop entry: its {s} has a control character", .{what});
+        return false;
+    };
+    std.log.err("zigui: no desktop entry: its {s} is too long ({d} bytes)", .{ what, value.len });
     return false;
 }
 

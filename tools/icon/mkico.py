@@ -19,9 +19,10 @@ import re, struct, sys, zlib, os
 SS = 16  # supersamples per axis, for the small sizes
 
 def supersamples(size):
-    """Fewer samples as the size grows: a 1024 px icon at 16x16 would take
-    minutes in pure Python, and the larger sizes need less antialiasing."""
-    return max(2, min(SS, 2048 // size))
+    """Fewer samples above 256 px: a 1024 px icon at 16x16 would take minutes
+    in pure Python, and the larger sizes need less antialiasing. Up to 256 px
+    (the .ico and .png) it stays at SS, so those outputs don't change."""
+    return max(2, min(SS, 4096 // size))
 
 def parse(svg):
     vb = [float(v) for v in re.search(r'viewBox="([^"]+)"', svg).group(1).split()]

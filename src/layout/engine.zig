@@ -154,6 +154,33 @@ pub fn measure(node: Node, prop: Proposal) Size {
     return measureUncached(node, prop);
 }
 
+/// The narrowest `node` can be laid out without a child overflowing: a leaf's
+/// minimum, a horizontal stack's children and gaps summed, the widest child
+/// of any other stack, padding added, and a fixed frame's width. A frame that
+/// only caps or fills the width does not lower its child's minimum (`arrange`
+/// still gives the child that much), and a measured leaf (wrapped text) is
+/// zero: it wraps, and reports no wider than it is offered.
+///
+/// - `node`: the tree.
+/// - Returns: the width.
+pub fn minWidth(node: Node) f32 {
+    return switch (node) {
+        .leaf => |h| h.min.width,
+        .spacer, .measured => 0,
+        .padding => |p| minWidth(p.child.*) + p.insets.horizontal(),
+        .frame => |f| f.width orelse @max(f.min_width orelse 0, minWidth(f.child.*)),
+        .stack => |s| blk: {
+            var w: f32 = 0;
+            for (s.children) |child| {
+                const cw = if (child == .spacer and s.direction == .horizontal) child.spacer.min_length else minWidth(child);
+                w = if (s.direction == .horizontal) w + cw else @max(w, cw);
+            }
+            if (s.direction == .horizontal and s.children.len > 1) w += s.spacing * @as(f32, @floatFromInt(s.children.len - 1));
+            break :blk w;
+        },
+    };
+}
+
 fn measureUncached(node: Node, prop: Proposal) Size {
     return switch (node) {
         .leaf => |h| .{
@@ -448,6 +475,20 @@ test "a stack longer than 256 children lays out (heap scratch)" {
     for (kids) |*k| k.* = .{ .leaf = SizingHints.fixedSize(.{ .width = 10, .height = 2 }) };
     const sz = measure(.{ .stack = .{ .direction = .vertical, .spacing = 0, .children = kids } }, .{ .width = 100, .height = 1000 });
     try std.testing.expectEqual(@as(f32, 600), sz.height);
+}
+
+test "minWidth: sums a row, takes a column's widest, and sees through a filling frame" {
+    const wide = leaf(300, 10);
+    const row_kids = [_]Node{ leaf(50, 10), .{ .spacer = .{} }, leaf(70, 10) };
+    const row = Node{ .stack = .{ .direction = .horizontal, .spacing = 10, .children = &row_kids } };
+    try std.testing.expectEqual(@as(f32, 140), minWidth(row));
+    const filled = Node{ .frame = .{ .max_width = inf, .child = &wide } };
+    const col_kids = [_]Node{ row, filled };
+    const col = Node{ .stack = .{ .direction = .vertical, .spacing = 8, .children = &col_kids } };
+    const padded = Node{ .padding = .{ .insets = .{ .leading = 20, .trailing = 20 }, .child = &col } };
+    try std.testing.expectEqual(@as(f32, 340), minWidth(padded));
+    // A fixed frame is its width, whatever its child needs.
+    try std.testing.expectEqual(@as(f32, 120), minWidth(.{ .frame = .{ .width = 120, .child = &wide } }));
 }
 
 test "measure: leaf reports ideal when proposal unspecified" {

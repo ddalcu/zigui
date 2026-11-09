@@ -885,10 +885,10 @@ fn richCached(arena: Allocator, spans: []const richtext.Span, faces: richtext.Fa
     var h = std.hash.Wyhash.init(0x51c4);
     for (spans) |sp| {
         h.update(sp.text);
-        const style = [_]u32{ if (sp.weight) |w| @intFromEnum(w) + 1 else 0, @intFromBool(sp.italic), @intFromBool(sp.mono), @bitCast(sp.size_scale), @intCast(sp.text.len) };
+        const style = [_]u32{ if (sp.weight) |w| @backingInt(w) + 1 else 0, @intFromBool(sp.italic), @intFromBool(sp.mono), @bitCast(sp.size_scale), @intCast(sp.text.len) };
         h.update(std.mem.asBytes(&style));
     }
-    const rest = [_]u32{ @bitCast(px), @bitCast(mult), @intFromFloat(@max(0, @min(1.0e9, @round(max_w)))), @intFromBool(pre), @intFromEnum(faces.base_weight), @intFromBool(faces.fonts != null) };
+    const rest = [_]u32{ @bitCast(px), @bitCast(mult), @intFromFloat(@max(0, @min(1.0e9, @round(max_w)))), @intFromBool(pre), @backingInt(faces.base_weight), @intFromBool(faces.fonts != null) };
     h.update(std.mem.asBytes(&rest));
     const k = h.final();
     if (wc.rich.get(k)) |e| {
@@ -1900,16 +1900,24 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
 
     // 3. Measure & position the content. macOS sheets are *centered* window
     //    modals (they don't hug the bottom edge like iOS).
-    const prop: engine.Proposal = switch (req.style) {
+    var prop: engine.Proposal = switch (req.style) {
         .sheet => .{ .width = @min(root.width - 160, 480), .height = null },
         .alert => .{ .width = @min(root.width - 80, 320), .height = null },
         .popover => .unspecified,
     };
-    var size = measure(ctx, req.content, prop) catch Size{};
+    // A sheet or alert whose content cannot be narrower than its usual width
+    // (a wide segmented `Picker`) widens to it, as far as the window allows,
+    // rather than being clipped at both edges.
+    const node = try buildNode(ctx, req.content);
+    if (prop.width) |usual| {
+        const least = engine.minWidth(node);
+        if (least > usual) prop.width = @max(usual, @min(least, root.width - 2 * popover_margin));
+    }
+    var size = engine.measure(node, prop);
     // A popover wider than the window is narrowed to fit (its rows truncate),
     // not pushed past the edge.
     const max_w = root.width - 2 * popover_margin;
-    if (req.style == .popover and size.width > max_w) size = measure(ctx, req.content, .{ .width = max_w, .height = null }) catch size;
+    if (req.style == .popover and size.width > max_w) size = engine.measure(node, .{ .width = max_w, .height = null });
     const target = switch (req.style) {
         .sheet, .alert => centerRect(root, size),
         .popover => anchoredRect(root, req.anchor, size),
@@ -2301,7 +2309,9 @@ fn drawTextC(ctx: *const Context, canvas: *Canvas, text: []const u8, px: f32, co
 /// (returns `str` unchanged when it already fits). The clipped string is built in
 /// the per-frame arena. Used for `.truncated()` single-line Text.
 fn truncateToWidth(ctx: *const Context, str: []const u8, px: f32, max_w: f32) []const u8 {
-    if (shape.measureLineWidth(ctx.cache.face, str, px) <= max_w) return str;
+    // Layout hands a text exactly its measured width back, give or take float
+    // rounding, so a tolerance keeps a string that fits from losing its tail.
+    if (shape.measureLineWidth(ctx.cache.face, str, px) <= max_w + 0.01) return str;
     const ell = "…";
     const ell_w = shape.measureLineWidth(ctx.cache.face, ell, px);
     if (max_w <= ell_w) return ell; // no room even for the body — just the ellipsis
@@ -5070,6 +5080,41 @@ test "view: a Drawing paints into its frame" {
     try raster.render(testing.allocator, &fb, canvas.commands.items);
     try testing.expect(fb.at(5, 10).b > 0.9 and fb.at(5, 10).r < 0.1);
     try testing.expect(fb.at(35, 10).r > 0.9);
+}
+
+test "view: an alert widens to content that cannot be narrower" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+    var choice = state.State(i64).init(testing.allocator, 0);
+    defer choice.deinit();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 900, .height = 400 };
+    const options = [_][]const u8{ "A long first option", "A long second option", "A long third option", "Fourth" };
+    const picker = Picker(choice.binding(), &options);
+    const least = try measure(&c, picker, .{ .width = 0, .height = null });
+    try testing.expect(least.width > 320);
+    // A filling picker under a heading, padded: as a settings sheet is built.
+    const content = VStack(.{ Text("Settings"), picker.frameMaxWidth() }).alignment(.leading).padding(20);
+    const tree = Rectangle(Color.white).alert(presented.binding(), content);
+    endBuild();
+    try render(&c, tree, root, &canvas);
+    // The panel holds every segment: none reaches its clip, which is the panel.
+    var clip: ?Rect = null;
+    for (canvas.commands.items) |cmd| if (cmd == .push_clip) {
+        clip = cmd.push_clip.rect;
+    };
+    try testing.expect(clip.?.width >= least.width + 40 - 0.5);
+    try testing.expect(clip.?.x >= 0 and clip.?.maxX() <= root.width);
+    for (c.hit_regions.items) |region| if (region.action == .select) {
+        try testing.expect(region.rect.x >= clip.?.x - 0.5 and region.rect.maxX() <= clip.?.maxX() + 0.5);
+    };
 }
 
 test "view: popover content is positioned near its (top) anchor" {

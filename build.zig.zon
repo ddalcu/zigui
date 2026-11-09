@@ -1,6 +1,6 @@
 .{
     .name = .zigui,
-    .version = "0.2.1",
+    .version = "0.2.2",
     .fingerprint = 0x18d03e108d8c3c7e,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{

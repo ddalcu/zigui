@@ -81,8 +81,60 @@ pub fn build(b: *std.Build) void {
     // (log output, `--screenshot` messages) for debugging.
     const windows_console = b.option(bool, "windows-console", "Build Windows examples as console apps (shows log output)") orelse false;
     const sdl: SdlConfig = .{ .prefix = sdl3_prefix, .macos_sdk = macos_sdk, .windows_console = windows_console };
-    addExample(b, mod, target, optimize, sdl, "showcase", "examples/showcase/main.zig");
-    addExample(b, mod, target, optimize, sdl, "edit", "examples/edit/main.zig");
+    // The examples only when zigui is the root build: a package that depends
+    // on zigui reaches SDL through `linkApp` alone, so `b.dependency("zigui")`
+    // never fetches or builds SDL for a consumer that draws no window.
+    if (b.dep_prefix.len == 0) {
+        addExample(b, mod, target, optimize, sdl, "showcase", "examples/showcase/main.zig");
+        addExample(b, mod, target, optimize, sdl, "edit", "examples/edit/main.zig");
+    }
+}
+
+/// What `linkApp` builds the SDL runtime for.
+pub const AppOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// The macOS SDK root (`xcrun --show-sdk-path`), needed whenever macOS is
+    /// an explicit `-Dtarget`; null lets Zig probe the host's.
+    macos_sdk: ?[]const u8 = null,
+    /// A prebuilt SDL3 (`include/` and `lib/` inside) instead of the package.
+    sdl3_prefix: ?[]const u8 = null,
+};
+
+/// The SDL3-backed runtime (`src/app.zig`) for a package that depends on
+/// zigui: import the result as `zigui_app` beside `dep.module("zigui")` (the
+/// same core module it imports, so the two agree on every type). It links
+/// SDL3 (fetched lazily, on first use), libc and, on macOS, the Objective-C
+/// runtime. On the first configure SDL may not be fetched yet: the module is
+/// returned unlinked and the build reruns once the package is there.
+///
+///     const zigui_dep = b.dependency("zigui", .{ .target = target, .optimize = optimize });
+///     const app_mod = @import("zigui").linkApp(zigui_dep, .{ .target = target, .optimize = optimize });
+///     exe.root_module.addImport("zigui", zigui_dep.module("zigui"));
+///     exe.root_module.addImport("zigui_app", app_mod);
+pub fn linkApp(dep: *std.Build.Dependency, opts: AppOptions) *std.Build.Module {
+    const b = dep.builder;
+    const sdl_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/sdl_c.h"),
+        .target = opts.target,
+        .optimize = opts.optimize,
+        .link_libc = true,
+    });
+    const app_mod = b.createModule(.{
+        .root_source_file = b.path("src/app.zig"),
+        .target = opts.target,
+        .optimize = opts.optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zigui", .module = dep.module("zigui") }},
+    });
+    app_mod.addImport("sdl_c", sdl_c.createModule());
+    const sdl: SdlConfig = .{ .prefix = opts.sdl3_prefix, .macos_sdk = opts.macos_sdk, .windows_console = false };
+    linkSdl3(b, app_mod, sdl_c, opts.target, opts.optimize, sdl);
+    if (opts.target.result.os.tag == .macos) {
+        if (opts.macos_sdk) |sdk| addMacosSdk(b, app_mod, sdk);
+        app_mod.linkSystemLibrary("objc", .{});
+    }
+    return app_mod;
 }
 
 /// Where SDL3 and (for explicit macOS targets) the system SDK come from.

@@ -1900,11 +1900,18 @@ fn drawOverlay(ctx: *const Context, req: OverlayReq, root: Rect, canvas: *Canvas
 
     // 3. Measure & position the content. macOS sheets are *centered* window
     //    modals (they don't hug the bottom edge like iOS).
-    const prop: engine.Proposal = switch (req.style) {
+    var prop: engine.Proposal = switch (req.style) {
         .sheet => .{ .width = @min(root.width - 160, 480), .height = null },
         .alert => .{ .width = @min(root.width - 80, 320), .height = null },
         .popover => .unspecified,
     };
+    // A sheet or alert whose content cannot be narrower than its usual width
+    // (a wide segmented `Picker`) widens to it, as far as the window allows,
+    // rather than being clipped at both edges.
+    if (prop.width) |usual| {
+        const least = if (buildNode(ctx, req.content)) |node| engine.minWidth(node) else |_| 0;
+        if (least > usual) prop.width = @max(usual, @min(least, root.width - 2 * popover_margin));
+    }
     var size = measure(ctx, req.content, prop) catch Size{};
     // A popover wider than the window is narrowed to fit (its rows truncate),
     // not pushed past the edge.
@@ -2301,7 +2308,9 @@ fn drawTextC(ctx: *const Context, canvas: *Canvas, text: []const u8, px: f32, co
 /// (returns `str` unchanged when it already fits). The clipped string is built in
 /// the per-frame arena. Used for `.truncated()` single-line Text.
 fn truncateToWidth(ctx: *const Context, str: []const u8, px: f32, max_w: f32) []const u8 {
-    if (shape.measureLineWidth(ctx.cache.face, str, px) <= max_w) return str;
+    // Layout hands a text exactly its measured width back, give or take float
+    // rounding, so a tolerance keeps a string that fits from losing its tail.
+    if (shape.measureLineWidth(ctx.cache.face, str, px) <= max_w + 0.01) return str;
     const ell = "…";
     const ell_w = shape.measureLineWidth(ctx.cache.face, ell, px);
     if (max_w <= ell_w) return ell; // no room even for the body — just the ellipsis
@@ -5070,6 +5079,41 @@ test "view: a Drawing paints into its frame" {
     try raster.render(testing.allocator, &fb, canvas.commands.items);
     try testing.expect(fb.at(5, 10).b > 0.9 and fb.at(5, 10).r < 0.1);
     try testing.expect(fb.at(35, 10).r > 0.9);
+}
+
+test "view: an alert widens to content that cannot be narrower" {
+    var env = TestEnv.init();
+    env.setup();
+    defer env.deinit();
+    var c = env.ctx();
+    var ovs: std.ArrayList(OverlayReq) = .empty;
+    c.overlays = &ovs;
+    var presented = state.State(bool).init(testing.allocator, true);
+    defer presented.deinit();
+    var choice = state.State(i64).init(testing.allocator, 0);
+    defer choice.deinit();
+    var canvas = Canvas.init(testing.allocator);
+    defer canvas.deinit();
+    const root = Rect{ .x = 0, .y = 0, .width = 900, .height = 400 };
+    const options = [_][]const u8{ "A long first option", "A long second option", "A long third option", "Fourth" };
+    const picker = Picker(choice.binding(), &options);
+    const least = try measure(&c, picker, .{ .width = 0, .height = null });
+    try testing.expect(least.width > 320);
+    // A filling picker under a heading, padded: as a settings sheet is built.
+    const content = VStack(.{ Text("Settings"), picker.frameMaxWidth() }).alignment(.leading).padding(20);
+    const tree = Rectangle(Color.white).alert(presented.binding(), content);
+    endBuild();
+    try render(&c, tree, root, &canvas);
+    // The panel holds every segment: none reaches its clip, which is the panel.
+    var clip: ?Rect = null;
+    for (canvas.commands.items) |cmd| if (cmd == .push_clip) {
+        clip = cmd.push_clip.rect;
+    };
+    try testing.expect(clip.?.width >= least.width + 40 - 0.5);
+    try testing.expect(clip.?.x >= 0 and clip.?.maxX() <= root.width);
+    for (c.hit_regions.items) |region| if (region.action == .select) {
+        try testing.expect(region.rect.x >= clip.?.x - 0.5 and region.rect.maxX() <= clip.?.maxX() + 0.5);
+    };
 }
 
 test "view: popover content is positioned near its (top) anchor" {

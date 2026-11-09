@@ -6,7 +6,9 @@ writes next to the SVG:
   * <name>.ico — 16…256 px PNG entries, embedded in the Windows .exe as a
     resource (Explorer, title bar, taskbar); see build.zig / zigui.rc;
   * <name>.png — 256 px, loaded at runtime via `Config.icon_png` for the
-    window/Dock icon on macOS and Linux.
+    window/Dock icon on macOS and Linux;
+  * with `--iconset`, also <name>.iconset/ — the 16…1024 px PNGs (@1x and
+    @2x) a macOS bundle's icon is made of: `iconutil -c icns <name>.iconset`.
 
 Handles only what the icon uses: <path> elements with absolute M/L/Z commands
 and solid #rrggbb fills (polygons, even-odd per path, painted in order), with
@@ -14,7 +16,12 @@ and solid #rrggbb fills (polygons, even-odd per path, painted in order), with
 outputs, so builds never need this step."""
 import re, struct, sys, zlib, os
 
-SS = 16  # supersamples per axis
+SS = 16  # supersamples per axis, for the small sizes
+
+def supersamples(size):
+    """Fewer samples as the size grows: a 1024 px icon at 16x16 would take
+    minutes in pure Python, and the larger sizes need less antialiasing."""
+    return max(2, min(SS, 2048 // size))
 
 def parse(svg):
     vb = [float(v) for v in re.search(r'viewBox="([^"]+)"', svg).group(1).split()]
@@ -39,7 +46,8 @@ def parse(svg):
 def render(vb, polys, size):
     # Coverage per pixel per fill color (union of polygons sharing a color).
     x0, y0, vw, vh = vb
-    sub = size * SS
+    ss = supersamples(size)
+    sub = size * ss
     sx, sy = sub / vw, sub / vh
     colors = {}
     for color, pts in polys:
@@ -62,12 +70,12 @@ def render(vb, polys, size):
     out = bytearray(size * size * 4)
     for color, grid in colors.items():
         for py in range(size):
-            rows = grid[py * SS:(py + 1) * SS]
+            rows = grid[py * ss:(py + 1) * ss]
             for px in range(size):
-                c = sum(sum(rw[px * SS:(px + 1) * SS]) for rw in rows)
+                c = sum(sum(rw[px * ss:(px + 1) * ss]) for rw in rows)
                 if not c:
                     continue
-                a = c / (SS * SS)
+                a = c / (ss * ss)
                 o = (py * size + px) * 4
                 # straight-alpha "over" onto what's there
                 da = out[o + 3] / 255
@@ -94,9 +102,21 @@ def ico(pngs):
 
 if __name__ == '__main__':
     src = sys.argv[1]
+    iconset = '--iconset' in sys.argv[2:]
     base = os.path.splitext(src)[0]
     vb, polys = parse(open(src).read())
     pngs = [(s, png(render(vb, polys, s), s)) for s in (16, 20, 24, 32, 40, 48, 64, 128, 256)]
     open(base + '.ico', 'wb').write(ico(pngs))
     open(base + '.png', 'wb').write(pngs[-1][1])
     print(f'wrote {base}.ico ({len(pngs)} sizes) and {base}.png (256 px)')
+    if iconset:
+        os.makedirs(base + '.iconset', exist_ok=True)
+        done = {s: blob for s, blob in pngs}
+        for points in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                px = points * scale
+                if px not in done:
+                    done[px] = png(render(vb, polys, px), px)
+                name = f'icon_{points}x{points}' + ('@2x' if scale == 2 else '') + '.png'
+                open(os.path.join(base + '.iconset', name), 'wb').write(done[px])
+        print(f'wrote {base}.iconset (10 images)')

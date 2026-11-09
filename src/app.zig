@@ -752,26 +752,43 @@ pub fn installDesktopEntry(name: []const u8, icon_png: []const u8) bool {
 
     const app_dir = std.fmt.bufPrintSentinel(&path_buf, "{s}/applications", .{data_dir}, 0) catch return false;
     if (!c.SDL_CreateDirectory(app_dir.ptr)) return logInstallError(app_dir);
-    var entry_buf: [8192]u8 = undefined;
-    // Exec is quoted so paths with spaces work; Icon is the absolute path so
-    // no icon-theme cache refresh is needed. StartupWMClass ties X11 windows
-    // to the entry too (Wayland matches by file name = app ID).
+    // Each value escaped per the Desktop Entry Specification, so a path with
+    // spaces, quotes, `$`, `%` or backslashes means what it says (a path that
+    // cannot be written, with a control character in it, is refused). Exec is
+    // quoted; Icon is the absolute path so no icon-theme cache refresh is
+    // needed; StartupWMClass ties X11 windows to the entry too (Wayland
+    // matches by file name = app ID). Sized for the worst case: every byte of
+    // a 4096-byte path escaped to four.
+    var exec_buf: [4 * 4096 + 8]u8 = undefined;
+    var name_buf: [2 * 256]u8 = undefined;
+    var icon_value_buf: [2 * 4096]u8 = undefined;
+    var id_buf: [2 * 4096]u8 = undefined;
+    const exec = zigui.desktop_entry.execValue(&exec_buf, exe, false) orelse return logUnwritable("executable path", exe);
+    const name_value = zigui.desktop_entry.stringValue(&name_buf, name) orelse return logUnwritable("name", name);
+    const icon_value = zigui.desktop_entry.stringValue(&icon_value_buf, icon_path) orelse return logUnwritable("icon path", icon_path);
+    const id_value = zigui.desktop_entry.stringValue(&id_buf, id) orelse return logUnwritable("app ID", id);
+    var entry_buf: [exec_buf.len + name_buf.len + icon_value_buf.len + id_buf.len + 256]u8 = undefined;
     const entry = std.fmt.bufPrint(&entry_buf,
         \\[Desktop Entry]
         \\Type=Application
         \\Name={s}
-        \\Exec="{s}"
+        \\Exec={s}
         \\Icon={s}
         \\StartupWMClass={s}
         \\Terminal=false
         \\Categories=Utility;
         \\
-    , .{ name, exe, icon_path, id }) catch return false;
+    , .{ name_value, exec, icon_value, id_value }) catch return false;
     var desk_buf: [4096]u8 = undefined;
     const desk_path = std.fmt.bufPrintSentinel(&desk_buf, "{s}/{s}.desktop", .{ app_dir, id }, 0) catch return false;
     if (!c.SDL_SaveFile(desk_path.ptr, entry.ptr, entry.len)) return logInstallError(desk_path);
     std.log.info("zigui: installed {s} (icon {s})", .{ desk_path, icon_path });
     return true;
+}
+
+fn logUnwritable(what: []const u8, value: []const u8) bool {
+    std.log.err("zigui: no desktop entry: its {s} has a control character ({s})", .{ what, value });
+    return false;
 }
 
 fn logInstallError(path: []const u8) bool {

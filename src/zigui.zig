@@ -88,6 +88,8 @@ pub const themeForScheme = theme_registry.forScheme;
 /// The default theme (macOS light).
 pub const default_theme = macos.light;
 
+/// Escaped values for a freedesktop desktop entry (`.desktop`).
+pub const desktop_entry = @import("desktop_entry.zig");
 pub const view = @import("view/view.zig");
 pub const View = view.View;
 pub const Context = view.Context;
@@ -222,6 +224,7 @@ pub const Material = view.Material;
 test {
     std.testing.refAllDecls(@This());
     _ = @import("integration_test.zig");
+    _ = @import("desktop_entry.zig");
 }
 
 test "version is parsed from the package manifest" {
